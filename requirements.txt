@@ -1,0 +1,11 @@
+gym
+pandas
+numpy
+stable-baselines3
+torch
+yfinance
+shimmy>=2.0
+pandas_ta
+PyYAML
+plotly
+matplotlib

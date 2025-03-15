@@ -1,0 +1,82 @@
+training:
+  total_timesteps: 10000
+  fee_rate: 0.0
+  # New parameters for iterative training
+  max_iterations: 500
+  improvement_threshold: 0.05
+  additional_timesteps: 10000
+  n_stagnant_loops: 20
+  verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
+
+data:
+  symbol: "NQ=F"
+  period: "60d"
+  interval: "5m"
+  train_ratio: 0.8
+
+indicators:
+  supertrend:
+    enabled: true
+    length: 10
+    multiplier: 3
+  rsi:
+    enabled: true
+    length: 14
+  # New technical indicators
+  cci:
+    enabled: true
+    length: 20
+  adx:
+    enabled: true
+    length: 14
+  adx_pos:
+    enabled: true
+  adx_neg:
+    enabled: true
+  stoch_k:
+    enabled: true
+    length: 14
+  stoch_d:
+    enabled: true
+    length: 3
+  macd:
+    enabled: true
+    fast: 12
+    slow: 26
+    signal: 9
+  roc:
+    enabled: true
+    length: 10
+  williams_r:
+    enabled: true
+    length: 14
+  sma:
+    enabled: true
+    length: 20
+  ema:
+    enabled: true
+    length: 20
+  disparity:
+    enabled: true
+  atr:
+    enabled: true
+    length: 14
+  obv:
+    enabled: true
+  cmf:
+    enabled: true
+    length: 20
+  psar:
+    enabled: true
+    af: 0.02
+    max_af: 0.2
+
+environment:
+  initial_balance: 10000.0
+  position_size: 1  # Number of NQ futures contracts to trade (default: 1)
+
+model:
+  ent_coef: 0.3
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
