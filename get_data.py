@@ -8,6 +8,7 @@ if not hasattr(np, "NaN"):
 
 import pandas_ta as ta
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,31 +19,47 @@ from config import config
 def get_data(symbol: str = "NQ=F",
                  period: str = "60d",
                  interval: str = "5m",
-                 train_ratio: float = 0.8):
+                 train_ratio: float = 0.7,
+                 validation_ratio: float = 0.15):
     """
     Load data from local CSV file, compute technical indicators, normalize prices,
-    and split the data into training and testing sets.
+    and split the data into training, validation and testing sets.
 
     Args:
         symbol (str): Asset ticker symbol (not used when loading from CSV).
         period (str): Historical period (not used when loading from CSV).
         interval (str): Data interval (not used when loading from CSV).
-        train_ratio (float): Proportion of data to use for training (default 0.8).
+        train_ratio (float): Proportion of data to use for training (default 0.7).
+        validation_ratio (float): Proportion of data to use for validation (default 0.15).
+                                 Test ratio is calculated as 1 - train_ratio - validation_ratio.
 
     Returns:
-        tuple: (train_df, test_df)
+        tuple: (train_df, validation_df, test_df) - DataFrames containing processed data.
     """
     logger.info("Loading data from local CSV file: data/nq.csv")
     
     try:
-        # Read the CSV file
-        df = pd.read_csv('data/nq.csv')
+        # Check if file exists
+        if not os.path.exists('data/nq.csv'):
+            logger.error("CSV file not found: data/nq.csv")
+            return None, None, None
+            
+        # Read the CSV file with error handling
+        try:
+            df = pd.read_csv('data/nq.csv')
+        except pd.errors.EmptyDataError:
+            logger.error("CSV file is empty")
+            return None, None, None
+        except pd.errors.ParserError:
+            logger.error("Error parsing CSV file - it may be malformed")
+            return None, None, None
+        
         logger.info(f"CSV file loaded. Shape: {df.shape}, Columns: {df.columns.tolist()}")
         
         # Check if the DataFrame is empty
         if df.empty:
             logger.error("The loaded DataFrame is empty!")
-            raise ValueError("Empty DataFrame loaded from CSV")
+            return None, None, None
             
         # Print the first few rows to debug
         logger.info(f"First 5 rows of data:\n{df.head()}")
@@ -431,12 +448,49 @@ def get_data(symbol: str = "NQ=F",
                 # Create a direction indicator (1 if price above PSAR, -1 if below)
                 df['PSAR_DIR'] = np.where(df['Close'] > df['PSAR'], 1, -1)
 
-        # Normalize Close price to the range [0,1] using training data statistics only to avoid look-ahead bias
-        split_idx = int(len(df) * train_ratio)
-        train_close_min = df.iloc[:split_idx]['Close'].min()
-        train_close_max = df.iloc[:split_idx]['Close'].max()
-        df['close_norm'] = (df['Close'] - train_close_min) / (train_close_max - train_close_min)
+        # Only drop rows with NaN values in essential columns
+        essential_columns = ['Close', 'close_norm']
+        logger.info(f"Shape before dropping NaN in essential columns: {df.shape}")
         
+        # Check if we have valid Close values before trying to normalize
+        if df['Close'].notna().any():
+            # Fill NaN values in Close with forward fill then backward fill
+            df['Close'] = df['Close'].ffill().bfill()
+            
+            # Normalize Close price to the range [0,1] using all available data if train data is empty
+            if train_ratio <= 0:
+                close_min = df['Close'].min()
+                close_max = df['Close'].max()
+                df['close_norm'] = (df['Close'] - close_min) / (close_max - close_min)
+            else:
+                # Calculate split index
+                split_idx = int(len(df) * train_ratio)
+                if split_idx > 0:
+                    train_close_min = df.iloc[:split_idx]['Close'].min()
+                    train_close_max = df.iloc[:split_idx]['Close'].max()
+                    # Avoid division by zero
+                    if train_close_max > train_close_min:
+                        df['close_norm'] = (df['Close'] - train_close_min) / (train_close_max - train_close_min)
+                    else:
+                        df['close_norm'] = 0.5  # Default if all values are the same
+                else:
+                    # If train data is empty, normalize using all data
+                    close_min = df['Close'].min()
+                    close_max = df['Close'].max()
+                    df['close_norm'] = (df['Close'] - close_min) / (close_max - close_min)
+        else:
+            logger.error("No valid Close prices found in the data")
+            return None, None, None
+        
+        # Check for remaining NaN values in essential columns and log
+        nan_count = df[essential_columns].isna().sum()
+        if nan_count.sum() > 0:
+            logger.warning(f"NaN values in essential columns after filling: {nan_count}")
+            # Fill any remaining NaNs with 0
+            df[essential_columns] = df[essential_columns].fillna(0)
+        
+        logger.info(f"Shape after handling NaN values: {df.shape}")
+
         # Create an initial 'position' column (copy of trend_direction)
         df['position'] = df['trend_direction']
         
@@ -444,12 +498,17 @@ def get_data(symbol: str = "NQ=F",
         model_columns = ['Close', 'close_norm', 'trend_direction', 'position']
         
         # Add all technical indicators that were enabled and calculated
+        indicators_to_normalize = []
         for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D', 
                          'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R', 
                          'SMA_NORM', 'EMA_NORM', 'DISPARITY', 'ATR', 'OBV_NORM', 
                          'CMF', 'PSAR_NORM', 'PSAR_DIR']:
             if indicator in df.columns:
                 model_columns.append(indicator)
+                
+                # Skip indicators that are already guaranteed to be within bounds
+                if indicator not in ['trend_direction', 'RSI', 'PSAR_DIR']:
+                    indicators_to_normalize.append(indicator)
                 
                 # Fill NaN values in indicators with appropriate defaults
                 if indicator in ['RSI', 'STOCH_K', 'STOCH_D']:
@@ -473,22 +532,53 @@ def get_data(symbol: str = "NQ=F",
         df['trend_direction'] = df['trend_direction'].fillna(0)
         df['position'] = df['position'].fillna(0)
         
-        # Only drop rows with NaN values in essential columns
-        essential_columns = ['Close', 'close_norm']
-        logger.info(f"Shape before dropping NaN in essential columns: {df.shape}")
-        df.dropna(subset=essential_columns, inplace=True)
-        logger.info(f"Shape after dropping NaN in essential columns: {df.shape}")
-
-        # Split data into training and testing sets
-        split_idx = int(len(df) * train_ratio)
-        train_df = df.iloc[:split_idx].copy()
-        test_df = df.iloc[split_idx:].copy()
+        # Two-stage normalization for technical indicators using only training data statistics
+        logger.info("Performing two-stage normalization for technical indicators using only training data statistics")
         
-        logger.info("Data loaded and processed. Train data: %d rows, Test data: %d rows", len(train_df), len(test_df))
-        return train_df, test_df
+        # Calculate split index for normalization
+        split_idx = int(len(df) * train_ratio) if train_ratio > 0 else len(df)
+        
+        for indicator in indicators_to_normalize:
+            # Get min and max values from training data only
+            train_indicator_min = df.iloc[:split_idx][indicator].min()
+            train_indicator_max = df.iloc[:split_idx][indicator].max()
+            
+            # Check if values need normalization
+            if train_indicator_min < -1.0 or train_indicator_max > 1.0 or (indicator in ['CCI', 'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC']):
+                # Normalize to [-1, 1] range using training data statistics
+                if train_indicator_min != train_indicator_max:  # Avoid division by zero
+                    df[indicator] = 2.0 * (df[indicator] - train_indicator_min) / (train_indicator_max - train_indicator_min) - 1.0
+                else:
+                    df[indicator] = 0.0  # If all values are the same, set to 0
+                
+                # Clip to ensure within bounds
+                df[indicator] = np.clip(df[indicator], -1.0, 1.0)
+                logger.info(f"Normalized {indicator} using training data statistics (min: {train_indicator_min}, max: {train_indicator_max})")
+
+        # Split data into training, validation, and testing sets
+        if train_ratio <= 0:
+            # If train_ratio is 0 or negative, return all data as train data and empty validation/test sets
+            train_df = df.copy()
+            validation_df = pd.DataFrame(columns=df.columns)
+            test_df = pd.DataFrame(columns=df.columns)
+            logger.info("Data loaded and processed. Train data: %d rows (all data), Validation data: 0 rows, Test data: 0 rows", 
+                       len(train_df))
+        else:
+            # Normal splitting
+            train_split_idx = int(len(df) * train_ratio)
+            validation_split_idx = train_split_idx + int(len(df) * validation_ratio)
+            
+            train_df = df.iloc[:train_split_idx].copy()
+            validation_df = df.iloc[train_split_idx:validation_split_idx].copy()
+            test_df = df.iloc[validation_split_idx:].copy()
+            
+            logger.info("Data loaded and processed. Train data: %d rows, Validation data: %d rows, Test data: %d rows", 
+                       len(train_df), len(validation_df), len(test_df))
+                       
+        return train_df, validation_df, test_df
     except Exception as e:
         logger.error(f"Error loading data: {e}")
-        return None, None
+        return None, None, None
 
 if __name__ == "__main__":
     get_data()

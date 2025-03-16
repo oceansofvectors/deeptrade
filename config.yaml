@@ -12,7 +12,8 @@ data:
   symbol: "NQ=F"
   period: "60d"
   interval: "5m"
-  train_ratio: 0.8
+  train_ratio: 0.7
+  validation_ratio: 0.15
 
 indicators:
   supertrend:
@@ -74,9 +75,42 @@ indicators:
 environment:
   initial_balance: 10000.0
   position_size: 1  # Number of NQ futures contracts to trade (default: 1)
+  transaction_cost: 0.0  # Transaction cost as percentage
 
 model:
   ent_coef: 0.3
   learning_rate: 0.0003
   n_steps: 2048
   batch_size: 64
+
+# Risk management configuration for trade.py
+risk_management:
+  # Enable/disable risk management features
+  enabled: true  # Master switch to enable/disable all risk management
+  
+  # Stop loss configuration
+  stop_loss:
+    enabled: true
+    percentage: 0.5  # Stop loss as percentage of entry price
+  
+  # Take profit configuration
+  take_profit:
+    enabled: true
+    percentage: 1.0  # Take profit as percentage of entry price
+  
+  # Trailing stop loss configuration
+  trailing_stop:
+    enabled: false
+    percentage: 0.5  # Trailing stop as percentage of highest/lowest price
+  
+  # Position sizing configuration
+  position_sizing:
+    enabled: false
+    size_multiplier: 1.0  # Position size as a multiplier (1.0 = 100% of available capital)
+    max_risk_per_trade_percentage: 2.0  # Maximum risk per trade as percentage of portfolio
+
+# Walk-forward testing configuration
+walk_forward:
+  enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
+  window_size: 14  # Size of each walk-forward window in days
+  step_size: 7     # Number of days to step forward at each iteration

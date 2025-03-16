@@ -2,6 +2,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
+from decimal import Decimal
+import money  # Import the new money module
 
 class TradingEnv(gym.Env):
     """
@@ -100,48 +102,20 @@ class TradingEnv(gym.Env):
         # Internal state variables
         self.current_step = 0
         self.position = 0  # Will be immediately updated to either 1 (long) or -1 (short)
-        self.entry_price = 0.0  # Actual price when position was opened
+        self.entry_price = Decimal('0.0')  # Actual price when position was opened
         self.initial_index = 0
 
-        # Portfolio tracking
-        self.initial_balance = initial_balance
+        # Portfolio tracking with Decimal for precision
+        self.initial_balance = money.to_decimal(initial_balance)
         self.net_worth = self.initial_balance
-        self.transaction_cost = transaction_cost
+        self.transaction_cost = money.to_decimal(transaction_cost)
         
         # Position sizing
         self.position_size = position_size
         
         # Reward normalization parameters
-        self.correct_prediction_reward = 1.0
-        self.incorrect_prediction_reward = -1.0
-        
-        # Normalize all indicators in the dataset to ensure they're within bounds
-        self._normalize_indicators()
-
-    def _normalize_indicators(self):
-        """
-        Ensure all indicators are properly normalized within the bounds of the observation space.
-        """
-        # Check each indicator and normalize if needed
-        for indicator in self.technical_indicators:
-            # Skip indicators that are already guaranteed to be within bounds
-            if indicator in ['trend_direction', 'RSI', 'PSAR_DIR']:
-                continue
-                
-            # Get min and max values
-            min_val = self.data[indicator].min()
-            max_val = self.data[indicator].max()
-            
-            # Check if values exceed bounds
-            if min_val < -1.0 or max_val > 1.0:
-                # Normalize to [-1, 1] range
-                if min_val != max_val:  # Avoid division by zero
-                    self.data[indicator] = 2.0 * (self.data[indicator] - min_val) / (max_val - min_val) - 1.0
-                else:
-                    self.data[indicator] = 0.0  # If all values are the same, set to 0
-                    
-                # Clip to ensure within bounds
-                self.data[indicator] = np.clip(self.data[indicator], -1.0, 1.0)
+        self.correct_prediction_reward = Decimal('1.0')
+        self.incorrect_prediction_reward = Decimal('-1.0')
 
     def reset(self, seed=None, options=None):
         """
@@ -152,7 +126,7 @@ class TradingEnv(gym.Env):
         """
         self.current_step = self.initial_index
         self.position = 0  # Will be immediately set by first action
-        self.entry_price = 0.0
+        self.entry_price = Decimal('0.0')
         self.net_worth = self.initial_balance
         obs = self._get_obs()
         return obs, {}
@@ -192,10 +166,10 @@ class TradingEnv(gym.Env):
             tuple: (observation, reward, terminated, truncated, info)
         """
         info = {}
-        reward = 0.0
+        reward = Decimal('0.0')
 
         # Current price based on actual 'Close'
-        current_price = self.data.loc[self.current_step, "Close"]
+        current_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
         
         # Track old position to detect changes for transaction cost
         old_position = self.position
@@ -209,7 +183,7 @@ class TradingEnv(gym.Env):
                 self.position = 1
                 # Add a small reward for changing position to encourage exploration
                 if old_position != 0:  # Only if changing from an existing position, not from neutral
-                    reward += 0.1
+                    reward += Decimal('0.1')
             else:
                 pass  # No position duration tracking needed
         else:  # Go short
@@ -219,48 +193,51 @@ class TradingEnv(gym.Env):
                 self.position = -1
                 # Add a small reward for changing position to encourage exploration
                 if old_position != 0:  # Only if changing from an existing position, not from neutral
-                    reward += 0.1
+                    reward += Decimal('0.1')
             else:
                 pass  # No position duration tracking needed
             
         # Calculate reward based on correctness of prediction about next candle
         if self.current_step < self.total_steps:
-            next_price = self.data.loc[self.current_step + 1, "Close"]
+            next_price = money.to_decimal(self.data.loc[self.current_step + 1, "Close"])
             price_change = next_price - current_price
             
             # If long and price goes up OR short and price goes down, prediction is correct
-            if (self.position == 1 and price_change > 0) or (self.position == -1 and price_change < 0):
+            if (self.position == 1 and price_change > Decimal('0')) or (self.position == -1 and price_change < Decimal('0')):
                 reward += self.correct_prediction_reward
             else:
                 reward += self.incorrect_prediction_reward
                 
             # Normalize reward based on the magnitude of price change
             price_change_pct = abs(price_change / current_price)
-            reward *= min(1.0, price_change_pct * 100)  # Scale by percentage change, capped at 1.0
+            reward *= min(Decimal('1.0'), price_change_pct * Decimal('100'))  # Scale by percentage change, capped at 1.0
 
         # Advance to next step
         self.current_step += 1
         
         # Calculate portfolio value change based on position and price change
         if self.current_step < self.total_steps:
-            next_price = self.data.loc[self.current_step, "Close"]
-            price_change = next_price - current_price
+            next_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
             
-            # Calculate dollar value of the price change per contract
-            # For NQ futures, each point is worth $20
-            point_value = 20.0  # $20 per point for NQ futures
-            dollar_change = price_change * point_value * self.position_size
-            
-            # Update net worth based on position and price change
-            if self.position == 1:  # Long position
-                # Add the dollar change to the portfolio
+            # Calculate price change using the same function as in RiskManager
+            if self.position != 0:  # Only if we have an active position
+                # Calculate price change - matching RiskManager logic
+                if self.position == 1:  # Long position
+                    price_change = next_price - current_price
+                else:  # Short position
+                    price_change = current_price - next_price
+                
+                # For NQ futures, each point is $20
+                point_value = money.to_decimal(20.0)
+                
+                # Calculate dollar change directly
+                dollar_change = price_change * point_value * money.to_decimal(self.position_size)
+                
+                # Update portfolio value
                 self.net_worth += dollar_change
-            elif self.position == -1:  # Short position
-                # Subtract the dollar change from the portfolio (profit when price goes down)
-                self.net_worth -= dollar_change
         
         # Ensure net_worth doesn't go below a minimum threshold (e.g., 1% of initial balance)
-        min_balance = self.initial_balance * 0.01
+        min_balance = self.initial_balance * Decimal('0.01')
         if self.net_worth < min_balance:
             self.net_worth = min_balance
             info["hit_minimum_balance"] = True
@@ -274,8 +251,8 @@ class TradingEnv(gym.Env):
         
         # Add info about current state
         info["position"] = self.position
-        info["reward"] = reward
-        info["net_worth"] = self.net_worth
+        info["reward"] = float(reward)  # Convert Decimal to float for compatibility
+        info["net_worth"] = float(self.net_worth)  # Convert Decimal to float for compatibility
         info["position_size"] = self.position_size
         
         return obs, float(reward), terminated, truncated, info

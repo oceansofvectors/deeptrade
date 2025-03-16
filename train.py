@@ -3,14 +3,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from decimal import Decimal
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 
 from environment import TradingEnv
 from get_data import get_data
-
 from config import config
+import money  # Import the new money module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,14 +41,14 @@ def train_agent(train_data, total_timesteps: int):
     logger.info("Training completed")
     return model
 
-def train_agent_iteratively(train_data, test_data, initial_timesteps: int, max_iterations: int = 20, 
+def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20, 
                            n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000):
     """
-    Train a PPO model iteratively based on evaluation results.
+    Train a PPO model iteratively based on validation performance.
     
     Args:
         train_data (pd.DataFrame): Training dataset.
-        test_data (pd.DataFrame): Testing dataset.
+        validation_data (pd.DataFrame): Validation dataset for model selection.
         initial_timesteps (int): Initial number of training timesteps.
         max_iterations (int): Maximum number of training iterations.
         n_stagnant_loops (int): Number of consecutive iterations without improvement before stopping.
@@ -87,10 +88,10 @@ def train_agent_iteratively(train_data, test_data, initial_timesteps: int, max_i
     logger.info(f"Starting initial training for {initial_timesteps} timesteps")
     model.learn(total_timesteps=initial_timesteps)
     
-    # Evaluate initial model (now using non-deterministic evaluation)
+    # Evaluate initial model on validation data (deterministic action selection)
     if verbose_level > 0:
-        logger.info("Evaluating model with non-deterministic action selection")
-    results = evaluate_agent(model, test_data, verbose=verbose_level)
+        logger.info("Evaluating model on validation data with deterministic action selection")
+    results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
     best_return = results["total_return_pct"]
     best_model = model
     best_results = results
@@ -98,7 +99,7 @@ def train_agent_iteratively(train_data, test_data, initial_timesteps: int, max_i
     # Save the initial model as the best model so far
     best_model.save("best_model")
     
-    logger.info(f"Initial training completed. Return: {best_return:.2f}%, Portfolio: ${results['final_portfolio_value']:.2f}")
+    logger.info(f"Initial training completed. Validation Return: {best_return:.2f}%, Validation Portfolio: ${results['final_portfolio_value']:.2f}")
     
     # Store all results for comparison
     all_results = [results]
@@ -113,21 +114,24 @@ def train_agent_iteratively(train_data, test_data, initial_timesteps: int, max_i
             logger.info(f"Starting iteration {iteration} training for {additional_timesteps} timesteps")
         model.learn(total_timesteps=additional_timesteps)
         
-        # Evaluate the model (non-deterministic)
-        results = evaluate_agent(model, test_data, verbose=verbose_level)
+        # Evaluate the model on validation data (deterministic)
+        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
         current_return = results["total_return_pct"]
         all_results.append(results)
         
         # Calculate improvement
         improvement = current_return - best_return
-        logger.info(f"Iteration {iteration} - Return: {current_return:.2f}%, Portfolio: ${results['final_portfolio_value']:.2f}, Improvement: {improvement:.2f}%")
+        logger.info(f"Iteration {iteration} - Validation Return: {current_return:.2f}%, " 
+                   f"Validation Portfolio: ${results['final_portfolio_value']:.2f}, "
+                   f"Improvement: {improvement:.2f}%")
         
-        # Check if this is the best model so far
+        # Check if this is the best model so far based on validation performance
         if current_return > best_return + improvement_threshold:
             best_return = current_return
             best_model = model
             best_results = results
-            logger.info(f"New best model found! Return: {best_return:.2f}%, Portfolio: ${best_results['final_portfolio_value']:.2f}")
+            logger.info(f"New best model found! Validation Return: {best_return:.2f}%, " 
+                       f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
             
             # Save the best model
             best_model.save("best_model")
@@ -145,10 +149,11 @@ def train_agent_iteratively(train_data, test_data, initial_timesteps: int, max_i
             logger.info(f"Stopping training after {n_stagnant_loops} consecutive iterations without significant improvement")
             break
     
-    logger.info(f"Iterative training completed. Best return: {best_return:.2f}%, Portfolio: ${best_results['final_portfolio_value']:.2f}")
+    logger.info(f"Iterative training completed. Best validation return: {best_return:.2f}%, " 
+               f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
     return best_model, best_results, all_results
 
-def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1):
+def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, deterministic: bool = True):
     """
     Evaluate the trained model on test data and record trade history.
 
@@ -157,6 +162,7 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1):
         test_data (pd.DataFrame): Testing dataset.
         fee_rate (float): Trading fee rate (default 0.0 - no fees).
         verbose (int): Verbosity level for logging (default 1).
+        deterministic (bool): Whether to use deterministic action selection (default: True).
 
     Returns:
         dict: A dictionary containing performance metrics and trade history.
@@ -181,7 +187,7 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1):
     step_counter = 0
     current_price_initial = round(env.data.loc[env.current_step, "Close"], 2)
     price_history = [current_price_initial]
-    portfolio_history = [env.net_worth]
+    portfolio_history = [float(env.net_worth)]  # Convert Decimal to float for plotting
     buy_dates, buy_prices = [], []
     sell_dates, sell_prices = [], []
 
@@ -195,7 +201,7 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1):
         current_index = env.current_step
         current_price = round(env.data.loc[current_index, "Close"], 2)
         current_date = test_data.index[current_index]  # Get current date from the index
-        action, _ = model.predict(obs, deterministic=False)  # Changed from True to False for non-deterministic evaluation
+        action, _ = model.predict(obs, deterministic=deterministic)  # Use deterministic parameter
         action_counts[int(action)] += 1  # Count this action
         
         # Debug log only if verbose > 1
@@ -232,38 +238,38 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1):
                 trade_type = "Buy"
                 
             # Ensure portfolio value is never negative in the trade history
-            portfolio_value = max(0.01, env.net_worth)
+            portfolio_value = max(Decimal('0.01'), env.net_worth)
             
             trade_history.append({
                 "date": current_date,
                 "trade_type": trade_type,
                 "price": current_price,
-                "portfolio_value": portfolio_value
+                "portfolio_value": float(portfolio_value)  # Convert Decimal to float for serialization
             })
 
         step_counter += 1
         dates.append(current_date)
         price_history.append(current_price)
-        portfolio_history.append(round(env.net_worth, 2))
+        portfolio_history.append(float(money.format_money(env.net_worth, 2)))  # Format and convert to float for plotting
 
         if done:
             break
 
-    # Calculate percentage return
-    total_return_pct = ((env.net_worth - initial_net_worth) / initial_net_worth) * 100
+    # Calculate percentage return using the money module
+    total_return_pct = money.calculate_return_pct(env.net_worth, initial_net_worth)
     
     # Only log detailed evaluation if verbose > 0
     if verbose > 0:
-        logger.info("Evaluation completed: Final portfolio value: $%.2f (%.2f%% return), Total trades: %d",
-                    env.net_worth, total_return_pct, trade_count)
+        logger.info("Evaluation completed: Final portfolio value: $%s (%.2f%% return), Total trades: %d",
+                    money.format_money_str(env.net_worth), float(total_return_pct), trade_count)
         
         # Log action distribution only if verbose > 1
         if verbose > 1:
             logger.info(f"Action distribution - Long: {action_counts[0]}, Short: {action_counts[1]}")
 
     return {
-        "final_portfolio_value": round(env.net_worth, 2),
-        "total_return_pct": round(total_return_pct, 2),
+        "final_portfolio_value": float(money.format_money(env.net_worth, 2)),
+        "total_return_pct": float(money.format_money(total_return_pct, 2)),
         "trade_count": trade_count,
         "final_position": env.position,
         "dates": dates,
@@ -420,15 +426,16 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
     logger.info("Trade history saved to %s", filename)
 
 def main():
-    # Load data using settings from YAML
-    train_data, test_data = get_data(
+    # Load data using settings from YAML with three-way split
+    train_data, validation_data, test_data = get_data(
         symbol=config["data"]["symbol"],
         period=config["data"]["period"],
         interval=config["data"]["interval"],
-        train_ratio=config["data"]["train_ratio"]
+        train_ratio=config["data"].get("train_ratio", 0.7),
+        validation_ratio=config["data"].get("validation_ratio", 0.15)
     )
 
-    # Use the iterative training approach
+    # Use the iterative training approach with validation data for model selection
     initial_timesteps = config["training"].get("total_timesteps", 50000)
     max_iterations = config["training"].get("max_iterations", 20)
     improvement_threshold = config["training"].get("improvement_threshold", 0.1)
@@ -440,9 +447,10 @@ def main():
                f"improvement_threshold={improvement_threshold}%, "
                f"additional_timesteps={additional_timesteps}")
     
-    best_model, best_results, all_results = train_agent_iteratively(
+    # Train using train data and validate using validation data
+    best_model, best_validation_results, all_validation_results = train_agent_iteratively(
         train_data, 
-        test_data, 
+        validation_data,  # Use validation data for model selection
         initial_timesteps=initial_timesteps,
         max_iterations=max_iterations,
         n_stagnant_loops=n_stagnant_loops,
@@ -450,23 +458,30 @@ def main():
         additional_timesteps=additional_timesteps
     )
     
-    # Log detailed evaluation results for the best model
-    logger.info("Best Model Evaluation Results:")
-    logger.info("Final Portfolio Value: $%.2f", best_results["final_portfolio_value"])
-    logger.info("Total Return: %.2f%%", best_results["total_return_pct"])
-    logger.info("Total Trades Executed: %d", best_results["trade_count"])
-    logger.info("Final Position: %d", best_results["final_position"])
+    # Final evaluation on the test data (previously unseen)
+    logger.info("Performing final evaluation on test data (previously unseen)")
+    test_results = evaluate_agent(best_model, test_data, verbose=config["training"].get("verbose", 1), deterministic=True)
+    
+    # Log detailed evaluation results for the best model on test data
+    logger.info("Final Test Results:")
+    logger.info("Final Portfolio Value: $%.2f", test_results["final_portfolio_value"])
+    logger.info("Total Return: %.2f%%", test_results["total_return_pct"])
+    logger.info("Total Trades Executed: %d", test_results["trade_count"])
+    logger.info("Final Position: %d", test_results["final_position"])
     
     # Save trade history to CSV
-    save_trade_history(best_results["trade_history"], "best_model_trade_history.csv")
+    save_trade_history(test_results["trade_history"], "best_model_test_trade_history.csv")
     
-    # Plot results for the best model
-    logger.info("Plotting best model evaluation results...")
-    plot_results(best_results)
+    # Plot results for the best model on test data
+    logger.info("Plotting test evaluation results...")
+    plot_results(test_results)
     
-    # Plot training progress
+    # Plot training progress using validation results
     logger.info("Plotting training progress across iterations...")
-    plot_training_progress(all_results)
+    plot_training_progress(all_validation_results)
+    
+    # Also save validation trade history for comparison
+    save_trade_history(best_validation_results["trade_history"], "best_model_validation_trade_history.csv")
 
 if __name__ == "__main__":
     main()
