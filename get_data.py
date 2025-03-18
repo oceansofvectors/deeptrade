@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 # NEW: import YAML configuration
 from config import config
 
+# Import filter_market_hours from walk_forward module
+# We use try/except to handle circular import issue
+try:
+    from walk_forward import filter_market_hours
+except ImportError:
+    # Define a basic version if walk_forward isn't importable
+    def filter_market_hours(data):
+        logger.warning("Could not import filter_market_hours from walk_forward module. Using unfiltered data.")
+        return data
+
 def get_data(symbol: str = "NQ=F",
                  period: str = "60d",
                  interval: str = "5m",
@@ -555,6 +565,16 @@ def get_data(symbol: str = "NQ=F",
                 df[indicator] = np.clip(df[indicator], -1.0, 1.0)
                 logger.info(f"Normalized {indicator} using training data statistics (min: {train_indicator_min}, max: {train_indicator_max})")
 
+        # After all processing, check if we should filter to market hours only
+        if config["data"].get("market_hours_only", False):
+            logger.info("Filtering data to include only NYSE market hours")
+            try:
+                # Try to import again in case it wasn't available earlier
+                from walk_forward import filter_market_hours
+                df = filter_market_hours(df)
+            except ImportError:
+                logger.warning("Could not import filter_market_hours from walk_forward module. Using unfiltered data.")
+        
         # Split data into training, validation, and testing sets
         if train_ratio <= 0:
             # If train_ratio is 0 or negative, return all data as train data and empty validation/test sets

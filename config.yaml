@@ -1,11 +1,11 @@
 training:
-  total_timesteps: 10000
+  total_timesteps: 500
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 500
+  max_iterations: 50
   improvement_threshold: 0.05
-  additional_timesteps: 10000
-  n_stagnant_loops: 20
+  additional_timesteps: 250
+  n_stagnant_loops: 10
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
 
 data:
@@ -14,6 +14,7 @@ data:
   interval: "5m"
   train_ratio: 0.7
   validation_ratio: 0.15
+  market_hours_only: true  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
 
 indicators:
   supertrend:

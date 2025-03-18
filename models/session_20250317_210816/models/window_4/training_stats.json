@@ -1,0 +1,190 @@
+[
+    {
+        "iteration": 0,
+        "timesteps": 10000,
+        "return_pct": 59.95,
+        "portfolio_value": 15995.0,
+        "trade_count": 43,
+        "is_best": true
+    },
+    {
+        "iteration": 1,
+        "timesteps": 10000,
+        "return_pct": -86.0,
+        "portfolio_value": 1400.0,
+        "trade_count": 52,
+        "improvement": -145.95,
+        "is_best": false
+    },
+    {
+        "iteration": 2,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 26,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 3,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 16,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 4,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 22,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 5,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 27,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 6,
+        "timesteps": 10000,
+        "return_pct": -74.85,
+        "portfolio_value": 2515.0,
+        "trade_count": 14,
+        "improvement": -134.8,
+        "is_best": false
+    },
+    {
+        "iteration": 7,
+        "timesteps": 10000,
+        "return_pct": -62.55,
+        "portfolio_value": 3745.0,
+        "trade_count": 20,
+        "improvement": -122.5,
+        "is_best": false
+    },
+    {
+        "iteration": 8,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 34,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 9,
+        "timesteps": 10000,
+        "return_pct": -80.65,
+        "portfolio_value": 1935.0,
+        "trade_count": 28,
+        "improvement": -140.60000000000002,
+        "is_best": false
+    },
+    {
+        "iteration": 10,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 31,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 11,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 36,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 12,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 28,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 13,
+        "timesteps": 10000,
+        "return_pct": -84.4,
+        "portfolio_value": 1560.0,
+        "trade_count": 28,
+        "improvement": -144.35000000000002,
+        "is_best": false
+    },
+    {
+        "iteration": 14,
+        "timesteps": 10000,
+        "return_pct": -51.45,
+        "portfolio_value": 4855.0,
+        "trade_count": 16,
+        "improvement": -111.4,
+        "is_best": false
+    },
+    {
+        "iteration": 15,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 28,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 16,
+        "timesteps": 10000,
+        "return_pct": -84.4,
+        "portfolio_value": 1560.0,
+        "trade_count": 31,
+        "improvement": -144.35000000000002,
+        "is_best": false
+    },
+    {
+        "iteration": 17,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 30,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 18,
+        "timesteps": 10000,
+        "return_pct": -94.75,
+        "portfolio_value": 525.0,
+        "trade_count": 32,
+        "improvement": -154.7,
+        "is_best": false
+    },
+    {
+        "iteration": 19,
+        "timesteps": 10000,
+        "return_pct": -84.4,
+        "portfolio_value": 1560.0,
+        "trade_count": 19,
+        "improvement": -144.35000000000002,
+        "is_best": false
+    },
+    {
+        "iteration": 20,
+        "timesteps": 10000,
+        "return_pct": -70.45,
+        "portfolio_value": 2955.0,
+        "trade_count": 20,
+        "improvement": -130.4,
+        "is_best": false
+    }
+]

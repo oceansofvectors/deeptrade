@@ -1,6 +1,10 @@
 import logging
 import pandas as pd
 import numpy as np
+import os
+import json
+from datetime import datetime, time
+import pytz
 from typing import List, Dict, Tuple
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
@@ -11,8 +15,105 @@ from train import evaluate_agent, plot_results
 from config import config
 import money
 
-logging.basicConfig(level=logging.INFO)
+# Setup logging to save to file and console
+os.makedirs('models/logs', exist_ok=True)
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+log_filename = f'models/logs/walk_forward_{timestamp}.log'
+
+# Configure logging to both file and console
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
+
+# Custom JSON encoder to handle pandas Timestamp objects
+class TimestampJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, pd.Timestamp):
+            return obj.strftime('%Y-%m-%d %H:%M:%S')
+        # Handle numpy types
+        if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+            return int(obj)
+        if isinstance(obj, (np.float, np.float64, np.float32, np.float16)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super(TimestampJSONEncoder, self).default(obj)
+
+# Function to safely save JSON data
+def save_json(data, filepath):
+    """
+    Safely save data to JSON file with proper timestamp handling.
+    
+    Args:
+        data: The data to save
+        filepath: Path to save the JSON file
+    """
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
+        logger.info(f"Successfully saved JSON data to {filepath}")
+    except Exception as e:
+        logger.error(f"Error saving JSON data to {filepath}: {e}")
+
+def filter_market_hours(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter the data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday).
+    
+    Args:
+        data: DataFrame with DatetimeIndex in UTC
+        
+    Returns:
+        DataFrame: Filtered data containing only market hours
+    """
+    if not isinstance(data.index, pd.DatetimeIndex):
+        logger.error("Data index is not a DatetimeIndex, cannot filter market hours")
+        return data
+    
+    # Make a copy to avoid modifying the original
+    filtered_data = data.copy()
+    
+    # Convert UTC times to Eastern Time
+    eastern = pytz.timezone('US/Eastern')
+    
+    # Ensure the index is timezone-aware
+    if filtered_data.index.tz is None:
+        filtered_data.index = filtered_data.index.tz_localize('UTC')
+    
+    # Convert to Eastern Time
+    filtered_data.index = filtered_data.index.tz_convert(eastern)
+    
+    # Filter for weekdays (Monday=0, Friday=4)
+    weekday_mask = (filtered_data.index.dayofweek >= 0) & (filtered_data.index.dayofweek <= 4)
+    
+    # Filter for market hours (9:30 AM to 4:00 PM ET)
+    market_open = time(9, 30)
+    market_close = time(16, 0)
+    
+    hours_mask = (
+        (filtered_data.index.time >= market_open) & 
+        (filtered_data.index.time <= market_close)
+    )
+    
+    # Apply both filters
+    market_hours_mask = weekday_mask & hours_mask
+    filtered_data = filtered_data.loc[market_hours_mask]
+    
+    # Convert back to UTC for consistency with the rest of the system
+    filtered_data.index = filtered_data.index.tz_convert('UTC')
+    
+    # Log filtering results
+    filtered_pct = (len(filtered_data) / len(data)) * 100
+    logger.info(f"Filtered data to market hours only: {len(filtered_data)} / {len(data)} rows ({filtered_pct:.2f}%)")
+    
+    return filtered_data
 
 def walk_forward_testing(
     data: pd.DataFrame,
@@ -44,10 +145,19 @@ def walk_forward_testing(
     Returns:
         Dict: Results of walk-forward testing
     """
+    # Create session folder within models directory
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    session_folder = f'models/session_{timestamp}'
+    os.makedirs(f'{session_folder}/models', exist_ok=True)
+    os.makedirs(f'{session_folder}/plots', exist_ok=True)
+    os.makedirs(f'{session_folder}/reports', exist_ok=True)
+    
+    logger.info(f"Created session folder: {session_folder}")
+    
     # Check if data is empty
     if data is None or len(data) == 0:
         logger.error("Empty dataset provided for walk-forward testing")
-        return {
+        error_report = {
             "all_window_results": [],
             "avg_return": 0,
             "avg_portfolio": 0,
@@ -55,10 +165,12 @@ def walk_forward_testing(
             "num_windows": 0,
             "error": "Empty dataset"
         }
+        save_json(error_report, f'{session_folder}/reports/error_report.json')
+        return error_report
     
     if not isinstance(data.index, pd.DatetimeIndex):
         logger.error("Data index is not a DatetimeIndex, cannot perform walk-forward testing")
-        return {
+        error_report = {
             "all_window_results": [],
             "avg_return": 0,
             "avg_portfolio": 0,
@@ -66,6 +178,12 @@ def walk_forward_testing(
             "num_windows": 0,
             "error": "Invalid index type"
         }
+        save_json(error_report, f'{session_folder}/reports/error_report.json')
+        return error_report
+    
+    # Filter data to include only market hours
+    logger.info("Filtering data to include only NYSE market hours")
+    data = filter_market_hours(data)
     
     # Calculate number of samples per day safely
     try:
@@ -82,8 +200,8 @@ def walk_forward_testing(
             
         logger.info(f"Calculated {samples_per_day} samples per day")
     except (IndexError, ZeroDivisionError, AttributeError) as e:
-        logger.error(f"Error calculating samples per day: {e}. Using default value of 288 (5-minute intervals).")
-        samples_per_day = 288  # Default for 5-minute data (288 samples per day)
+        logger.error(f"Error calculating samples per day: {e}. Using default value of 78 (NYSE trading period 6.5 hours with 5-minute intervals).")
+        samples_per_day = 78  # Default for 5-minute data in NYSE hours (78 samples per day)
     
     # Convert window_size and step_size from days to samples
     window_samples = window_size * samples_per_day
@@ -95,9 +213,35 @@ def walk_forward_testing(
     # Store results for each window
     all_window_results = []
     
+    # Save session parameters
+    session_params = {
+        "timestamp": timestamp,
+        "window_size_days": window_size,
+        "step_size_days": step_size,
+        "train_ratio": train_ratio,
+        "validation_ratio": validation_ratio,
+        "initial_timesteps": initial_timesteps,
+        "additional_timesteps": additional_timesteps,
+        "max_iterations": max_iterations,
+        "n_stagnant_loops": n_stagnant_loops,
+        "improvement_threshold": improvement_threshold,
+        "num_windows": num_windows,
+        "data_start": data.index[0],
+        "data_end": data.index[-1],
+        "data_length": len(data),
+        "samples_per_day": samples_per_day,
+        "market_hours_only": True
+    }
+    
+    save_json(session_params, f'{session_folder}/reports/session_parameters.json')
+    
     # Walk-forward testing
     for i in range(num_windows):
         logger.info(f"\n{'='*80}\nStarting walk-forward window {i+1}/{num_windows}\n{'='*80}")
+        
+        # Create window folder
+        window_folder = f'{session_folder}/models/window_{i+1}'
+        os.makedirs(window_folder, exist_ok=True)
         
         # Extract data for this window
         start_idx = i * step_samples
@@ -116,15 +260,29 @@ def walk_forward_testing(
         logger.info(f"Validation period: {validation_data.index[0]} to {validation_data.index[-1]}")
         logger.info(f"Test period: {test_data.index[0]} to {test_data.index[-1]}")
         
+        # Save window periods
+        window_periods = {
+            "window": i+1,
+            "train_start": train_data.index[0],
+            "train_end": train_data.index[-1],
+            "validation_start": validation_data.index[0],
+            "validation_end": validation_data.index[-1],
+            "test_start": test_data.index[0],
+            "test_end": test_data.index[-1]
+        }
+        
+        save_json(window_periods, f'{window_folder}/window_periods.json')
+        
         # Create and train model
-        model = train_walk_forward_model(
+        model, training_stats = train_walk_forward_model(
             train_data, 
             validation_data,
             initial_timesteps=initial_timesteps,
             additional_timesteps=additional_timesteps,
             max_iterations=max_iterations,
             n_stagnant_loops=n_stagnant_loops,
-            improvement_threshold=improvement_threshold
+            improvement_threshold=improvement_threshold,
+            window_folder=window_folder
         )
         
         # Evaluate on test data
@@ -140,11 +298,19 @@ def walk_forward_testing(
         test_results["validation_end"] = validation_data.index[-1]
         test_results["test_start"] = test_data.index[0]
         test_results["test_end"] = test_data.index[-1]
+        test_results["training_stats"] = training_stats
         
         all_window_results.append(test_results)
         
+        # Save test results
+        save_json(test_results, f'{window_folder}/test_results.json')
+        
         # Save model for this window
-        model.save(f"walk_forward_model_{i+1}")
+        model.save(f"{window_folder}/model")
+        logger.info(f"Saved model for window {i+1} to {window_folder}/model")
+        
+        # Plot window performance
+        plot_window_performance(test_data, test_results, window_folder, i+1)
         
     # Aggregate results across all windows
     returns = [res["total_return_pct"] for res in all_window_results]
@@ -162,16 +328,25 @@ def walk_forward_testing(
     logger.info(f"Average final portfolio: ${avg_portfolio:.2f}")
     logger.info(f"Average trade count: {avg_trades:.2f}")
     
-    # Plot results
-    plot_walk_forward_results(all_window_results)
-    
-    return {
-        "all_window_results": all_window_results,
+    # Save summary results
+    summary_results = {
         "avg_return": avg_return,
         "avg_portfolio": avg_portfolio,
         "avg_trades": avg_trades,
-        "num_windows": num_windows
+        "num_windows": num_windows,
+        "timestamp": timestamp
     }
+    
+    # Don't include all window results in the summary JSON (they may contain non-serializable objects)
+    save_json(summary_results, f'{session_folder}/reports/summary_results.json')
+    
+    # Add window results back for the return value (not for JSON serialization)
+    summary_results["all_window_results"] = all_window_results
+    
+    # Plot results
+    plot_walk_forward_results(all_window_results, session_folder)
+    
+    return summary_results
 
 def train_walk_forward_model(
     train_data: pd.DataFrame,
@@ -180,8 +355,9 @@ def train_walk_forward_model(
     additional_timesteps: int = 5000,
     max_iterations: int = 10,
     n_stagnant_loops: int = 3,
-    improvement_threshold: float = 0.1
-) -> PPO:
+    improvement_threshold: float = 0.1,
+    window_folder: str = None
+) -> Tuple[PPO, List[Dict]]:
     """
     Train a model for a single walk-forward window.
     
@@ -193,9 +369,10 @@ def train_walk_forward_model(
         max_iterations: Maximum number of training iterations
         n_stagnant_loops: Number of consecutive iterations without improvement before stopping
         improvement_threshold: Minimum percentage improvement considered significant
+        window_folder: Folder to save training statistics
         
     Returns:
-        PPO: Trained model
+        Tuple[PPO, List[Dict]]: Trained model and training statistics
     """
     # Initialize training environment
     train_env = TradingEnv(
@@ -218,6 +395,9 @@ def train_walk_forward_model(
         gae_lambda=0.95,
     )
     
+    # Initialize training statistics list
+    training_stats = []
+    
     # Initial training
     logger.info(f"Starting initial training for {initial_timesteps} timesteps")
     model.learn(total_timesteps=initial_timesteps)
@@ -226,6 +406,17 @@ def train_walk_forward_model(
     results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
     best_return = results["total_return_pct"]
     best_model = model
+    
+    # Record initial training statistics
+    initial_stats = {
+        "iteration": 0,
+        "timesteps": initial_timesteps,
+        "return_pct": best_return,
+        "portfolio_value": results["final_portfolio_value"],
+        "trade_count": results["trade_count"],
+        "is_best": True
+    }
+    training_stats.append(initial_stats)
     
     logger.info(f"Initial validation return: {best_return:.2f}%")
     
@@ -245,11 +436,29 @@ def train_walk_forward_model(
         improvement = current_return - best_return
         logger.info(f"Iteration {iteration} - Validation return: {current_return:.2f}%, Improvement: {improvement:.2f}%")
         
+        # Record training statistics
+        is_best = current_return > best_return + improvement_threshold
+        iteration_stats = {
+            "iteration": iteration,
+            "timesteps": additional_timesteps,
+            "return_pct": current_return,
+            "portfolio_value": results["final_portfolio_value"],
+            "trade_count": results["trade_count"],
+            "improvement": improvement,
+            "is_best": is_best
+        }
+        training_stats.append(iteration_stats)
+        
         # Check if this is the best model so far
-        if current_return > best_return + improvement_threshold:
+        if is_best:
             best_return = current_return
             best_model = model
             logger.info(f"New best model found! Validation return: {best_return:.2f}%")
+            
+            # Save intermediate best model
+            if window_folder:
+                best_model.save(f"{window_folder}/best_model_iteration_{iteration}")
+                logger.info(f"Saved best model at iteration {iteration}")
             
             # Reset stagnant counter since we found improvement
             stagnant_counter = 0
@@ -264,14 +473,112 @@ def train_walk_forward_model(
             break
     
     logger.info(f"Training completed. Best validation return: {best_return:.2f}%")
-    return best_model
+    
+    # Plot training progress
+    if window_folder:
+        plot_training_progress(training_stats, window_folder)
+        
+        # Save training statistics
+        save_json(training_stats, f'{window_folder}/training_stats.json')
+    
+    return best_model, training_stats
 
-def plot_walk_forward_results(all_window_results: List[Dict]) -> None:
+def plot_training_progress(training_stats: List[Dict], window_folder: str) -> None:
+    """
+    Plot the training progress for a window.
+    
+    Args:
+        training_stats: List of training statistics dictionaries
+        window_folder: Folder to save the plot
+    """
+    iterations = [stat["iteration"] for stat in training_stats]
+    returns = [stat["return_pct"] for stat in training_stats]
+    is_best = [stat["is_best"] for stat in training_stats]
+    
+    plt.figure(figsize=(10, 6))
+    
+    # Plot returns
+    plt.plot(iterations, returns, marker='o', linestyle='-', color='blue', label='Validation Return')
+    
+    # Highlight best models
+    best_iterations = [iterations[i] for i in range(len(iterations)) if is_best[i]]
+    best_returns = [returns[i] for i in range(len(returns)) if is_best[i]]
+    plt.scatter(best_iterations, best_returns, color='green', s=100, marker='*', label='Best Model')
+    
+    plt.xlabel('Training Iteration')
+    plt.ylabel('Validation Return (%)')
+    plt.title('Training Progress')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    
+    # Save the plot
+    plt.tight_layout()
+    plt.savefig(f'{window_folder}/training_progress.png')
+    plt.close()
+
+def plot_window_performance(test_data: pd.DataFrame, test_results: Dict, window_folder: str, window_num: int) -> None:
+    """
+    Plot the performance of a window on test data.
+    
+    Args:
+        test_data: Test data for this window
+        test_results: Results dictionary from evaluation
+        window_folder: Folder to save the plot
+        window_num: Window number
+    """
+    if 'portfolio_history' not in test_results:
+        logger.warning(f"No portfolio history available for window {window_num}. Skipping performance plot.")
+        return
+    
+    portfolio_history = test_results['portfolio_history']
+    action_history = test_results.get('action_history', [])
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Plot portfolio value
+    plt.subplot(2, 1, 1)
+    plt.plot(portfolio_history, color='blue', label='Portfolio Value')
+    plt.title(f'Window {window_num} Test Performance')
+    plt.ylabel('Portfolio Value ($)')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    
+    # Plot price and trades if available
+    if 'close' in test_data.columns and len(action_history) > 0:
+        plt.subplot(2, 1, 2)
+        plt.plot(test_data.index, test_data['close'], color='gray', label='Price')
+        
+        # Plot buy and sell points
+        buy_indices = [i for i, action in enumerate(action_history) if action == 1]
+        sell_indices = [i for i, action in enumerate(action_history) if action == 2]
+        
+        if buy_indices:
+            buy_dates = [test_data.index[i] for i in buy_indices if i < len(test_data)]
+            buy_prices = [test_data['close'].iloc[i] for i in buy_indices if i < len(test_data)]
+            plt.scatter(buy_dates, buy_prices, color='green', marker='^', s=100, label='Buy')
+            
+        if sell_indices:
+            sell_dates = [test_data.index[i] for i in sell_indices if i < len(test_data)]
+            sell_prices = [test_data['close'].iloc[i] for i in sell_indices if i < len(test_data)]
+            plt.scatter(sell_dates, sell_prices, color='red', marker='v', s=100, label='Sell')
+            
+        plt.xlabel('Date')
+        plt.ylabel('Price')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+    
+    # Save the plot
+    plt.tight_layout()
+    plt.savefig(f'{window_folder}/test_performance.png')
+    plt.close()
+
+def plot_walk_forward_results(all_window_results: List[Dict], session_folder: str) -> None:
     """
     Plot the results of walk-forward testing.
     
     Args:
         all_window_results: List of results dictionaries from each walk-forward window
+        session_folder: Folder to save the plot
     """
     windows = [res["window"] for res in all_window_results]
     returns = [res["total_return_pct"] for res in all_window_results]
@@ -302,10 +609,26 @@ def plot_walk_forward_results(all_window_results: List[Dict]) -> None:
     
     # Adjust layout
     plt.tight_layout()
-    plt.savefig('walk_forward_results.png')
-    plt.show()
+    plt.savefig(f'{session_folder}/plots/walk_forward_results.png')
+    plt.close()
+    
+    # Also create and save a cumulative return plot
+    plt.figure(figsize=(12, 6))
+    cumulative_returns = np.cumsum(returns)
+    plt.plot(windows, cumulative_returns, marker='o', linestyle='-', color='blue')
+    plt.xlabel('Walk-Forward Window')
+    plt.ylabel('Cumulative Return (%)')
+    plt.title('Cumulative Returns Across Walk-Forward Windows')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(f'{session_folder}/plots/cumulative_returns.png')
+    plt.close()
 
 def main():
+    # Create model directories if they don't exist
+    os.makedirs('models', exist_ok=True)
+    os.makedirs('models/logs', exist_ok=True)
+    
     # Load all data
     train_data, validation_data, test_data = get_data(
         symbol=config["data"]["symbol"],
@@ -323,6 +646,7 @@ def main():
     
     full_data = train_data  # Just get the first part (full dataset)
     logger.info(f"Loaded dataset with {len(full_data)} rows spanning from {full_data.index[0]} to {full_data.index[-1]}")
+    logger.info("Note: Dataset will be filtered to include only NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)")
     
     # Get walk-forward parameters from config or use defaults
     wf_config = config.get("walk_forward", {})
@@ -360,6 +684,8 @@ def main():
     print(f"Average return: {results['avg_return']:.2f}%")
     print(f"Average final portfolio: ${results['avg_portfolio']:.2f}")
     print(f"Average trade count: {results['avg_trades']:.2f}")
+    print(f"Results saved to models/session_{results['timestamp']}")
+    print("Note: Training was performed only on NYSE market hours data (9:30 AM to 4:00 PM ET, Monday to Friday)")
 
 if __name__ == "__main__":
     main() 

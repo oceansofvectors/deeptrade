@@ -1,0 +1,18 @@
+{
+    "timestamp": "20250317_210327",
+    "window_size_days": 60,
+    "step_size_days": 7,
+    "train_ratio": 0.7,
+    "validation_ratio": 0.15,
+    "initial_timesteps": 10000,
+    "additional_timesteps": 10000,
+    "max_iterations": 500,
+    "n_stagnant_loops": 20,
+    "improvement_threshold": 0.05,
+    "num_windows": 7,
+    "data_start": "2024-11-25 14:30:00",
+    "data_end": "2025-03-12 20:00:00",
+    "data_length": 5746,
+    "samples_per_day": 53,
+    "market_hours_only": true
+}
