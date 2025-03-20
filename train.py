@@ -179,6 +179,7 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
     
     trade_history = []
     trade_count = 0
+    profitable_trades = 0  # Track number of profitable trades
     action_counts = {0: 0, 1: 0}  # Track action distribution (0: long/buy, 1: short/sell)
 
     # Records for plotting
@@ -192,6 +193,9 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
     sell_dates, sell_prices = [], []
 
     prev_position = env.position
+    prev_net_worth = env.net_worth  # Track previous net worth to determine if a trade was profitable
+    entry_net_worth = env.net_worth  # Track net worth at entry for calculating trade profitability
+    entry_positions = {-1: None, 1: None}  # Track entry net worth for both short and long positions
     
     # Only log initial state if verbose > 1
     if verbose > 1:
@@ -218,24 +222,48 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
             if verbose > 1:
                 logger.info(f"Position changed from {prev_position} to {env.position} at step {step_counter}, price {current_price}")
             
-            trade_count += 1
-
-            if (prev_position, env.position) in [(0, 1), (-1, 1)]:
+            # Count trades more accurately:
+            # 1. Closing a position (going from non-zero to zero) counts as 1 trade
+            # 2. Opening a position (going from zero to non-zero) doesn't add to trade count (it's part of entry/exit pair)
+            # 3. Switching positions directly (e.g., long to short) counts as 2 trades (close previous + open new)
+            
+            if prev_position != 0:
+                # We're closing or changing a position
+                trade_count += 1
+                
+                # Check if the trade was profitable based on the position type
+                position_type = "long" if prev_position > 0 else "short"
+                position_entry_worth = entry_positions.get(prev_position)
+                
+                if position_entry_worth is not None:
+                    # For long positions, profit when exit value > entry value
+                    # For short positions, profit when exit value < entry value
+                    is_profitable = False
+                    if prev_position > 0:  # Long position
+                        is_profitable = env.net_worth > position_entry_worth
+                    else:  # Short position
+                        is_profitable = env.net_worth > position_entry_worth
+                    
+                    if is_profitable:
+                        profitable_trades += 1
+                        if verbose > 1:
+                            logger.info(f"Profitable {position_type} trade completed. Profit: {float(env.net_worth - position_entry_worth):.2f}")
+                    elif verbose > 1:
+                        logger.info(f"Unprofitable {position_type} trade completed. Loss: {float(position_entry_worth - env.net_worth):.2f}")
+            
+            # If we're opening a new position, record the entry value
+            if env.position != 0:
+                entry_positions[env.position] = env.net_worth
+            
+            # Record the trade
+            if (prev_position, env.position) in [(0, 1), (-1, 1), (-1, 0)]:
                 buy_dates.append(current_date)
                 buy_prices.append(current_price)
                 trade_type = "Buy"
-            elif (prev_position, env.position) in [(0, -1), (1, -1)]:
+            elif (prev_position, env.position) in [(0, -1), (1, -1), (1, 0)]:
                 sell_dates.append(current_date)
                 sell_prices.append(current_price)
                 trade_type = "Sell"
-            elif prev_position == 1 and env.position == 0:
-                sell_dates.append(current_date)
-                sell_prices.append(current_price)
-                trade_type = "Sell"
-            elif prev_position == -1 and env.position == 0:
-                buy_dates.append(current_date)
-                buy_prices.append(current_price)
-                trade_type = "Buy"
                 
             # Ensure portfolio value is never negative in the trade history
             portfolio_value = max(Decimal('0.01'), env.net_worth)
@@ -244,8 +272,13 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
                 "date": current_date,
                 "trade_type": trade_type,
                 "price": current_price,
-                "portfolio_value": float(portfolio_value)  # Convert Decimal to float for serialization
+                "portfolio_value": float(portfolio_value),  # Convert Decimal to float for serialization
+                "profitable": float(portfolio_value) > float(prev_net_worth),  # Track if this specific action was profitable
+                "position_from": prev_position,
+                "position_to": env.position
             })
+            
+            prev_net_worth = env.net_worth
 
         step_counter += 1
         dates.append(current_date)
@@ -258,10 +291,18 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
     # Calculate percentage return using the money module
     total_return_pct = money.calculate_return_pct(env.net_worth, initial_net_worth)
     
+    # Calculate hit rate (percentage of profitable trades)
+    hit_rate = 0
+    if trade_count > 0:
+        hit_rate = (profitable_trades / trade_count) * 100
+    
     # Only log detailed evaluation if verbose > 0
     if verbose > 0:
         logger.info("Evaluation completed: Final portfolio value: $%s (%.2f%% return), Total trades: %d",
                     money.format_money_str(env.net_worth), float(total_return_pct), trade_count)
+        
+        if trade_count > 0:
+            logger.info("Hit rate: %.2f%% (%d/%d profitable trades)", hit_rate, profitable_trades, trade_count)
         
         # Log action distribution only if verbose > 1
         if verbose > 1:
@@ -271,6 +312,8 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
         "final_portfolio_value": float(money.format_money(env.net_worth, 2)),
         "total_return_pct": float(money.format_money(total_return_pct, 2)),
         "trade_count": trade_count,
+        "profitable_trades": profitable_trades,
+        "hit_rate": hit_rate,
         "final_position": env.position,
         "dates": dates,
         "price_history": price_history,
@@ -426,13 +469,14 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
     logger.info("Trade history saved to %s", filename)
 
 def main():
-    # Load data using settings from YAML with three-way split
+    # Load data using settings from YAML with three-way split and direct Yahoo Finance download
     train_data, validation_data, test_data = get_data(
         symbol=config["data"]["symbol"],
         period=config["data"]["period"],
         interval=config["data"]["interval"],
         train_ratio=config["data"].get("train_ratio", 0.7),
-        validation_ratio=config["data"].get("validation_ratio", 0.15)
+        validation_ratio=config["data"].get("validation_ratio", 0.15),
+        use_yfinance=True  # Use Yahoo Finance directly
     )
 
     # Use the iterative training approach with validation data for model selection

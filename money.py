@@ -210,4 +210,70 @@ def calculate_trailing_stop_price(reference_price, trailing_stop_pct, position):
     if position == 1:  # Long position
         return reference_price * (Decimal('1') - trailing_stop_pct / Decimal('100'))
     else:  # Short position
-        return reference_price * (Decimal('1') + trailing_stop_pct / Decimal('100')) 
+        return reference_price * (Decimal('1') + trailing_stop_pct / Decimal('100'))
+
+def calculate_portfolio_stop_loss_price(entry_price, stop_loss_pct, position, portfolio_value, contracts, initial_price_per_point=20.0):
+    """
+    Calculate stop loss price based on a percentage of the portfolio value instead of entry price.
+    
+    Args:
+        entry_price: Entry price
+        stop_loss_pct: Stop loss percentage of portfolio
+        position: Position (1 for long, -1 for short)
+        portfolio_value: Current portfolio value
+        contracts: Number of contracts
+        initial_price_per_point: Dollar value per point (default: $20 for NQ futures)
+        
+    Returns:
+        Decimal: Stop loss price
+    """
+    entry_price = to_decimal(entry_price)
+    stop_loss_pct = to_decimal(stop_loss_pct)
+    portfolio_value = to_decimal(portfolio_value)
+    contracts = to_decimal(contracts)
+    initial_price_per_point = to_decimal(initial_price_per_point)
+    
+    # Calculate maximum loss in dollars (percentage of portfolio)
+    max_loss_dollars = portfolio_value * (stop_loss_pct / Decimal('100'))
+    
+    # Calculate how many points this represents based on contracts and price per point
+    max_loss_points = max_loss_dollars / (contracts * initial_price_per_point)
+    
+    # Calculate the stop loss price based on entry price and max loss points
+    if position == 1:  # Long position
+        return entry_price - max_loss_points
+    else:  # Short position
+        return entry_price + max_loss_points
+
+def calculate_portfolio_take_profit_price(entry_price, take_profit_pct, position, portfolio_value, contracts, initial_price_per_point=20.0):
+    """
+    Calculate take profit price based on a percentage of the portfolio value instead of entry price.
+    
+    Args:
+        entry_price: Entry price
+        take_profit_pct: Take profit percentage of portfolio
+        position: Position (1 for long, -1 for short)
+        portfolio_value: Current portfolio value
+        contracts: Number of contracts
+        initial_price_per_point: Dollar value per point (default: $20 for NQ futures)
+        
+    Returns:
+        Decimal: Take profit price
+    """
+    entry_price = to_decimal(entry_price)
+    take_profit_pct = to_decimal(take_profit_pct)
+    portfolio_value = to_decimal(portfolio_value)
+    contracts = to_decimal(contracts)
+    initial_price_per_point = to_decimal(initial_price_per_point)
+    
+    # Calculate target profit in dollars (percentage of portfolio)
+    target_profit_dollars = portfolio_value * (take_profit_pct / Decimal('100'))
+    
+    # Calculate how many points this represents based on contracts and price per point
+    target_profit_points = target_profit_dollars / (contracts * initial_price_per_point)
+    
+    # Calculate the take profit price based on entry price and target profit points
+    if position == 1:  # Long position
+        return entry_price + target_profit_points
+    else:  # Short position
+        return entry_price - target_profit_points 

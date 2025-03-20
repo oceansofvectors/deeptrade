@@ -12,6 +12,7 @@ from stable_baselines3 import PPO
 from environment import TradingEnv
 from get_data import get_data
 from train import evaluate_agent, plot_results
+from trade import trade_with_risk_management, save_trade_history  # Import trade_with_risk_management and save_trade_history
 from config import config
 import money
 
@@ -115,6 +116,123 @@ def filter_market_hours(data: pd.DataFrame) -> pd.DataFrame:
     
     return filtered_data
 
+def get_trading_days(data: pd.DataFrame) -> List[str]:
+    """
+    Extract unique trading days from a DataFrame with filtered market hours.
+    
+    Args:
+        data: DataFrame with DatetimeIndex in UTC, already filtered to market hours
+        
+    Returns:
+        List[str]: List of unique trading days in YYYY-MM-DD format
+    """
+    # Ensure index is timezone-aware and convert to Eastern Time for day counting
+    if data.index.tz is None:
+        data_index = data.index.tz_localize('UTC')
+    else:
+        data_index = data.index.copy()
+    
+    eastern = pytz.timezone('US/Eastern')
+    data_index = data_index.tz_convert(eastern)
+    
+    # Extract date part (without time) and get unique days
+    unique_days = sorted(set(data_index.date.astype(str)))
+    logger.info(f"Found {len(unique_days)} unique trading days in the dataset")
+    
+    return unique_days
+
+def calculate_hit_rate_from_trade_results(results: Dict) -> Dict:
+    """
+    Calculate hit rate and profitable trades from trade_with_risk_management results.
+    
+    Args:
+        results: Results dictionary from trade_with_risk_management
+        
+    Returns:
+        Dict: Updated results with hit rate metrics
+    """
+    # Initialize metrics
+    profitable_trades = 0
+    total_trades = results.get("trade_count", 0)
+    hit_rate = 0.0
+    
+    # Process trade history to count profitable trades
+    if 'trade_history' in results and len(results['trade_history']) > 0:
+        # Filter for complete trades (those with 'profit' field)
+        # In trade_with_risk_management, the trade history includes both entries and exits
+        # Only exits have a 'profit' field
+        trades_with_profit = [trade for trade in results['trade_history'] if 'profit' in trade]
+        
+        # Count profitable trades (those with positive profit)
+        profitable_trades = sum(1 for trade in trades_with_profit if float(trade.get('profit', 0)) > 0)
+        
+        # Calculate hit rate if we have trades with profit info
+        total_completed_trades = len(trades_with_profit)
+        if total_completed_trades > 0:
+            hit_rate = (profitable_trades / total_completed_trades) * 100
+            
+            # Log trade profitability breakdown
+            logger.debug(f"Trade profitability: {profitable_trades} profitable out of {total_completed_trades} completed trades")
+            if len(trades_with_profit) > 0:
+                avg_profit = sum(float(trade.get('profit', 0)) for trade in trades_with_profit) / len(trades_with_profit)
+                logger.debug(f"Average profit per trade: ${avg_profit:.2f}")
+    
+    # Update results dictionary with hit rate metrics
+    results["hit_rate"] = hit_rate
+    results["profitable_trades"] = profitable_trades
+    results["completed_trades"] = len(trades_with_profit) if 'trade_history' in results else 0
+    
+    return results
+
+def export_consolidated_trade_history(all_window_results: List[Dict], session_folder: str) -> None:
+    """
+    Consolidate trade histories from all windows into a single CSV file.
+    
+    Args:
+        all_window_results: List of results dictionaries from each walk-forward window
+        session_folder: Folder to save the consolidated trade history
+    """
+    # Check if we have trade histories to consolidate
+    windows_with_history = [res for res in all_window_results if 'trade_history' in res and res['trade_history']]
+    
+    if not windows_with_history:
+        logger.warning("No trade histories found in any window. Skipping consolidated export.")
+        return
+    
+    # Create empty list to store all trades
+    all_trades = []
+    
+    # Process each window's trade history
+    for res in all_window_results:
+        window_num = res.get("window", 0)
+        
+        if 'trade_history' in res and res['trade_history']:
+            # Add window number to each trade
+            for trade in res['trade_history']:
+                trade_copy = trade.copy()
+                trade_copy['window'] = window_num
+                trade_copy['test_start'] = res.get('test_start', '')
+                trade_copy['test_end'] = res.get('test_end', '')
+                all_trades.append(trade_copy)
+    
+    if not all_trades:
+        logger.warning("No trades found in any window. Skipping consolidated export.")
+        return
+    
+    # Convert to DataFrame
+    consolidated_df = pd.DataFrame(all_trades)
+    
+    # Sort by date
+    if 'date' in consolidated_df.columns:
+        consolidated_df.sort_values('date', inplace=True)
+    
+    # Save to CSV
+    export_path = f'{session_folder}/reports/all_windows_trade_history.csv'
+    consolidated_df.to_csv(export_path, index=False)
+    
+    logger.info(f"Exported consolidated trade history from {len(windows_with_history)} windows "
+               f"with {len(all_trades)} trades to {export_path}")
+
 def walk_forward_testing(
     data: pd.DataFrame,
     window_size: int,
@@ -132,8 +250,8 @@ def walk_forward_testing(
     
     Args:
         data: Full dataset with all technical indicators
-        window_size: Size of each walk-forward window in days
-        step_size: Number of days to step forward at each iteration
+        window_size: Size of each walk-forward window in trading days (not calendar days)
+        step_size: Number of trading days to step forward at each iteration
         train_ratio: Proportion of window to use for training
         validation_ratio: Proportion of window to use for validation
         initial_timesteps: Initial number of training timesteps
@@ -185,39 +303,39 @@ def walk_forward_testing(
     logger.info("Filtering data to include only NYSE market hours")
     data = filter_market_hours(data)
     
-    # Calculate number of samples per day safely
-    try:
-        time_span = (data.index[-1] - data.index[0]).days
-        if time_span <= 0:
-            # If data spans less than a day, use number of hours instead
-            hours_span = (data.index[-1] - data.index[0]).total_seconds() / 3600
-            if hours_span <= 0:
-                samples_per_day = len(data)  # Use all samples if time span is too small
-            else:
-                samples_per_day = int(len(data) / hours_span * 24)  # Convert hours to days
-        else:
-            samples_per_day = int(len(data) / time_span)
-            
-        logger.info(f"Calculated {samples_per_day} samples per day")
-    except (IndexError, ZeroDivisionError, AttributeError) as e:
-        logger.error(f"Error calculating samples per day: {e}. Using default value of 78 (NYSE trading period 6.5 hours with 5-minute intervals).")
-        samples_per_day = 78  # Default for 5-minute data in NYSE hours (78 samples per day)
+    # Get list of unique trading days in the dataset
+    trading_days = get_trading_days(data)
+    logger.info(f"Total number of trading days in dataset: {len(trading_days)}")
     
-    # Convert window_size and step_size from days to samples
-    window_samples = window_size * samples_per_day
-    step_samples = step_size * samples_per_day
+    # Verify we have enough data for at least one window
+    if len(trading_days) < window_size:
+        logger.error(f"Not enough trading days in dataset ({len(trading_days)}) for window size ({window_size})")
+        error_report = {
+            "all_window_results": [],
+            "avg_return": 0,
+            "avg_portfolio": 0,
+            "avg_trades": 0,
+            "num_windows": 0,
+            "error": "Insufficient trading days"
+        }
+        save_json(error_report, f'{session_folder}/reports/error_report.json')
+        return error_report
     
-    # Number of walk-forward windows
-    num_windows = (len(data) - window_samples) // step_samples + 1
+    # Calculate number of windows
+    num_windows = max(1, (len(trading_days) - window_size) // step_size + 1)
+    logger.info(f"Number of walk-forward windows: {num_windows}")
     
     # Store results for each window
     all_window_results = []
     
+    # Get evaluation metric from config
+    eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
+    
     # Save session parameters
     session_params = {
         "timestamp": timestamp,
-        "window_size_days": window_size,
-        "step_size_days": step_size,
+        "window_size_trading_days": window_size,
+        "step_size_trading_days": step_size,
         "train_ratio": train_ratio,
         "validation_ratio": validation_ratio,
         "initial_timesteps": initial_timesteps,
@@ -229,8 +347,9 @@ def walk_forward_testing(
         "data_start": data.index[0],
         "data_end": data.index[-1],
         "data_length": len(data),
-        "samples_per_day": samples_per_day,
-        "market_hours_only": True
+        "total_trading_days": len(trading_days),
+        "market_hours_only": True,
+        "evaluation_metric": eval_metric
     }
     
     save_json(session_params, f'{session_folder}/reports/session_parameters.json')
@@ -243,10 +362,32 @@ def walk_forward_testing(
         window_folder = f'{session_folder}/models/window_{i+1}'
         os.makedirs(window_folder, exist_ok=True)
         
-        # Extract data for this window
-        start_idx = i * step_samples
-        end_idx = start_idx + window_samples
-        window_data = data.iloc[start_idx:end_idx].copy()
+        # Calculate start and end trading days for this window
+        start_day_idx = i * step_size
+        end_day_idx = start_day_idx + window_size
+        if end_day_idx > len(trading_days):
+            end_day_idx = len(trading_days)
+        
+        start_day = trading_days[start_day_idx]
+        end_day = trading_days[end_day_idx - 1]  # -1 because end_day_idx is exclusive
+        
+        logger.info(f"Window {i+1} trading days: {start_day} to {end_day}")
+        
+        # Convert to Eastern timezone for proper day-based filtering
+        eastern = pytz.timezone('US/Eastern')
+        data_eastern = data.copy()
+        data_eastern.index = data_eastern.index.tz_convert(eastern)
+        
+        # Extract data for this window by trading days
+        window_mask = (data_eastern.index.date.astype(str) >= start_day) & (data_eastern.index.date.astype(str) <= end_day)
+        window_data = data_eastern[window_mask].copy()
+        
+        # Convert back to UTC
+        window_data.index = window_data.index.tz_convert('UTC')
+        
+        # Log window data range
+        logger.info(f"Window {i+1} data range: {window_data.index[0]} to {window_data.index[-1]} (UTC)")
+        logger.info(f"Window {i+1} data points: {len(window_data)}")
         
         # Split window into train, validation, and test sets
         train_idx = int(len(window_data) * train_ratio)
@@ -286,9 +427,122 @@ def walk_forward_testing(
         )
         
         # Evaluate on test data
-        test_results = evaluate_agent(model, test_data, deterministic=True)
-        logger.info(f"Test Results - Return: {test_results['total_return_pct']:.2f}%, "
-                   f"Portfolio: ${test_results['final_portfolio_value']:.2f}")
+        # Get risk management configuration from config
+        risk_config = config.get("risk_management", {})
+        risk_enabled = risk_config.get("enabled", False)
+        
+        if risk_enabled:
+            # Initialize risk parameters
+            stop_loss_pct = None
+            take_profit_pct = None
+            trailing_stop_pct = None
+            position_size = 1.0
+            max_risk_per_trade_pct = 2.0
+            
+            # Apply risk management configuration
+            # Stop loss configuration
+            stop_loss_config = risk_config.get("stop_loss", {})
+            if stop_loss_config.get("enabled", False):
+                stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            
+            # Take profit configuration
+            take_profit_config = risk_config.get("take_profit", {})
+            if take_profit_config.get("enabled", False):
+                take_profit_pct = take_profit_config.get("percentage", 2.0)
+            
+            # Trailing stop configuration
+            trailing_stop_config = risk_config.get("trailing_stop", {})
+            if trailing_stop_config.get("enabled", False):
+                trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
+            
+            # Position sizing configuration
+            position_sizing_config = risk_config.get("position_sizing", {})
+            if position_sizing_config.get("enabled", False):
+                position_size = position_sizing_config.get("size_multiplier", 1.0)
+                max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
+                logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
+            else:
+                logger.info("  - Position sizing: Disabled")
+            
+            # Save the model temporarily for evaluation
+            temp_model_path = f"{window_folder}/temp_test_model"
+            model.save(temp_model_path)
+            
+            # Evaluate with risk management
+            test_results = trade_with_risk_management(
+                model_path=temp_model_path,
+                test_data=test_data,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                trailing_stop_pct=trailing_stop_pct,
+                position_size=position_size,
+                max_risk_per_trade_pct=max_risk_per_trade_pct,
+                initial_balance=config["environment"]["initial_balance"],
+                transaction_cost=config["environment"].get("transaction_cost", 0.0),
+                verbose=1,
+                deterministic=True
+            )
+            
+            # Clean up temporary model file
+            if os.path.exists(f"{temp_model_path}.zip"):
+                os.remove(f"{temp_model_path}.zip")
+                
+            # Calculate hit rate from trade results
+            test_results = calculate_hit_rate_from_trade_results(test_results)
+            
+            logger.info(f"Evaluated model with risk management: stop_loss={stop_loss_pct}%, " +
+                      f"take_profit={take_profit_pct}%, trailing_stop={trailing_stop_pct}%")
+        else:
+            # Use standard evaluation without risk management
+            test_results = evaluate_agent(model, test_data, deterministic=True)
+            logger.info("Evaluated model without risk management")
+        
+        # Log appropriate metrics based on evaluation metric
+        if eval_metric == "hit_rate" and test_results["trade_count"] > 0:
+            logger.info(f"Test Results - Hit Rate: {test_results['hit_rate']:.2f}% " +
+                       f"({test_results['profitable_trades']}/{test_results['trade_count']} trades), " +
+                       f"Portfolio: ${test_results['final_portfolio_value']:.2f}")
+        else:
+            logger.info(f"Test Results - Return: {test_results['total_return_pct']:.2f}%, " +
+                      f"Portfolio: ${test_results['final_portfolio_value']:.2f}")
+        
+        # Save trade history to CSV if available
+        if 'trade_history' in test_results and test_results['trade_history']:
+            # Create CSV file path for this window's trade history
+            trade_history_file = f'{window_folder}/test_trade_history.csv'
+            
+            # Save trade history
+            save_trade_history(test_results['trade_history'], trade_history_file)
+            logger.info(f"Saved test trade history to {trade_history_file}")
+            
+            # Create a summary of trade performance stats
+            trade_summary = {}
+            
+            # Extract stop loss, take profit, and trailing stop info if available
+            if risk_enabled:
+                exit_reasons = test_results.get('exit_reasons', {})
+                
+                trade_summary['total_trades'] = test_results['trade_count']
+                trade_summary['profitable_trades'] = test_results.get('profitable_trades', 0)
+                trade_summary['hit_rate'] = test_results.get('hit_rate', 0)
+                
+                # Count trades by exit reason
+                trade_summary['stop_loss_exits'] = exit_reasons.get('stop_loss', 0)
+                trade_summary['take_profit_exits'] = exit_reasons.get('take_profit', 0)
+                trade_summary['trailing_stop_exits'] = exit_reasons.get('trailing_stop', 0)
+                trade_summary['model_signal_exits'] = exit_reasons.get('model_signal', 0)
+                
+                # Calculate percentages of exit reasons
+                total_exits = sum(exit_reasons.values())
+                if total_exits > 0:
+                    trade_summary['stop_loss_pct'] = (exit_reasons.get('stop_loss', 0) / total_exits) * 100
+                    trade_summary['take_profit_pct'] = (exit_reasons.get('take_profit', 0) / total_exits) * 100
+                    trade_summary['trailing_stop_pct'] = (exit_reasons.get('trailing_stop', 0) / total_exits) * 100
+                    trade_summary['model_signal_pct'] = (exit_reasons.get('model_signal', 0) / total_exits) * 100
+                
+                # Save trade summary
+                save_json(trade_summary, f'{window_folder}/trade_summary.json')
+                logger.info(f"Saved trade summary to {window_folder}/trade_summary.json")
         
         # Save results for this window
         test_results["window"] = i + 1
@@ -317,24 +571,38 @@ def walk_forward_testing(
     portfolio_values = [res["final_portfolio_value"] for res in all_window_results]
     trade_counts = [res["trade_count"] for res in all_window_results]
     
+    # Also aggregate hit rates if that metric is used
+    hit_rates = [res.get("hit_rate", 0) for res in all_window_results]
+    profitable_trades = [res.get("profitable_trades", 0) for res in all_window_results]
+    
     # Calculate average metrics
     avg_return = np.mean(returns)
     avg_portfolio = np.mean(portfolio_values)
     avg_trades = np.mean(trade_counts)
+    avg_hit_rate = np.mean(hit_rates) if hit_rates else 0
+    avg_profitable_trades = np.mean(profitable_trades) if profitable_trades else 0
     
     logger.info(f"\n{'='*80}\nWalk-Forward Testing Summary\n{'='*80}")
     logger.info(f"Number of windows: {num_windows}")
     logger.info(f"Average return: {avg_return:.2f}%")
+    
+    if eval_metric == "hit_rate":
+        logger.info(f"Average hit rate: {avg_hit_rate:.2f}%")
+        logger.info(f"Average profitable trades: {avg_profitable_trades:.2f} out of {avg_trades:.2f}")
+    
     logger.info(f"Average final portfolio: ${avg_portfolio:.2f}")
     logger.info(f"Average trade count: {avg_trades:.2f}")
     
     # Save summary results
     summary_results = {
         "avg_return": avg_return,
+        "avg_hit_rate": avg_hit_rate,
         "avg_portfolio": avg_portfolio,
         "avg_trades": avg_trades,
+        "avg_profitable_trades": avg_profitable_trades,
         "num_windows": num_windows,
-        "timestamp": timestamp
+        "timestamp": timestamp,
+        "evaluation_metric": eval_metric
     }
     
     # Don't include all window results in the summary JSON (they may contain non-serializable objects)
@@ -344,7 +612,10 @@ def walk_forward_testing(
     summary_results["all_window_results"] = all_window_results
     
     # Plot results
-    plot_walk_forward_results(all_window_results, session_folder)
+    plot_walk_forward_results(all_window_results, session_folder, eval_metric)
+    
+    # Export consolidated trade history
+    export_consolidated_trade_history(all_window_results, session_folder)
     
     return summary_results
 
@@ -398,27 +669,138 @@ def train_walk_forward_model(
     # Initialize training statistics list
     training_stats = []
     
+    # Get evaluation metric from config
+    eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
+    hit_rate_min_trades = config.get("training", {}).get("evaluation", {}).get("hit_rate_min_trades", 5)
+    
+    # Log which metric we're using for evaluation
+    if eval_metric == "hit_rate":
+        logger.info(f"Using hit rate as evaluation metric with minimum {hit_rate_min_trades} trades")
+    else:
+        logger.info(f"Using return percentage as evaluation metric")
+    
+    # Get risk management configuration from config
+    risk_config = config.get("risk_management", {})
+    risk_enabled = risk_config.get("enabled", False)
+    
+    # Initialize risk parameters
+    stop_loss_pct = None
+    take_profit_pct = None
+    trailing_stop_pct = None
+    position_size = 1.0
+    max_risk_per_trade_pct = 2.0
+    
+    # Apply risk management configuration if enabled
+    if risk_enabled:
+        logger.info("Risk management is enabled for model evaluation")
+        # Stop loss configuration
+        stop_loss_config = risk_config.get("stop_loss", {})
+        if stop_loss_config.get("enabled", False):
+            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            logger.info(f"Stop loss enabled at {stop_loss_pct}%")
+        
+        # Take profit configuration
+        take_profit_config = risk_config.get("take_profit", {})
+        if take_profit_config.get("enabled", False):
+            take_profit_pct = take_profit_config.get("percentage", 2.0)
+            logger.info(f"Take profit enabled at {take_profit_pct}%")
+        
+        # Trailing stop configuration
+        trailing_stop_config = risk_config.get("trailing_stop", {})
+        if trailing_stop_config.get("enabled", False):
+            trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
+            logger.info(f"Trailing stop enabled at {trailing_stop_pct}%")
+        
+        # Position sizing configuration
+        position_sizing_config = risk_config.get("position_sizing", {})
+        if position_sizing_config.get("enabled", False):
+            position_size = position_sizing_config.get("size_multiplier", 1.0)
+            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
+            logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
+        else:
+            logger.info("  - Position sizing: Disabled")
+    else:
+        logger.info("Risk management is disabled for model evaluation")
+    
     # Initial training
     logger.info(f"Starting initial training for {initial_timesteps} timesteps")
     model.learn(total_timesteps=initial_timesteps)
     
     # Evaluate initial model on validation data
-    results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-    best_return = results["total_return_pct"]
+    if risk_enabled and window_folder:
+        # Save the model temporarily for evaluation with risk management
+        temp_model_path = f"{window_folder}/temp_model_initial"
+        model.save(temp_model_path)
+        
+        # Evaluate with risk management
+        results = trade_with_risk_management(
+            model_path=temp_model_path,
+            test_data=validation_data,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct,
+            position_size=position_size,
+            max_risk_per_trade_pct=max_risk_per_trade_pct,
+            initial_balance=config["environment"]["initial_balance"],
+            transaction_cost=config["environment"].get("transaction_cost", 0.0),
+            verbose=0,
+            deterministic=True
+        )
+        
+        # Clean up temporary model file
+        if os.path.exists(f"{temp_model_path}.zip"):
+            os.remove(f"{temp_model_path}.zip")
+        
+        # Calculate hit rate from trade results
+        results = calculate_hit_rate_from_trade_results(results)
+    else:
+        # Use standard evaluation without risk management
+        results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
+    
+    # Log detailed trade statistics for debugging
+    logger.info(f"Initial evaluation - Trade count: {results['trade_count']}, " +
+               f"Profitable trades: {results.get('profitable_trades', 0)}, " +
+               f"Hit rate: {results.get('hit_rate', 0):.2f}%")
+
+    # Print a sample of trade history for debugging
+    if 'trade_history' in results and results['trade_history']:
+        sample_size = min(5, len(results['trade_history']))
+        logger.info(f"Sample of first {sample_size} trades:")
+        for i, trade in enumerate(results['trade_history'][:sample_size]):
+            logger.info(f"Trade {i+1}: {trade.get('action', 'N/A')}, " +
+                        f"Price: {trade.get('price', 'N/A')}, " +
+                        f"Profit: {trade.get('profit', 'N/A')}")
+    
+    # Determine best metric value depending on config
+    if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
+        best_metric_value = results["hit_rate"]
+        best_metric_name = "hit rate"
+    else:
+        # Default to return if hit_rate is selected but not enough trades, or if return is selected
+        best_metric_value = results["total_return_pct"]
+        best_metric_name = "return"
+        if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
+            logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
+    
     best_model = model
     
     # Record initial training statistics
     initial_stats = {
         "iteration": 0,
         "timesteps": initial_timesteps,
-        "return_pct": best_return,
+        "return_pct": results["total_return_pct"],
+        "hit_rate": results.get("hit_rate", 0),
         "portfolio_value": results["final_portfolio_value"],
         "trade_count": results["trade_count"],
+        "profitable_trades": results.get("profitable_trades", 0),
+        "metric_used": best_metric_name,
+        "metric_value": best_metric_value,
         "is_best": True
     }
     training_stats.append(initial_stats)
     
-    logger.info(f"Initial validation return: {best_return:.2f}%")
+    logger.info(f"Initial validation {best_metric_name}: {best_metric_value:.2f}" + 
+               (f"%" if best_metric_name == "return" else "% (profitable trades)"))
     
     # Counter for consecutive iterations without significant improvement
     stagnant_counter = 0
@@ -429,21 +811,76 @@ def train_walk_forward_model(
         model.learn(total_timesteps=additional_timesteps)
         
         # Evaluate on validation data
-        results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-        current_return = results["total_return_pct"]
+        if risk_enabled and window_folder:
+            # Save the model temporarily for evaluation with risk management
+            temp_model_path = f"{window_folder}/temp_model_iteration_{iteration}"
+            model.save(temp_model_path)
+            
+            # Evaluate with risk management
+            results = trade_with_risk_management(
+                model_path=temp_model_path,
+                test_data=validation_data,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                trailing_stop_pct=trailing_stop_pct,
+                position_size=position_size,
+                max_risk_per_trade_pct=max_risk_per_trade_pct,
+                initial_balance=config["environment"]["initial_balance"],
+                transaction_cost=config["environment"].get("transaction_cost", 0.0),
+                verbose=0,
+                deterministic=True
+            )
+            
+            # Clean up temporary model file
+            if os.path.exists(f"{temp_model_path}.zip"):
+                os.remove(f"{temp_model_path}.zip")
+            
+            # Calculate hit rate from trade results
+            results = calculate_hit_rate_from_trade_results(results)
+        else:
+            # Use standard evaluation without risk management
+            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
+        
+        # Log detailed trade statistics for debugging
+        logger.info(f"Iteration {iteration} - Trade count: {results['trade_count']}, " +
+                   f"Profitable trades: {results.get('profitable_trades', 0)}, " +
+                   f"Hit rate: {results.get('hit_rate', 0):.2f}%")
+        
+        # Determine current metric value depending on config
+        if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
+            current_metric_value = results["hit_rate"]
+            current_metric_name = "hit rate"
+        else:
+            # Default to return if hit_rate is selected but not enough trades
+            current_metric_value = results["total_return_pct"]
+            current_metric_name = "return"
+            if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
+                logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
         
         # Calculate improvement
-        improvement = current_return - best_return
-        logger.info(f"Iteration {iteration} - Validation return: {current_return:.2f}%, Improvement: {improvement:.2f}%")
+        improvement = current_metric_value - best_metric_value
+        
+        # Log different formats based on metric type
+        if current_metric_name == "hit_rate":
+            logger.info(f"Iteration {iteration} - Validation {current_metric_name}: {current_metric_value:.2f}% " +
+                       f"({results['profitable_trades']}/{results['trade_count']} trades), " +
+                       f"Improvement: {improvement:.2f}%")
+        else:
+            logger.info(f"Iteration {iteration} - Validation {current_metric_name}: {current_metric_value:.2f}%, " +
+                       f"Improvement: {improvement:.2f}%")
         
         # Record training statistics
-        is_best = current_return > best_return + improvement_threshold
+        is_best = current_metric_value > best_metric_value + improvement_threshold
         iteration_stats = {
             "iteration": iteration,
             "timesteps": additional_timesteps,
-            "return_pct": current_return,
+            "return_pct": results["total_return_pct"],
+            "hit_rate": results.get("hit_rate", 0),
             "portfolio_value": results["final_portfolio_value"],
             "trade_count": results["trade_count"],
+            "profitable_trades": results.get("profitable_trades", 0),
+            "metric_used": current_metric_name,
+            "metric_value": current_metric_value,
             "improvement": improvement,
             "is_best": is_best
         }
@@ -451,9 +888,16 @@ def train_walk_forward_model(
         
         # Check if this is the best model so far
         if is_best:
-            best_return = current_return
+            best_metric_value = current_metric_value
+            best_metric_name = current_metric_name
             best_model = model
-            logger.info(f"New best model found! Validation return: {best_return:.2f}%")
+            
+            # Format the log message based on the metric
+            if best_metric_name == "hit_rate":
+                logger.info(f"New best model found! Validation {best_metric_name}: {best_metric_value:.2f}% " +
+                           f"({results['profitable_trades']}/{results['trade_count']} trades)")
+            else:
+                logger.info(f"New best model found! Validation {best_metric_name}: {best_metric_value:.2f}%")
             
             # Save intermediate best model
             if window_folder:
@@ -472,7 +916,8 @@ def train_walk_forward_model(
             logger.info(f"Stopping training after {n_stagnant_loops} consecutive iterations without significant improvement")
             break
     
-    logger.info(f"Training completed. Best validation return: {best_return:.2f}%")
+    logger.info(f"Training completed. Best validation {best_metric_name}: {best_metric_value:.2f}" + 
+               (f"%" if best_metric_name == "return" else "% (profitable trades)"))
     
     # Plot training progress
     if window_folder:
@@ -480,6 +925,71 @@ def train_walk_forward_model(
         
         # Save training statistics
         save_json(training_stats, f'{window_folder}/training_stats.json')
+    
+    # Final evaluation for logging trade examples
+    if risk_enabled and window_folder:
+        # Save the model temporarily for evaluation with risk management
+        temp_model_path = f"{window_folder}/temp_best_model_final"
+        best_model.save(temp_model_path)
+        
+        # Evaluate with risk management
+        final_results = trade_with_risk_management(
+            model_path=temp_model_path,
+            test_data=validation_data,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct,
+            position_size=position_size,
+            max_risk_per_trade_pct=max_risk_per_trade_pct,
+            initial_balance=config["environment"]["initial_balance"],
+            transaction_cost=config["environment"].get("transaction_cost", 0.0),
+            verbose=1,
+            deterministic=True
+        )
+        
+        # Clean up temporary model file
+        if os.path.exists(f"{temp_model_path}.zip"):
+            os.remove(f"{temp_model_path}.zip")
+        
+        # Calculate hit rate from final results
+        final_results = calculate_hit_rate_from_trade_results(final_results)
+    else:
+        # Use standard evaluation without risk management
+        final_results = evaluate_agent(best_model, validation_data, verbose=1, deterministic=True)
+    
+    # Save trade history to CSV
+    if 'trade_history' in final_results and final_results['trade_history']:
+        # Convert to DataFrame and save
+        validation_trade_history_path = f'{window_folder}/validation_trade_history.csv'
+        save_trade_history(final_results['trade_history'], validation_trade_history_path)
+        logger.info(f"Saved validation trade history to {validation_trade_history_path}")
+        
+        # Create a summary of validation trade performance stats
+        if risk_enabled and window_folder:
+            validation_trade_summary = {}
+            exit_reasons = final_results.get('exit_reasons', {})
+            
+            validation_trade_summary['total_trades'] = final_results['trade_count']
+            validation_trade_summary['profitable_trades'] = final_results.get('profitable_trades', 0)
+            validation_trade_summary['hit_rate'] = final_results.get('hit_rate', 0)
+            
+            # Count trades by exit reason
+            validation_trade_summary['stop_loss_exits'] = exit_reasons.get('stop_loss', 0)
+            validation_trade_summary['take_profit_exits'] = exit_reasons.get('take_profit', 0)
+            validation_trade_summary['trailing_stop_exits'] = exit_reasons.get('trailing_stop', 0)
+            validation_trade_summary['model_signal_exits'] = exit_reasons.get('model_signal', 0)
+            
+            # Calculate percentages of exit reasons
+            total_exits = sum(exit_reasons.values())
+            if total_exits > 0:
+                validation_trade_summary['stop_loss_pct'] = (exit_reasons.get('stop_loss', 0) / total_exits) * 100
+                validation_trade_summary['take_profit_pct'] = (exit_reasons.get('take_profit', 0) / total_exits) * 100
+                validation_trade_summary['trailing_stop_pct'] = (exit_reasons.get('trailing_stop', 0) / total_exits) * 100
+                validation_trade_summary['model_signal_pct'] = (exit_reasons.get('model_signal', 0) / total_exits) * 100
+            
+            # Save validation trade summary
+            save_json(validation_trade_summary, f'{window_folder}/validation_trade_summary.json')
+            logger.info(f"Saved validation trade summary to {window_folder}/validation_trade_summary.json")
     
     return best_model, training_stats
 
@@ -492,22 +1002,38 @@ def plot_training_progress(training_stats: List[Dict], window_folder: str) -> No
         window_folder: Folder to save the plot
     """
     iterations = [stat["iteration"] for stat in training_stats]
-    returns = [stat["return_pct"] for stat in training_stats]
     is_best = [stat["is_best"] for stat in training_stats]
+    
+    # Determine which metric to plot
+    # Get the metric used in the most recent iteration
+    if training_stats:
+        metric_name = training_stats[-1].get("metric_used", "return")
+    else:
+        metric_name = "return"  # Default if no stats
+    
+    if metric_name == "hit rate":
+        metric_values = [stat["hit_rate"] for stat in training_stats]
+        y_label = 'Hit Rate (%)'
+        title_prefix = 'Hit Rate'
+    else:
+        metric_values = [stat["return_pct"] for stat in training_stats]
+        y_label = 'Return (%)'
+        title_prefix = 'Return'
     
     plt.figure(figsize=(10, 6))
     
-    # Plot returns
-    plt.plot(iterations, returns, marker='o', linestyle='-', color='blue', label='Validation Return')
+    # Plot metric values
+    plt.plot(iterations, metric_values, marker='o', linestyle='-', color='blue', 
+             label=f'Validation {metric_name.title()}')
     
     # Highlight best models
     best_iterations = [iterations[i] for i in range(len(iterations)) if is_best[i]]
-    best_returns = [returns[i] for i in range(len(returns)) if is_best[i]]
-    plt.scatter(best_iterations, best_returns, color='green', s=100, marker='*', label='Best Model')
+    best_metrics = [metric_values[i] for i in range(len(metric_values)) if is_best[i]]
+    plt.scatter(best_iterations, best_metrics, color='green', s=100, marker='*', label='Best Model')
     
     plt.xlabel('Training Iteration')
-    plt.ylabel('Validation Return (%)')
-    plt.title('Training Progress')
+    plt.ylabel(y_label)
+    plt.title(f'Training Progress - {title_prefix}')
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
     
@@ -515,6 +1041,25 @@ def plot_training_progress(training_stats: List[Dict], window_folder: str) -> No
     plt.tight_layout()
     plt.savefig(f'{window_folder}/training_progress.png')
     plt.close()
+    
+    # Additional plot for trade count if using hit rate
+    if metric_name == "hit_rate":
+        plt.figure(figsize=(10, 6))
+        trade_counts = [stat["trade_count"] for stat in training_stats]
+        profitable_trades = [stat.get("profitable_trades", 0) for stat in training_stats]
+        
+        plt.bar(iterations, trade_counts, color='blue', alpha=0.7, label='Total Trades')
+        plt.bar(iterations, profitable_trades, color='green', alpha=0.7, label='Profitable Trades')
+        
+        plt.xlabel('Training Iteration')
+        plt.ylabel('Number of Trades')
+        plt.title('Trade Performance by Iteration')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f'{window_folder}/trade_performance.png')
+        plt.close()
 
 def plot_window_performance(test_data: pd.DataFrame, test_results: Dict, window_folder: str, window_num: int) -> None:
     """
@@ -572,56 +1117,116 @@ def plot_window_performance(test_data: pd.DataFrame, test_results: Dict, window_
     plt.savefig(f'{window_folder}/test_performance.png')
     plt.close()
 
-def plot_walk_forward_results(all_window_results: List[Dict], session_folder: str) -> None:
+def plot_walk_forward_results(all_window_results: List[Dict], session_folder: str, eval_metric: str) -> None:
     """
     Plot the results of walk-forward testing.
     
     Args:
         all_window_results: List of results dictionaries from each walk-forward window
         session_folder: Folder to save the plot
+        eval_metric: Evaluation metric used for the walk-forward testing
     """
     windows = [res["window"] for res in all_window_results]
     returns = [res["total_return_pct"] for res in all_window_results]
     portfolio_values = [res["final_portfolio_value"] for res in all_window_results]
     trade_counts = [res["trade_count"] for res in all_window_results]
     
-    # Create figure with 3 subplots
-    fig, axs = plt.subplots(3, 1, figsize=(12, 15), sharex=True)
+    # Also get hit rates if that metric is used
+    hit_rates = [res.get("hit_rate", 0) for res in all_window_results]
+    profitable_trades = [res.get("profitable_trades", 0) for res in all_window_results]
+    
+    # Number of subplots depends on which metric is being used
+    num_plots = 4 if eval_metric == "hit_rate" else 3
+    
+    # Create figure with appropriate number of subplots
+    fig, axs = plt.subplots(num_plots, 1, figsize=(12, 5 * num_plots), sharex=True)
+    
+    plot_idx = 0
     
     # Plot returns
-    axs[0].bar(windows, returns, color='blue')
-    axs[0].set_ylabel('Return (%)')
-    axs[0].set_title('Returns by Walk-Forward Window')
-    axs[0].grid(True, linestyle='--', alpha=0.7)
+    axs[plot_idx].bar(windows, returns, color='blue')
+    axs[plot_idx].set_ylabel('Return (%)')
+    axs[plot_idx].set_title('Returns by Walk-Forward Window')
+    axs[plot_idx].grid(True, linestyle='--', alpha=0.7)
+    plot_idx += 1
+    
+    # Plot hit rates if that metric is used
+    if eval_metric == "hit_rate":
+        axs[plot_idx].bar(windows, hit_rates, color='green')
+        axs[plot_idx].set_ylabel('Hit Rate (%)')
+        axs[plot_idx].set_title('Hit Rates by Walk-Forward Window')
+        axs[plot_idx].grid(True, linestyle='--', alpha=0.7)
+        
+        # Add text annotations showing number of trades
+        for i, (hr, pt, tc) in enumerate(zip(hit_rates, profitable_trades, trade_counts)):
+            if tc > 0:  # Only annotate windows with trades
+                axs[plot_idx].annotate(f"{int(pt)}/{int(tc)}", 
+                                     (windows[i], hr),
+                                     textcoords="offset points", 
+                                     xytext=(0,5), 
+                                     ha='center')
+        plot_idx += 1
     
     # Plot portfolio values
-    axs[1].bar(windows, portfolio_values, color='green')
-    axs[1].set_ylabel('Final Portfolio Value ($)')
-    axs[1].set_title('Final Portfolio Values by Walk-Forward Window')
-    axs[1].grid(True, linestyle='--', alpha=0.7)
+    axs[plot_idx].bar(windows, portfolio_values, color='purple')
+    axs[plot_idx].set_ylabel('Final Portfolio Value ($)')
+    axs[plot_idx].set_title('Final Portfolio Values by Walk-Forward Window')
+    axs[plot_idx].grid(True, linestyle='--', alpha=0.7)
+    plot_idx += 1
     
     # Plot trade counts
-    axs[2].bar(windows, trade_counts, color='red')
-    axs[2].set_xlabel('Walk-Forward Window')
-    axs[2].set_ylabel('Trade Count')
-    axs[2].set_title('Trade Counts by Walk-Forward Window')
-    axs[2].grid(True, linestyle='--', alpha=0.7)
+    axs[plot_idx].bar(windows, trade_counts, color='red')
+    axs[plot_idx].set_xlabel('Walk-Forward Window')
+    axs[plot_idx].set_ylabel('Trade Count')
+    axs[plot_idx].set_title('Trade Counts by Walk-Forward Window')
+    axs[plot_idx].grid(True, linestyle='--', alpha=0.7)
+    
+    # If using hit rate, add profitable trades as a second bar
+    if eval_metric == "hit_rate":
+        axs[plot_idx].bar(windows, profitable_trades, color='green', alpha=0.7)
+        axs[plot_idx].legend(['Total Trades', 'Profitable Trades'])
     
     # Adjust layout
     plt.tight_layout()
-    plt.savefig(f'{session_folder}/plots/walk_forward_results.png')
+    plt.savefig(f'{session_folder}/plots/walk_forward_results_{eval_metric}.png')
     plt.close()
     
-    # Also create and save a cumulative return plot
+    # Also create and save cumulative charts
     plt.figure(figsize=(12, 6))
+    
+    # Cumulative returns
     cumulative_returns = np.cumsum(returns)
-    plt.plot(windows, cumulative_returns, marker='o', linestyle='-', color='blue')
+    plt.plot(windows, cumulative_returns, marker='o', linestyle='-', color='blue', label='Cumulative Return (%)')
+    
+    # If using hit rate, also plot cumulative hit rate
+    if eval_metric == "hit_rate":
+        # Calculate cumulative hit rate (cumulative profitable trades / cumulative total trades)
+        cum_trades = np.cumsum(trade_counts)
+        cum_profitable = np.cumsum(profitable_trades)
+        cum_hit_rate = [100 * cum_profitable[i] / cum_trades[i] if cum_trades[i] > 0 else 0 for i in range(len(cum_trades))]
+        
+        # Add to plot with secondary y-axis
+        ax2 = plt.gca().twinx()
+        ax2.plot(windows, cum_hit_rate, marker='s', linestyle='-', color='green', label='Cumulative Hit Rate (%)')
+        ax2.set_ylabel('Cumulative Hit Rate (%)', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
+    
     plt.xlabel('Walk-Forward Window')
-    plt.ylabel('Cumulative Return (%)')
-    plt.title('Cumulative Returns Across Walk-Forward Windows')
+    plt.ylabel('Cumulative Return (%)', color='blue')
+    plt.tick_params(axis='y', labelcolor='blue')
+    plt.title('Cumulative Performance Across Walk-Forward Windows')
     plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Create legend that incorporates both axes
+    lines1, labels1 = plt.gca().get_legend_handles_labels()
+    if eval_metric == "hit_rate":
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        plt.legend(lines1 + lines2, labels1 + labels2, loc='best')
+    else:
+        plt.legend(loc='best')
+    
     plt.tight_layout()
-    plt.savefig(f'{session_folder}/plots/cumulative_returns.png')
+    plt.savefig(f'{session_folder}/plots/cumulative_performance_{eval_metric}.png')
     plt.close()
 
 def main():
@@ -650,8 +1255,58 @@ def main():
     
     # Get walk-forward parameters from config or use defaults
     wf_config = config.get("walk_forward", {})
-    window_size = wf_config.get("window_size", 14)  # 14 days default
-    step_size = wf_config.get("step_size", 7)       # 7 days default
+    window_size = wf_config.get("window_size", 14)  # 14 trading days default
+    step_size = wf_config.get("step_size", 7)       # 7 trading days default
+    
+    # Log information about how days are counted
+    logger.info(f"Window size: {window_size} trading days (NYSE business days, not calendar days)")
+    logger.info(f"Step size: {step_size} trading days (NYSE business days, not calendar days)")
+    
+    # Get evaluation metric from config
+    eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
+    
+    # Check if risk management is enabled
+    risk_config = config.get("risk_management", {})
+    risk_enabled = risk_config.get("enabled", False)
+    
+    if risk_enabled:
+        # Log risk management settings
+        logger.info("Risk management is ENABLED for walk-forward testing")
+        
+        # Stop loss configuration
+        stop_loss_config = risk_config.get("stop_loss", {})
+        if stop_loss_config.get("enabled", False):
+            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            logger.info(f"  - Stop loss: {stop_loss_pct}%")
+        else:
+            logger.info("  - Stop loss: Disabled")
+        
+        # Take profit configuration
+        take_profit_config = risk_config.get("take_profit", {})
+        if take_profit_config.get("enabled", False):
+            take_profit_pct = take_profit_config.get("percentage", 2.0)
+            logger.info(f"  - Take profit: {take_profit_pct}%")
+        else:
+            logger.info("  - Take profit: Disabled")
+        
+        # Trailing stop configuration
+        trailing_stop_config = risk_config.get("trailing_stop", {})
+        if trailing_stop_config.get("enabled", False):
+            trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
+            logger.info(f"  - Trailing stop: {trailing_stop_pct}%")
+        else:
+            logger.info("  - Trailing stop: Disabled")
+        
+        # Position sizing configuration
+        position_sizing_config = risk_config.get("position_sizing", {})
+        if position_sizing_config.get("enabled", False):
+            position_size = position_sizing_config.get("size_multiplier", 1.0)
+            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
+            logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
+        else:
+            logger.info("  - Position sizing: Disabled")
+    else:
+        logger.info("Risk management is DISABLED for walk-forward testing")
     
     # Run walk-forward testing
     results = walk_forward_testing(
@@ -682,9 +1337,45 @@ def main():
     print("\nWalk-Forward Testing Summary:")
     print(f"Number of windows: {results['num_windows']}")
     print(f"Average return: {results['avg_return']:.2f}%")
+    
+    # Display hit rate metrics if that evaluation metric was used
+    if eval_metric == "hit_rate":
+        print(f"Average hit rate: {results['avg_hit_rate']:.2f}%")
+        print(f"Average profitable trades: {results['avg_profitable_trades']:.2f} out of {results['avg_trades']:.2f}")
+    
     print(f"Average final portfolio: ${results['avg_portfolio']:.2f}")
     print(f"Average trade count: {results['avg_trades']:.2f}")
     print(f"Results saved to models/session_{results['timestamp']}")
+    print(f"Evaluation metric used: {eval_metric}")
+    
+    # Print risk management information
+    if risk_enabled:
+        print("\nRisk Management Settings:")
+        # Stop loss
+        if stop_loss_config.get("enabled", False):
+            print(f"  Stop Loss: {stop_loss_pct}%")
+        else:
+            print("  Stop Loss: Disabled")
+        
+        # Take profit
+        if take_profit_config.get("enabled", False):
+            print(f"  Take Profit: {take_profit_pct}%")
+        else:
+            print("  Take Profit: Disabled")
+        
+        # Trailing stop
+        if trailing_stop_config.get("enabled", False):
+            print(f"  Trailing Stop: {trailing_stop_pct}%")
+        else:
+            print("  Trailing Stop: Disabled")
+        
+        # Position sizing
+        if position_sizing_config.get("enabled", False):
+            print(f"  Position Sizing: Multiplier {position_size}, Max Risk {max_risk_per_trade_pct}%")
+        else:
+            print("  Position Sizing: Disabled")
+    
+    print("Note: All references to 'days' now indicate trading days (NYSE business days), not calendar days")
     print("Note: Training was performed only on NYSE market hours data (9:30 AM to 4:00 PM ET, Monday to Friday)")
 
 if __name__ == "__main__":

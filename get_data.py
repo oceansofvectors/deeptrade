@@ -9,12 +9,33 @@ if not hasattr(np, "NaN"):
 import pandas_ta as ta
 import logging
 import os
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # NEW: import YAML configuration
 from config import config
+
+# Helper function to ensure numeric values
+def ensure_numeric(df, columns):
+    """
+    Ensure columns contain only numeric values.
+    
+    Args:
+        df: DataFrame to process
+        columns: List of column names to check/convert
+        
+    Returns:
+        DataFrame with numeric columns
+    """
+    for col in columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Drop rows with NaN in essential columns
+    df = df.dropna(subset=[col for col in columns if col in df.columns])
+    return df
 
 # Import filter_market_hours from walk_forward module
 # We use try/except to handle circular import issue
@@ -26,57 +47,177 @@ except ImportError:
         logger.warning("Could not import filter_market_hours from walk_forward module. Using unfiltered data.")
         return data
 
+def download_data(symbol: str = "NQ=F", period: str = "60d", interval: str = "5m") -> pd.DataFrame:
+    """
+    Download historical data from Yahoo Finance.
+    
+    Args:
+        symbol: Ticker symbol to download
+        period: Time period to download (e.g. '60d' for 60 days)
+        interval: Data interval (e.g. '5m' for 5 minutes)
+        
+    Returns:
+        DataFrame: Historical price data
+    """
+    logger.info(f"Downloading {symbol} data for period {period} with interval {interval}")
+    
+    try:
+        # Download data from Yahoo Finance
+        data = yf.download(symbol, period=period, interval=interval)
+        
+        if data.empty:
+            logger.error(f"Failed to download data for {symbol}")
+            return None
+            
+        logger.info(f"Downloaded {len(data)} rows of data")
+        logger.info(f"Downloaded columns: {data.columns.tolist()}")
+        logger.info(f"Downloaded index type: {type(data.index)}")
+        
+        # Save raw data to CSV
+        os.makedirs('data', exist_ok=True)
+        raw_data = data.copy()
+        raw_data.index.name = 'Datetime'  # Ensure the index has a name
+        raw_filename = f'data/{symbol.replace("=", "_")}_raw.csv'
+        raw_data.to_csv(raw_filename)
+        logger.info(f"Saved raw data to {raw_filename}")
+        
+        # Create a processed dataframe with the index as the 'time' column
+        processed_data = pd.DataFrame()
+        processed_data['time'] = data.index.astype('int64') // 10**9  # Convert to Unix timestamp
+        
+        # Handle different formats of yfinance columns (single-level or multi-level)
+        if isinstance(data.columns, pd.MultiIndex):
+            logger.info("Detected multi-index columns from yfinance")
+            # Extract the price columns we need
+            for price_col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                for col in data.columns:
+                    if isinstance(col, tuple) and col[0] == price_col:
+                        processed_data[price_col.lower()] = data[col].values
+                        break
+        else:
+            # Standard column names
+            for yf_col, our_col in [('Open', 'open'), ('High', 'high'), 
+                                     ('Low', 'low'), ('Close', 'close'), 
+                                     ('Volume', 'volume')]:
+                if yf_col in data.columns:
+                    processed_data[our_col] = data[yf_col].values
+        
+        logger.info(f"Processed data columns: {processed_data.columns.tolist()}")
+        logger.info(f"Sample of processed data:\n{processed_data.head()}")
+        
+        # Ensure we have the required columns
+        required_cols = ['time', 'open', 'high', 'low', 'close']
+        missing_cols = [col for col in required_cols if col not in processed_data.columns]
+        
+        if missing_cols:
+            logger.error(f"Missing required columns after processing: {missing_cols}")
+            return None
+        
+        # Save processed data to CSV
+        processed_data.to_csv('data/nq.csv', index=False)
+        logger.info(f"Saved processed data to data/nq.csv")
+        
+        return processed_data
+    
+    except Exception as e:
+        logger.error(f"Error downloading data: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
 def get_data(symbol: str = "NQ=F",
                  period: str = "60d",
                  interval: str = "5m",
                  train_ratio: float = 0.7,
-                 validation_ratio: float = 0.15):
+                 validation_ratio: float = 0.15,
+                 use_yfinance: bool = True):
     """
-    Load data from local CSV file, compute technical indicators, normalize prices,
+    Load data, compute technical indicators, normalize prices,
     and split the data into training, validation and testing sets.
 
     Args:
-        symbol (str): Asset ticker symbol (not used when loading from CSV).
-        period (str): Historical period (not used when loading from CSV).
-        interval (str): Data interval (not used when loading from CSV).
+        symbol (str): Asset ticker symbol.
+        period (str): Historical period to download (e.g., '60d' for 60 days).
+        interval (str): Data interval (e.g., '5m' for 5 minutes).
         train_ratio (float): Proportion of data to use for training (default 0.7).
         validation_ratio (float): Proportion of data to use for validation (default 0.15).
                                  Test ratio is calculated as 1 - train_ratio - validation_ratio.
+        use_yfinance (bool): Whether to download fresh data from Yahoo Finance (default True).
 
     Returns:
         tuple: (train_df, validation_df, test_df) - DataFrames containing processed data.
     """
-    logger.info("Loading data from local CSV file: data/nq.csv")
-    
     try:
-        # Check if file exists
-        if not os.path.exists('data/nq.csv'):
-            logger.error("CSV file not found: data/nq.csv")
+        # Option 1: Download data directly from Yahoo Finance
+        if use_yfinance:
+            logger.info(f"Downloading data directly from Yahoo Finance: {symbol}")
+            df = download_data(symbol, period, interval)
+            
+            # Debug: print DataFrame structure
+            logger.info(f"Downloaded data structure: columns={df.columns.tolist() if df is not None else None}")
+            
+            if df is None:
+                logger.error("Failed to download data from Yahoo Finance.")
+                # Try to fall back to CSV if available
+                if os.path.exists('data/nq.csv'):
+                    logger.info("Falling back to local CSV file: data/nq.csv")
+                    df = pd.read_csv('data/nq.csv')
+                else:
+                    return None, None, None
+        
+        # Option 2: Load from local CSV if download is disabled
+        elif os.path.exists('data/nq.csv'):
+            logger.info("Loading data from local CSV file: data/nq.csv")
+            # Read the CSV file, explicitly convert numeric columns
+            df = pd.read_csv('data/nq.csv')
+        else:
+            logger.error("CSV file not found: data/nq.csv and use_yfinance is False")
             return None, None, None
             
-        # Read the CSV file with error handling
-        try:
-            df = pd.read_csv('data/nq.csv')
-        except pd.errors.EmptyDataError:
-            logger.error("CSV file is empty")
+        # Ensure we have required columns
+        required_cols = ['time', 'open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"Missing required columns. Available columns: {df.columns.tolist()}")
             return None, None, None
-        except pd.errors.ParserError:
-            logger.error("Error parsing CSV file - it may be malformed")
-            return None, None, None
+            
+        # Debug: print the first 5 rows before any conversion
+        logger.info(f"First 5 rows before time conversion:\n{df.head()}")
+        logger.info(f"Time column type: {df['time'].dtype}")
         
-        logger.info(f"CSV file loaded. Shape: {df.shape}, Columns: {df.columns.tolist()}")
+        # Remove any rows where numeric columns contain non-numeric data
+        numeric_cols = ['open', 'high', 'low', 'close']
+        for col in numeric_cols:
+            if col in df.columns:
+                df = df[pd.to_numeric(df[col], errors='coerce').notna()]
+                df[col] = pd.to_numeric(df[col])
+        
+        logger.info(f"Data loaded. Shape: {df.shape}, Columns: {df.columns.tolist()}")
         
         # Check if the DataFrame is empty
         if df.empty:
             logger.error("The loaded DataFrame is empty!")
             return None, None, None
-            
-        # Print the first few rows to debug
-        logger.info(f"First 5 rows of data:\n{df.head()}")
         
-        # Convert time column to datetime and set as index
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df = df.set_index('time')
+        # Convert time column to datetime - handle different possible formats
+        try:
+            # Try different approaches to convert time to datetime depending on its current format
+            if pd.api.types.is_numeric_dtype(df['time']):
+                # If time is already numeric (timestamp), convert to datetime
+                logger.info("Converting numeric timestamp to datetime")
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+            else:
+                # If time is string or already datetime
+                logger.info("Converting string or datetime to datetime")
+                df['time'] = pd.to_datetime(df['time'])
+                
+            # Set time as index
+            df = df.set_index('time')
+            logger.info("Successfully converted time column to datetime index")
+        except Exception as e:
+            logger.error(f"Error converting time column: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None, None, None
         
         # Rename columns to match the expected format
         column_mapping = {
@@ -84,28 +225,42 @@ def get_data(symbol: str = "NQ=F",
             'high': 'High',
             'low': 'Low',
             'close': 'Close',
-            'Volume': 'Volume'
+            'volume': 'Volume'
         }
-        df = df.rename(columns=column_mapping)
+        df = df.rename(columns={col: column_mapping[col] for col in column_mapping if col in df.columns})
         
-        # Drop any duplicate columns and NaN values
-        df = df.loc[:, ~df.columns.duplicated()]
-        # Instead of dropping all rows with NaN values, we'll only drop rows with NaN in essential columns
+        # Ensure all price columns are numeric
         essential_columns = ['Open', 'High', 'Low', 'Close']
         if 'Volume' in df.columns:
             essential_columns.append('Volume')
         
-        # Only drop rows where essential columns have NaN values
-        df.dropna(subset=essential_columns, inplace=True)
+        # Use the helper function to ensure numeric data
+        df = ensure_numeric(df, essential_columns)
+        
+        # Drop any duplicate columns and NaN values
+        df = df.loc[:, ~df.columns.duplicated()]
         
         logger.info(f"After preprocessing. Shape: {df.shape}")
+        logger.info(f"Columns after preprocessing: {df.columns.tolist()}")
         print(df.head())
         
         # Compute Supertrend indicator if enabled
         if config["indicators"]["supertrend"]["enabled"]:
             try:
+                # Ensure data types are correct for Supertrend calculation
+                high = pd.to_numeric(df['High'], errors='coerce')
+                low = pd.to_numeric(df['Low'], errors='coerce')
+                close = pd.to_numeric(df['Close'], errors='coerce')
+                
+                # Drop any NaN values that might have been introduced
+                valid_rows = ~(high.isna() | low.isna() | close.isna())
+                high = high[valid_rows]
+                low = low[valid_rows]
+                close = close[valid_rows]
+                
+                # Calculate Supertrend
                 supertrend_df = ta.supertrend(
-                    df['High'], df['Low'], df['Close'],
+                    high, low, close,
                     length=config["indicators"]["supertrend"]["length"],
                     multiplier=config["indicators"]["supertrend"]["multiplier"]
                 )
@@ -458,6 +613,32 @@ def get_data(symbol: str = "NQ=F",
                 # Create a direction indicator (1 if price above PSAR, -1 if below)
                 df['PSAR_DIR'] = np.where(df['Close'] > df['PSAR'], 1, -1)
 
+        # Volume indicator
+        if config["indicators"].get("volume", {}).get("enabled", False):
+            if 'Volume' in df.columns:
+                # Calculate volume moving average
+                ma_length = config["indicators"]["volume"].get("ma_length", 20)
+                df['VOLUME_MA'] = ta.sma(df['Volume'], length=ma_length)
+                
+                # Replace NaN values in the moving average with the current volume
+                df['VOLUME_MA'] = df['VOLUME_MA'].fillna(df['Volume'])
+                
+                # Calculate normalized volume (relative to its moving average)
+                df['VOLUME_NORM'] = df['Volume'] / df['VOLUME_MA']
+                
+                # Log transform to handle skewed volume distribution (common in financial data)
+                df['VOLUME_NORM'] = np.log1p(df['VOLUME_NORM'])
+                
+                # Clip extreme values and normalize to [-1, 1] range
+                vol_mean = df['VOLUME_NORM'].mean()
+                vol_std = df['VOLUME_NORM'].std()
+                if vol_std > 0:
+                    df['VOLUME_NORM'] = np.clip((df['VOLUME_NORM'] - vol_mean) / (3 * vol_std), -1, 1)
+                    
+                logger.info(f"Added normalized Volume indicator based on {ma_length}-period moving average")
+            else:
+                logger.warning("Volume data not available, skipping Volume indicator")
+
         # Only drop rows with NaN values in essential columns
         essential_columns = ['Close', 'close_norm']
         logger.info(f"Shape before dropping NaN in essential columns: {df.shape}")
@@ -512,7 +693,7 @@ def get_data(symbol: str = "NQ=F",
         for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D', 
                          'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R', 
                          'SMA_NORM', 'EMA_NORM', 'DISPARITY', 'ATR', 'OBV_NORM', 
-                         'CMF', 'PSAR_NORM', 'PSAR_DIR']:
+                         'CMF', 'PSAR_NORM', 'PSAR_DIR', 'VOLUME_NORM']:
             if indicator in df.columns:
                 model_columns.append(indicator)
                 
@@ -525,7 +706,7 @@ def get_data(symbol: str = "NQ=F",
                     # These indicators are typically in the range [0, 1]
                     df[indicator] = df[indicator].fillna(0.5)
                 elif indicator in ['CCI', 'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R', 
-                                  'SMA_NORM', 'EMA_NORM', 'DISPARITY', 'CMF']:
+                                  'SMA_NORM', 'EMA_NORM', 'DISPARITY', 'CMF', 'VOLUME_NORM']:
                     # These indicators are typically centered around 0
                     df[indicator] = df[indicator].fillna(0.0)
                 elif indicator in ['ADX', 'ADX_POS', 'ADX_NEG', 'ATR', 'OBV_NORM']:

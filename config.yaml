@@ -1,12 +1,16 @@
 training:
-  total_timesteps: 500
+  total_timesteps: 1000
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 50
+  max_iterations: 200
   improvement_threshold: 0.05
-  additional_timesteps: 250
+  additional_timesteps: 50
   n_stagnant_loops: 10
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
+  # Evaluation metric configuration
+  evaluation:
+    metric: "return"  # Options: "return" (total return percentage) or "hit_rate" (percentage of profitable trades)
+    hit_rate_min_trades: 3  # Minimum number of trades required for hit rate to be meaningful
 
 data:
   symbol: "NQ=F"
@@ -22,9 +26,8 @@ indicators:
     length: 10
     multiplier: 3
   rsi:
-    enabled: true
+    enabled: false
     length: 14
-  # New technical indicators
   cci:
     enabled: true
     length: 20
@@ -32,9 +35,9 @@ indicators:
     enabled: true
     length: 14
   adx_pos:
-    enabled: true
+    enabled: false
   adx_neg:
-    enabled: true
+    enabled: false
   stoch_k:
     enabled: true
     length: 14
@@ -53,10 +56,10 @@ indicators:
     enabled: true
     length: 14
   sma:
-    enabled: true
+    enabled: false
     length: 20
   ema:
-    enabled: true
+    enabled: false
     length: 20
   disparity:
     enabled: true
@@ -72,6 +75,9 @@ indicators:
     enabled: true
     af: 0.02
     max_af: 0.2
+  volume:
+    enabled: false
+    ma_length: 20  # For volume moving average normalization
 
 environment:
   initial_balance: 10000.0
@@ -92,26 +98,26 @@ risk_management:
   # Stop loss configuration
   stop_loss:
     enabled: true
-    percentage: 0.5  # Stop loss as percentage of entry price
+    percentage: 1  # Stop loss as percentage of portfolio value
   
   # Take profit configuration
   take_profit:
     enabled: true
-    percentage: 1.0  # Take profit as percentage of entry price
+    percentage: 1  # Take profit as percentage of portfolio value
   
   # Trailing stop loss configuration
   trailing_stop:
     enabled: false
-    percentage: 0.5  # Trailing stop as percentage of highest/lowest price
+    percentage: 1.0  # Trailing stop as percentage of highest/lowest price
   
   # Position sizing configuration
   position_sizing:
     enabled: false
     size_multiplier: 1.0  # Position size as a multiplier (1.0 = 100% of available capital)
-    max_risk_per_trade_percentage: 2.0  # Maximum risk per trade as percentage of portfolio
+    max_risk_per_trade_percentage: 1.0  # Maximum risk per trade as percentage of portfolio
 
 # Walk-forward testing configuration
 walk_forward:
   enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
-  window_size: 14  # Size of each walk-forward window in days
-  step_size: 7     # Number of days to step forward at each iteration
+  window_size: 14  # Size of each walk-forward window in trading days (NYSE business days)
+  step_size: 7     # Number of trading days to step forward at each iteration (NYSE business days)
