@@ -167,3 +167,6 @@ Desktop.ini
 # Logs
 logs/
 *.log
+
+models 
+plots

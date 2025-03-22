@@ -1,10 +1,10 @@
 training:
-  total_timesteps: 1000
+  total_timesteps: 20000
   fee_rate: 0.0
   # New parameters for iterative training
   max_iterations: 200
   improvement_threshold: 0.05
-  additional_timesteps: 50
+  additional_timesteps: 200
   n_stagnant_loops: 10
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
@@ -22,14 +22,14 @@ data:
 
 indicators:
   supertrend:
-    enabled: true
+    enabled: false
     length: 10
     multiplier: 3
   rsi:
     enabled: false
     length: 14
   cci:
-    enabled: true
+    enabled: false
     length: 20
   adx:
     enabled: true
@@ -39,7 +39,7 @@ indicators:
   adx_neg:
     enabled: false
   stoch_k:
-    enabled: true
+    enabled: false
     length: 14
   stoch_d:
     enabled: true
@@ -50,10 +50,10 @@ indicators:
     slow: 26
     signal: 9
   roc:
-    enabled: true
+    enabled: false
     length: 10
   williams_r:
-    enabled: true
+    enabled: false
     length: 14
   sma:
     enabled: false
@@ -62,17 +62,17 @@ indicators:
     enabled: false
     length: 20
   disparity:
-    enabled: true
+    enabled: false
   atr:
     enabled: true
     length: 14
   obv:
-    enabled: true
+    enabled: false
   cmf:
-    enabled: true
+    enabled: false
     length: 20
   psar:
-    enabled: true
+    enabled: false
     af: 0.02
     max_af: 0.2
   volume:
@@ -85,15 +85,15 @@ environment:
   transaction_cost: 0.0  # Transaction cost as percentage
 
 model:
-  ent_coef: 0.3
-  learning_rate: 0.0003
+  ent_coef: 0.25
+  learning_rate: 0.003
   n_steps: 2048
-  batch_size: 64
+  batch_size: 10
 
 # Risk management configuration for trade.py
 risk_management:
   # Enable/disable risk management features
-  enabled: true  # Master switch to enable/disable all risk management
+  enabled: false  # Master switch to enable/disable all risk management
   
   # Stop loss configuration
   stop_loss:
@@ -103,7 +103,7 @@ risk_management:
   # Take profit configuration
   take_profit:
     enabled: true
-    percentage: 1  # Take profit as percentage of portfolio value
+    percentage: 3  # Take profit as percentage of portfolio value
   
   # Trailing stop loss configuration
   trailing_stop:
