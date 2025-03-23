@@ -121,9 +121,18 @@ class TradingEnv(gym.Env):
         """
         Reset the environment state and portfolio to start a new episode.
 
+        Args:
+            seed: Random seed for reproducibility
+            options: Additional options (unused)
+            
         Returns:
             tuple: (observation, info)
         """
+        # Set random seed if provided
+        if seed is not None:
+            import numpy as np
+            np.random.seed(seed)
+            
         self.current_step = self.initial_index
         self.position = 0  # Will be immediately set by first action
         self.entry_price = Decimal('0.0')

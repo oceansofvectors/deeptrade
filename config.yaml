@@ -17,7 +17,7 @@ data:
   period: "60d"
   interval: "5m"
   train_ratio: 0.7
-  validation_ratio: 0.15
+  validation_ratio: 0.2
   market_hours_only: true  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
 
 indicators:
@@ -85,7 +85,7 @@ environment:
   transaction_cost: 0.0  # Transaction cost as percentage
 
 model:
-  ent_coef: 0.25
+  ent_coef: 0.35
   learning_rate: 0.003
   n_steps: 2048
   batch_size: 10
@@ -93,17 +93,17 @@ model:
 # Risk management configuration for trade.py
 risk_management:
   # Enable/disable risk management features
-  enabled: false  # Master switch to enable/disable all risk management
+  enabled: true  # Master switch to enable/disable all risk management
   
   # Stop loss configuration
   stop_loss:
     enabled: true
-    percentage: 1  # Stop loss as percentage of portfolio value
+    percentage: 20  # Stop loss as percentage of portfolio value
   
   # Take profit configuration
   take_profit:
     enabled: true
-    percentage: 3  # Take profit as percentage of portfolio value
+    percentage: 50  # Take profit as percentage of portfolio value
   
   # Trailing stop loss configuration
   trailing_stop:
@@ -119,5 +119,34 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
-  window_size: 14  # Size of each walk-forward window in trading days (NYSE business days)
-  step_size: 7     # Number of trading days to step forward at each iteration (NYSE business days)
+  window_size: 40  # Size of each walk-forward window in trading days (NYSE business days)
+  step_size: 3     # Number of trading days to step forward at each iteration (NYSE business days)
+
+# Hyperparameter tuning configuration
+hyperparameter_tuning:
+  enabled: false  # Set to true to enable hyperparameter tuning during training
+  n_trials: 30     # Number of trials for the optimization
+  # Parameters to tune (these are the search spaces)
+  parameters:
+    learning_rate: 
+      min: 0.00001
+      max: 0.01
+      log: true
+    n_steps:
+      min: 128
+      max: 2048
+      log: true
+    ent_coef:
+      min: 0.00001
+      max: 0.5
+      log: true
+    batch_size:
+      min: 8
+      max: 128
+      log: true
+    gamma:
+      min: 0.9
+      max: 0.9999
+    gae_lambda:
+      min: 0.9
+      max: 0.999

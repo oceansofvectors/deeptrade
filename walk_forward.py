@@ -8,6 +8,7 @@ import pytz
 from typing import List, Dict, Tuple
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
+import optuna
 
 from environment import TradingEnv
 from get_data import get_data
@@ -50,19 +51,111 @@ class TimestampJSONEncoder(json.JSONEncoder):
 
 # Function to safely save JSON data
 def save_json(data, filepath):
+    """Save data to JSON file with custom encoder for timestamps."""
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
+    logger.info(f"Saved JSON data to {filepath}")
+
+def load_tradingview_data(csv_filepath: str = "data/trading_view_nq.csv") -> pd.DataFrame:
     """
-    Safely save data to JSON file with proper timestamp handling.
+    Load and process data from a TradingView CSV export file.
     
     Args:
-        data: The data to save
-        filepath: Path to save the JSON file
+        csv_filepath: Path to the TradingView CSV file
+        
+    Returns:
+        DataFrame: Processed data with technical indicators
     """
+    logger.info(f"Loading TradingView data from {csv_filepath}")
+    
     try:
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
-        logger.info(f"Successfully saved JSON data to {filepath}")
+        # Read the CSV file
+        df = pd.read_csv(csv_filepath)
+        
+        # Debug information
+        logger.info(f"Raw TradingView data columns: {df.columns.tolist()}")
+        
+        # Check if we have the required columns
+        required_cols = ['time', 'open', 'high', 'low', 'close']
+        available_cols = [col.lower() for col in df.columns]
+        
+        # Check if all required columns are present (case insensitive)
+        if not all(col.lower() in available_cols for col in required_cols):
+            logger.error(f"Missing required columns in TradingView data. Available columns: {df.columns.tolist()}")
+            return None
+        
+        # Create mapping from available columns to required columns (case insensitive)
+        col_mapping = {}
+        for req_col in required_cols:
+            for avail_col in df.columns:
+                if avail_col.lower() == req_col:
+                    col_mapping[avail_col] = req_col
+        
+        # Rename columns to lowercase standard format
+        df = df.rename(columns=col_mapping)
+        
+        # Convert time column to datetime
+        try:
+            # Try different approaches to convert time to datetime depending on its current format
+            if pd.api.types.is_numeric_dtype(df['time']):
+                # If time is already numeric (timestamp), convert to datetime
+                logger.info("Converting numeric timestamp to datetime")
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+            else:
+                # If time is string or already datetime
+                logger.info("Converting string or datetime to datetime")
+                df['time'] = pd.to_datetime(df['time'])
+                
+            # Set time as index
+            df = df.set_index('time')
+            logger.info("Successfully converted time column to datetime index")
+        except Exception as e:
+            logger.error(f"Error converting time column: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+        
+        # Extract available indicator columns from TradingView if they exist
+        # Map TradingView column names to our expected format
+        indicator_mapping = {
+            'ema': 'EMA',
+            'volume': 'Volume',
+            'histogram': 'Histogram', 
+            'macd': 'MACD',
+            'signal': 'Signal'
+        }
+        
+        # Rename any matching indicator columns
+        for tv_col, our_col in indicator_mapping.items():
+            for col in df.columns:
+                if col.lower() == tv_col.lower():
+                    df[our_col] = df[col]
+        
+        # Rename price columns to match expected format
+        column_mapping = {
+            'open': 'Open',
+            'high': 'High',
+            'low': 'Low',
+            'close': 'Close'
+        }
+        df = df.rename(columns=column_mapping)
+        
+        # Process technical indicators using the same logic as in get_data
+        from get_data import process_technical_indicators
+        
+        # Process indicators 
+        df = process_technical_indicators(df)
+        
+        logger.info(f"TradingView data loaded and processed. Shape: {df.shape}")
+        logger.info(f"Final columns: {df.columns.tolist()}")
+        
+        return df
+        
     except Exception as e:
-        logger.error(f"Error saving JSON data to {filepath}: {e}")
+        logger.error(f"Error loading TradingView data: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
 
 def filter_market_hours(data: pd.DataFrame) -> pd.DataFrame:
     """
@@ -243,7 +336,9 @@ def walk_forward_testing(
     additional_timesteps: int = 5000,
     max_iterations: int = 10,
     n_stagnant_loops: int = 3,
-    improvement_threshold: float = 0.1
+    improvement_threshold: float = 0.1,
+    run_hyperparameter_tuning: bool = False,
+    tuning_trials: int = 30
 ) -> Dict:
     """
     Perform walk-forward testing with anchored walk-forward analysis.
@@ -259,6 +354,8 @@ def walk_forward_testing(
         max_iterations: Maximum number of training iterations
         n_stagnant_loops: Number of consecutive iterations without improvement before stopping
         improvement_threshold: Minimum percentage improvement considered significant
+        run_hyperparameter_tuning: Whether to run hyperparameter tuning before training
+        tuning_trials: Number of trials for hyperparameter tuning
         
     Returns:
         Dict: Results of walk-forward testing
@@ -423,7 +520,9 @@ def walk_forward_testing(
             max_iterations=max_iterations,
             n_stagnant_loops=n_stagnant_loops,
             improvement_threshold=improvement_threshold,
-            window_folder=window_folder
+            window_folder=window_folder,
+            run_hyperparameter_tuning=run_hyperparameter_tuning,
+            tuning_trials=tuning_trials
         )
         
         # Evaluate on test data
@@ -480,7 +579,8 @@ def walk_forward_testing(
                 initial_balance=config["environment"]["initial_balance"],
                 transaction_cost=config["environment"].get("transaction_cost", 0.0),
                 verbose=1,
-                deterministic=True
+                deterministic=True,
+                close_at_end_of_day=True
             )
             
             # Clean up temporary model file
@@ -619,6 +719,197 @@ def walk_forward_testing(
     
     return summary_results
 
+def hyperparameter_tuning(
+    train_data: pd.DataFrame,
+    validation_data: pd.DataFrame,
+    n_trials: int = 30,
+    window_folder: str = None,
+    eval_metric: str = "return",
+    hit_rate_min_trades: int = 5
+) -> Dict:
+    """
+    Perform hyperparameter tuning using Optuna.
+    
+    Args:
+        train_data: Training data
+        validation_data: Validation data for evaluation
+        n_trials: Number of trials for Optuna
+        window_folder: Folder to save results
+        eval_metric: Evaluation metric ("return" or "hit_rate")
+        hit_rate_min_trades: Minimum number of trades required for hit rate to be meaningful
+        
+    Returns:
+        Dict: Best hyperparameters and optimization results
+    """
+    logger.info(f"Starting hyperparameter tuning with {n_trials} trials")
+    logger.info(f"Evaluation metric: {eval_metric}")
+    
+    # Get risk management configuration from config
+    risk_config = config.get("risk_management", {})
+    risk_enabled = risk_config.get("enabled", False)
+    
+    # Initialize risk parameters
+    stop_loss_pct = None
+    take_profit_pct = None
+    trailing_stop_pct = None
+    position_size = 1.0
+    max_risk_per_trade_pct = 2.0
+    
+    # Apply risk management configuration if enabled
+    if risk_enabled:
+        logger.info("Risk management is enabled for model evaluation")
+        # Stop loss configuration
+        stop_loss_config = risk_config.get("stop_loss", {})
+        if stop_loss_config.get("enabled", False):
+            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            logger.info(f"Stop loss enabled at {stop_loss_pct}%")
+        
+        # Take profit configuration
+        take_profit_config = risk_config.get("take_profit", {})
+        if take_profit_config.get("enabled", False):
+            take_profit_pct = take_profit_config.get("percentage", 2.0)
+            logger.info(f"Take profit enabled at {take_profit_pct}%")
+        
+        # Trailing stop configuration
+        trailing_stop_config = risk_config.get("trailing_stop", {})
+        if trailing_stop_config.get("enabled", False):
+            trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
+            logger.info(f"Trailing stop enabled at {trailing_stop_pct}%")
+        
+        # Position sizing configuration
+        position_sizing_config = risk_config.get("position_sizing", {})
+        if position_sizing_config.get("enabled", False):
+            position_size = position_sizing_config.get("size_multiplier", 1.0)
+            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
+    
+    def objective(trial):
+        # Define hyperparameters to tune
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+        n_steps = trial.suggest_int("n_steps", 128, 2048, log=True)
+        ent_coef = trial.suggest_float("ent_coef", 0.00001, 0.5, log=True)
+        batch_size = trial.suggest_int("batch_size", 8, 128, log=True)
+        gamma = trial.suggest_float("gamma", 0.9, 0.9999)
+        gae_lambda = trial.suggest_float("gae_lambda", 0.9, 0.999)
+        
+        # Create environment
+        train_env = TradingEnv(
+            train_data,
+            initial_balance=config["environment"]["initial_balance"],
+            transaction_cost=0.0,
+            position_size=config["environment"].get("position_size", 1)
+        )
+        
+        # Create model with trial hyperparameters
+        model = PPO(
+            "MlpPolicy",
+            train_env,
+            verbose=0,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            ent_coef=ent_coef,
+            batch_size=batch_size,
+            gamma=gamma,
+            gae_lambda=gae_lambda
+        )
+        
+        # Train the model
+        total_timesteps = config["training"].get("total_timesteps", 10000)
+        model.learn(total_timesteps=total_timesteps)
+        
+        # Evaluate on validation data
+        if risk_enabled and window_folder:
+            # Save the model temporarily for evaluation with risk management
+            temp_model_path = f"{window_folder}/temp_model_trial_{trial.number}"
+            model.save(temp_model_path)
+            
+            # Evaluate with risk management
+            results = trade_with_risk_management(
+                model_path=temp_model_path,
+                test_data=validation_data,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                trailing_stop_pct=trailing_stop_pct,
+                position_size=position_size,
+                max_risk_per_trade_pct=max_risk_per_trade_pct,
+                initial_balance=config["environment"]["initial_balance"],
+                transaction_cost=config["environment"].get("transaction_cost", 0.0),
+                verbose=0,
+                deterministic=True,
+                close_at_end_of_day=True
+            )
+            
+            # Clean up temporary model file
+            if os.path.exists(f"{temp_model_path}.zip"):
+                os.remove(f"{temp_model_path}.zip")
+                
+            # Calculate hit rate from trade results
+            results = calculate_hit_rate_from_trade_results(results)
+        else:
+            # Use standard evaluation without risk management
+            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
+        
+        # Determine metric value to optimize
+        if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
+            metric_value = results["hit_rate"]
+            logger.info(f"Trial {trial.number}: Hit Rate = {metric_value:.2f}% ({results['profitable_trades']}/{results['trade_count']} trades)")
+        else:
+            metric_value = results["total_return_pct"]
+            logger.info(f"Trial {trial.number}: Return = {metric_value:.2f}%")
+            if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
+                logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
+        
+        # Log all hyperparameters and results
+        logger.info(f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, ent_coef={ent_coef:.6f}, "
+                   f"batch_size={batch_size}, gamma={gamma:.4f}, gae_lambda={gae_lambda:.4f}")
+        
+        # Return metric value (negative since Optuna minimizes)
+        return -metric_value
+    
+    # Create and run Optuna study
+    study = optuna.create_study()
+    study.optimize(objective, n_trials=n_trials)
+    
+    # Get best parameters
+    best_params = study.best_params
+    best_value = -study.best_value  # Convert back to positive
+    
+    logger.info("\n" + "="*80)
+    logger.info("Hyperparameter Tuning Results:")
+    logger.info(f"Best {eval_metric}: {best_value:.2f}" + ("%" if eval_metric == "return" else "% (hit rate)"))
+    logger.info("Best parameters:")
+    for param, value in best_params.items():
+        logger.info(f"  {param}: {value}")
+    
+    # Save results if window_folder is provided
+    if window_folder:
+        # Save best parameters
+        tuning_results = {
+            "best_params": best_params,
+            "best_value": best_value,
+            "eval_metric": eval_metric,
+            "n_trials": n_trials,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        save_json(tuning_results, f'{window_folder}/hyperparameter_tuning_results.json')
+        
+        # Create a visualization of the optimization history
+        try:
+            fig1 = optuna.visualization.plot_optimization_history(study)
+            fig1.write_image(f'{window_folder}/optimization_history.png')
+            
+            fig2 = optuna.visualization.plot_param_importances(study)
+            fig2.write_image(f'{window_folder}/param_importances.png')
+            
+            logger.info(f"Saved optimization visualizations to {window_folder}")
+        except Exception as e:
+            logger.warning(f"Could not save optimization visualizations: {e}")
+    
+    return {
+        "best_params": best_params,
+        "best_value": best_value,
+        "study": study
+    }
+
 def train_walk_forward_model(
     train_data: pd.DataFrame,
     validation_data: pd.DataFrame,
@@ -627,7 +918,9 @@ def train_walk_forward_model(
     max_iterations: int = 10,
     n_stagnant_loops: int = 3,
     improvement_threshold: float = 0.1,
-    window_folder: str = None
+    window_folder: str = None,
+    run_hyperparameter_tuning: bool = False,
+    tuning_trials: int = 30
 ) -> Tuple[PPO, List[Dict]]:
     """
     Train a model for a single walk-forward window.
@@ -641,10 +934,31 @@ def train_walk_forward_model(
         n_stagnant_loops: Number of consecutive iterations without improvement before stopping
         improvement_threshold: Minimum percentage improvement considered significant
         window_folder: Folder to save training statistics
+        run_hyperparameter_tuning: Whether to run hyperparameter tuning before training
+        tuning_trials: Number of trials for hyperparameter tuning
         
     Returns:
         Tuple[PPO, List[Dict]]: Trained model and training statistics
     """
+    # Get evaluation metric from config
+    eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
+    hit_rate_min_trades = config.get("training", {}).get("evaluation", {}).get("hit_rate_min_trades", 5)
+    
+    # Run hyperparameter tuning if enabled
+    model_params = {}
+    if run_hyperparameter_tuning:
+        logger.info(f"Running hyperparameter tuning with {tuning_trials} trials")
+        tuning_results = hyperparameter_tuning(
+            train_data=train_data,
+            validation_data=validation_data,
+            n_trials=tuning_trials,
+            window_folder=window_folder,
+            eval_metric=eval_metric,
+            hit_rate_min_trades=hit_rate_min_trades
+        )
+        model_params = tuning_results["best_params"]
+        logger.info(f"Using tuned hyperparameters: {model_params}")
+    
     # Initialize training environment
     train_env = TradingEnv(
         train_data,
@@ -653,18 +967,26 @@ def train_walk_forward_model(
         position_size=config["environment"].get("position_size", 1)
     )
     
-    # Initialize model
-    model = PPO(
-        "MlpPolicy", 
-        train_env, 
-        verbose=0,
-        ent_coef=config["model"].get("ent_coef", 0.01),
-        learning_rate=config["model"].get("learning_rate", 0.0003),
-        n_steps=config["model"].get("n_steps", 2048),
-        batch_size=config["model"].get("batch_size", 64),
-        gamma=0.99,
-        gae_lambda=0.95,
-    )
+    # Initialize model with either tuned parameters or config parameters
+    if model_params:
+        model = PPO(
+            "MlpPolicy", 
+            train_env, 
+            verbose=0,
+            **model_params
+        )
+    else:
+        model = PPO(
+            "MlpPolicy", 
+            train_env, 
+            verbose=0,
+            ent_coef=config["model"].get("ent_coef", 0.01),
+            learning_rate=config["model"].get("learning_rate", 0.0003),
+            n_steps=config["model"].get("n_steps", 2048),
+            batch_size=config["model"].get("batch_size", 64),
+            gamma=0.99,
+            gae_lambda=0.95,
+        )
     
     # Initialize training statistics list
     training_stats = []
@@ -744,7 +1066,8 @@ def train_walk_forward_model(
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 0.0),
             verbose=0,
-            deterministic=True
+            deterministic=True,
+            close_at_end_of_day=True
         )
         
         # Clean up temporary model file
@@ -828,7 +1151,8 @@ def train_walk_forward_model(
                 initial_balance=config["environment"]["initial_balance"],
                 transaction_cost=config["environment"].get("transaction_cost", 0.0),
                 verbose=0,
-                deterministic=True
+                deterministic=True,
+                close_at_end_of_day=True
             )
             
             # Clean up temporary model file
@@ -944,7 +1268,8 @@ def train_walk_forward_model(
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 0.0),
             verbose=1,
-            deterministic=True
+            deterministic=True,
+            close_at_end_of_day=True
         )
         
         # Clean up temporary model file
@@ -1011,7 +1336,7 @@ def plot_training_progress(training_stats: List[Dict], window_folder: str) -> No
     else:
         metric_name = "return"  # Default if no stats
     
-    if metric_name == "hit rate":
+    if metric_name == "hit_rate":
         metric_values = [stat["hit_rate"] for stat in training_stats]
         y_label = 'Hit Rate (%)'
         title_prefix = 'Hit Rate'
@@ -1234,23 +1559,16 @@ def main():
     os.makedirs('models', exist_ok=True)
     os.makedirs('models/logs', exist_ok=True)
     
-    # Load all data
-    train_data, validation_data, test_data = get_data(
-        symbol=config["data"]["symbol"],
-        period=config["data"]["period"],
-        interval=config["data"]["interval"],
-        train_ratio=0.0,  # Don't split data here, we'll do it in walk-forward testing
-        validation_ratio=0.0
-    )
+    # Load data from TradingView CSV instead of Yahoo Finance
+    full_data = load_tradingview_data("data/trading_view_nq.csv")
     
     # Check if data loading was successful
-    if train_data is None or len(train_data) == 0:
-        logger.error("Failed to load data or dataset is empty. Check your data file and configuration.")
-        print("\nERROR: Data loading failed. Please check the data file and ensure it contains valid data.")
+    if full_data is None or len(full_data) == 0:
+        logger.error("Failed to load TradingView data or dataset is empty. Check your data file.")
+        print("\nERROR: Data loading failed. Please check the TradingView data file and ensure it contains valid data.")
         return
     
-    full_data = train_data  # Just get the first part (full dataset)
-    logger.info(f"Loaded dataset with {len(full_data)} rows spanning from {full_data.index[0]} to {full_data.index[-1]}")
+    logger.info(f"Loaded TradingView dataset with {len(full_data)} rows spanning from {full_data.index[0]} to {full_data.index[-1]}")
     logger.info("Note: Dataset will be filtered to include only NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)")
     
     # Get walk-forward parameters from config or use defaults
@@ -1293,9 +1611,9 @@ def main():
         trailing_stop_config = risk_config.get("trailing_stop", {})
         if trailing_stop_config.get("enabled", False):
             trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
-            logger.info(f"  - Trailing stop: {trailing_stop_pct}%")
+            logger.info(f"  - Trailing Stop: {trailing_stop_pct}%")
         else:
-            logger.info("  - Trailing stop: Disabled")
+            logger.info("  - Trailing Stop: Disabled")
         
         # Position sizing configuration
         position_sizing_config = risk_config.get("position_sizing", {})
@@ -1308,7 +1626,11 @@ def main():
     else:
         logger.info("Risk management is DISABLED for walk-forward testing")
     
-    # Run walk-forward testing
+    # Check if hyperparameter tuning is enabled in config
+    hyperparameter_tuning_enabled = config.get("hyperparameter_tuning", {}).get("enabled", False)
+    tuning_trials = config.get("hyperparameter_tuning", {}).get("n_trials", 30)
+    
+    # Run walk-forward testing with hyperparameter tuning if enabled
     results = walk_forward_testing(
         data=full_data,
         window_size=window_size,
@@ -1319,7 +1641,9 @@ def main():
         additional_timesteps=config["training"].get("additional_timesteps", 5000),
         max_iterations=config["training"].get("max_iterations", 10),
         n_stagnant_loops=config["training"].get("n_stagnant_loops", 3),
-        improvement_threshold=config["training"].get("improvement_threshold", 0.1)
+        improvement_threshold=config["training"].get("improvement_threshold", 0.1),
+        run_hyperparameter_tuning=hyperparameter_tuning_enabled,
+        tuning_trials=tuning_trials
     )
     
     # Check if we have results

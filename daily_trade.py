@@ -45,7 +45,7 @@ def prepare_data_for_training(df: pd.DataFrame) -> pd.DataFrame:
         
     return train_data
 
-def split_today_and_training_window(data: pd.DataFrame, window_days: int = 59, 
+def split_today_and_training_window(data: pd.DataFrame, window_days: int = 14, 
                                    train_ratio: float = 0.7, 
                                    validation_ratio: float = 0.15) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
@@ -53,7 +53,7 @@ def split_today_and_training_window(data: pd.DataFrame, window_days: int = 59,
     
     Args:
         data: Processed DataFrame with DateTime index
-        window_days: Number of days to use for training and validation window
+        window_days: Number of trading days to use for training and validation window
         train_ratio: Proportion of window to use for training
         validation_ratio: Proportion of window to use for validation
         
@@ -63,21 +63,39 @@ def split_today_and_training_window(data: pd.DataFrame, window_days: int = 59,
     # Get the most recent date in the data
     last_date = data.index.max()
     
-    # Calculate the start of the training window
-    window_start = last_date - timedelta(days=window_days)
+    # Convert data index to Eastern Time for consistent day counting
+    if data.index.tz is None:
+        eastern_data_index = data.index.tz_localize('UTC').tz_convert('US/Eastern')
+    else:
+        eastern_data_index = data.index.tz_convert('US/Eastern')
     
-    # Get historical data for the window
-    historical_data = data[data.index >= window_start].copy()
+    # Extract unique trading days
+    unique_days = sorted(set(eastern_data_index.date.astype(str)))
+    logger.info(f"Found {len(unique_days)} unique trading days in the dataset")
+    
+    # Make sure we have enough trading days
+    if len(unique_days) <= window_days:
+        logger.warning(f"Not enough trading days ({len(unique_days)}) for window size ({window_days}). Using all available data.")
+        window_days = len(unique_days) - 1  # Leave at least one day for test
+    
+    # Select the trading days for our window
+    window_days_list = unique_days[-window_days:]
+    window_start_day = window_days_list[0]
+    
+    logger.info(f"Using window of {window_days} trading days from {window_start_day} to {window_days_list[-1]}")
+    
+    # Filter data to include only the window days
+    window_data = data[data.index.tz_convert('US/Eastern').date.astype(str) >= window_start_day].copy()
     
     # Split historical data into training, validation and test by date
     # First determine size of training and validation periods in terms of data points
-    historical_size = len(historical_data)
+    historical_size = len(window_data)
     train_size = int(historical_size * train_ratio)
     validation_size = int(historical_size * validation_ratio)
     
     # Get the data for each period
-    train_data = historical_data.iloc[:train_size].copy()
-    validation_data = historical_data.iloc[train_size:train_size + validation_size].copy()
+    train_data = window_data.iloc[:train_size].copy()
+    validation_data = window_data.iloc[train_size:train_size + validation_size].copy()
     
     # Get the end date of validation period
     validation_end_date = validation_data.index.max()
@@ -114,7 +132,8 @@ def train_model(train_data: pd.DataFrame, validation_data: pd.DataFrame,
                additional_timesteps: int = None,
                max_iterations: int = None,
                n_stagnant_loops: int = None,
-               improvement_threshold: float = None) -> Tuple[PPO, List[Dict], str]:
+               improvement_threshold: float = None,
+               seed: int = 42) -> Tuple[PPO, List[Dict], str]:
     """
     Train a PPO model on the training data with iterative validation.
     
@@ -126,10 +145,14 @@ def train_model(train_data: pd.DataFrame, validation_data: pd.DataFrame,
         max_iterations: Maximum number of training iterations
         n_stagnant_loops: Number of consecutive iterations without improvement before stopping
         improvement_threshold: Minimum percentage improvement considered significant
+        seed: Random seed for reproducibility
         
     Returns:
         Tuple[PPO, List[Dict], str]: Best trained model based on validation performance and training statistics and model path
     """
+    # Set all random seeds for reproducibility
+    set_all_seeds(seed)
+    
     # Get training parameters from config
     if initial_timesteps is None:
         initial_timesteps = config["training"].get("total_timesteps", 10000)
@@ -153,6 +176,9 @@ def train_model(train_data: pd.DataFrame, validation_data: pd.DataFrame,
         position_size=config["environment"].get("position_size", 1)
     )
     
+    # Set the environment seed for reproducibility
+    train_env.reset(seed=seed)
+    
     # Validate environment
     check_env(train_env, skip_render_check=True)
     
@@ -167,6 +193,7 @@ def train_model(train_data: pd.DataFrame, validation_data: pd.DataFrame,
         batch_size=config["model"].get("batch_size", 64),
         gamma=0.99,
         gae_lambda=0.95,
+        seed=seed  # Add seed for reproducibility
     )
     
     # Initialize training statistics list
@@ -298,7 +325,7 @@ def train_model(train_data: pd.DataFrame, validation_data: pd.DataFrame,
     # Return the best model, training statistics, and path to best model
     return best_model, training_stats, final_model_path
 
-def execute_test_trade(model: PPO, model_path: str, test_data: pd.DataFrame) -> Dict:
+def execute_test_trade(model: PPO, model_path: str, test_data: pd.DataFrame, seed: int = 42) -> Dict:
     """
     Execute a test trade on the test data using the trained model with risk management.
     
@@ -306,10 +333,14 @@ def execute_test_trade(model: PPO, model_path: str, test_data: pd.DataFrame) -> 
         model: Trained PPO model (kept for compatibility)
         model_path: Path to the saved model file
         test_data: Test market data
+        seed: Random seed for reproducibility
         
     Returns:
         Dict: Trade results
     """
+    # Set all random seeds for reproducibility
+    set_all_seeds(seed)
+    
     # Get risk management configuration from config.yaml
     risk_config = config.get("risk_management", {})
     risk_enabled = risk_config.get("enabled", True)
@@ -399,24 +430,60 @@ def plot_training_progress(training_stats: List[Dict]) -> None:
     plt.legend()
     
     # Save the plot
-    os.makedirs('plots', exist_ok=True)
+    os.makedirs('models/plots', exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     plt.tight_layout()
-    plt.savefig(f'plots/daily_training_progress_{timestamp}.png')
+    plt.savefig(f'models/plots/daily_training_progress_{timestamp}.png')
     plt.close()
     
-    logger.info(f"Training progress plot saved to plots/daily_training_progress_{timestamp}.png")
+    logger.info(f"Training progress plot saved to models/plots/daily_training_progress_{timestamp}.png")
+
+def set_all_seeds(seed=42):
+    """
+    Set all random seeds for reproducibility.
+    
+    Args:
+        seed: The seed value to use
+    """
+    import numpy as np
+    import torch
+    import random
+    import os
+    
+    # Set Python's random seed
+    random.seed(seed)
+    
+    # Set NumPy's random seed
+    np.random.seed(seed)
+    
+    # Set PyTorch's random seeds
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # For multi-GPU
+        
+    # Set environment variables for additional determinism
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # Make PyTorch operations deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    logging.info(f"All random seeds set to {seed} for reproducibility")
 
 def main():
     """
     Main function to run the daily trading process.
     """
+    # Set random seeds for reproducibility (using our function)
+    set_all_seeds(42)
+    
     # Create directories if they don't exist
     os.makedirs('data', exist_ok=True)
     os.makedirs('models', exist_ok=True)
     os.makedirs('models/daily', exist_ok=True)
     os.makedirs('models/logs', exist_ok=True)
-    os.makedirs('plots', exist_ok=True)
+    os.makedirs('models/plots', exist_ok=True)
     
     # Record session timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -475,7 +542,8 @@ def main():
         additional_timesteps=additional_timesteps,
         max_iterations=max_iterations,
         n_stagnant_loops=n_stagnant_loops,
-        improvement_threshold=improvement_threshold
+        improvement_threshold=improvement_threshold,
+        seed=42
     )
     
     # Plot training progress
@@ -483,13 +551,15 @@ def main():
     
     # Execute test trade using the best model
     logger.info("Running trade on test data using the best model")
-    results = execute_test_trade(model, best_model_path, test_data)
+    results = execute_test_trade(model, best_model_path, test_data, seed=42)
     
     # Plot results
-    plot_results(results)
+    plots_dir = "models/plots"
+    os.makedirs(plots_dir, exist_ok=True)
+    plot_results(results, plots_dir=plots_dir)
     
     # Save trade history
-    trade_history_file = f"daily_trade_history_{timestamp}.csv"
+    trade_history_file = f"models/logs/daily_trade_history_{timestamp}.csv"
     save_trade_history(results["trade_history"], trade_history_file)
     logger.info(f"Trade history saved to {trade_history_file}")
     

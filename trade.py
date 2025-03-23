@@ -139,7 +139,7 @@ class RiskManager:
         unrealized_pnl_dollars = unrealized_pnl_points * point_value * self.current_contracts
         
         # Calculate as percentage of entry portfolio value
-        unrealized_pnl_pct = (unrealized_pnl_dollars / self.entry_portfolio_value) * 100
+        unrealized_pnl_pct = (unrealized_pnl_dollars / self.entry_portfolio_value) * 100 if self.entry_portfolio_value and self.entry_portfolio_value != 0 else Decimal('0.0')
         
         # Update highest unrealized profit % for trailing stop
         if unrealized_pnl_pct > self.highest_unrealized_profit_pct:
@@ -200,8 +200,8 @@ class RiskManager:
         pnl_dollars_profit = pnl_points_profit * point_value * self.current_contracts
         
         # Calculate as percentage of entry portfolio value
-        pnl_pct_stop = (pnl_dollars_stop / self.entry_portfolio_value) * 100
-        pnl_pct_profit = (pnl_dollars_profit / self.entry_portfolio_value) * 100
+        pnl_pct_stop = (pnl_dollars_stop / self.entry_portfolio_value) * 100 if self.entry_portfolio_value and self.entry_portfolio_value != 0 else Decimal('0.0')
+        pnl_pct_profit = (pnl_dollars_profit / self.entry_portfolio_value) * 100 if self.entry_portfolio_value and self.entry_portfolio_value != 0 else Decimal('0.0')
         
         # Add debug logging
         logging.debug(f"Position: {self.position}, Entry price: {self.entry_price}, Close: {close_price}")
@@ -260,6 +260,13 @@ class RiskManager:
         self.position = position
         self.entry_price = money.to_decimal(price)
         self.current_contracts = contracts  # Store the number of contracts
+        
+        # Ensure we never have a zero portfolio value at entry to prevent division by zero
+        if self.net_worth == 0:
+            # If net_worth is zero, use the initial_balance
+            self.net_worth = self.initial_balance
+            logging.warning(f"Portfolio value was zero at position entry. Using initial balance: {self.initial_balance}")
+            
         self.entry_portfolio_value = money.to_decimal(self.net_worth)  # Store portfolio value at entry
         self.highest_unrealized_profit_pct = Decimal('0.0')  # Reset highest profit
         
@@ -724,12 +731,13 @@ def trade_with_risk_management(
         "unrealistic_profit_count": unrealistic_profit_count
     }
 
-def plot_results(results: Dict) -> None:
+def plot_results(results: Dict, plots_dir: str = None) -> None:
     """
     Plot trading results using Plotly.
     
     Args:
         results: Results dictionary from trade_with_risk_management
+        plots_dir: Directory to save the plot to (if None, just show the plot)
     """
     dates = results["dates"]
     price_history = results["price_history"]
@@ -827,6 +835,23 @@ def plot_results(results: Dict) -> None:
         margin=dict(l=60, r=60, t=100, b=50)
     )
     
+    # Save the plot if a directory is provided
+    if plots_dir:
+        import os
+        from datetime import datetime
+        
+        # Create the directory if it doesn't exist
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        # Generate a timestamp for the filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{plots_dir}/trade_results_{timestamp}.html"
+        
+        # Save the plot
+        fig.write_html(filename)
+        logger.info(f"Plot saved to {filename}")
+    
+    # Always show the plot
     fig.show()
 
 def save_trade_history(trade_history: List[Dict], filename: str = "risk_managed_trade_history.csv") -> None:

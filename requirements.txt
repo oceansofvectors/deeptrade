@@ -10,3 +10,4 @@ PyYAML
 plotly
 matplotlib
 pytz
+optuna
