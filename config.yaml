@@ -5,12 +5,13 @@ training:
   max_iterations: 200
   improvement_threshold: 0.05
   additional_timesteps: 200
-  n_stagnant_loops: 10
+  n_stagnant_loops: 20
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
   evaluation:
-    metric: "return"  # Options: "return" (total return percentage) or "hit_rate" (percentage of profitable trades)
+    metric: "prediction_accuracy"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
     hit_rate_min_trades: 3  # Minimum number of trades required for hit rate to be meaningful
+    min_predictions: 10  # Minimum number of predictions required for prediction accuracy to be meaningful
 
 data:
   symbol: "NQ=F"
@@ -22,7 +23,7 @@ data:
 
 indicators:
   supertrend:
-    enabled: false
+    enabled: true
     length: 10
     multiplier: 3
   rsi:
@@ -103,7 +104,7 @@ risk_management:
   # Take profit configuration
   take_profit:
     enabled: true
-    percentage: 50  # Take profit as percentage of portfolio value
+    percentage: 20  # Take profit as percentage of portfolio value
   
   # Trailing stop loss configuration
   trailing_stop:
@@ -124,7 +125,7 @@ walk_forward:
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: false  # Set to true to enable hyperparameter tuning during training
+  enabled: true  # Set to true to enable hyperparameter tuning during training
   n_trials: 30     # Number of trials for the optimization
   # Parameters to tune (these are the search spaces)
   parameters:

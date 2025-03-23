@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from decimal import Decimal
+import os
+import json
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
@@ -42,7 +44,8 @@ def train_agent(train_data, total_timesteps: int):
     return model
 
 def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20, 
-                           n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000):
+                           n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000,
+                           evaluation_metric: str = "return", model_params: dict = None):
     """
     Train a PPO model iteratively based on validation performance.
     
@@ -54,6 +57,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         n_stagnant_loops (int): Number of consecutive iterations without improvement before stopping.
         improvement_threshold (float): Minimum percentage improvement considered significant.
         additional_timesteps (int): Number of additional timesteps for each iteration.
+        evaluation_metric (str): Metric to use for evaluation ("return", "hit_rate", or "prediction_accuracy").
+        model_params (dict, optional): Model hyperparameters to use for training.
         
     Returns:
         tuple: (best_model, best_results, all_results)
@@ -71,38 +76,70 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
     
-    # Initialize the PPO model
+    # Use provided model parameters or get defaults from config
+    if model_params is None:
+        model_params = {
+            "ent_coef": config["model"].get("ent_coef", 0.01),
+            "learning_rate": config["model"].get("learning_rate", 0.0003),
+            "n_steps": config["model"].get("n_steps", 2048),
+            "batch_size": config["model"].get("batch_size", 64),
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+        }
+    
+    # Initialize the PPO model with the specified parameters
     model = PPO(
         "MlpPolicy", 
         train_env, 
         verbose=verbose_level,
-        ent_coef=config["model"].get("ent_coef", 0.01),
-        learning_rate=config["model"].get("learning_rate", 0.0003),
-        n_steps=config["model"].get("n_steps", 2048),
-        batch_size=config["model"].get("batch_size", 64),
-        gamma=0.99,
-        gae_lambda=0.95,
+        ent_coef=model_params.get("ent_coef", 0.01),
+        learning_rate=model_params.get("learning_rate", 0.0003),
+        n_steps=model_params.get("n_steps", 2048),
+        batch_size=model_params.get("batch_size", 64),
+        gamma=model_params.get("gamma", 0.99),
+        gae_lambda=model_params.get("gae_lambda", 0.95),
     )
     
     # Initial training
     logger.info(f"Starting initial training for {initial_timesteps} timesteps")
     model.learn(total_timesteps=initial_timesteps)
     
-    # Evaluate initial model on validation data (deterministic action selection)
+    # Evaluate initial model on validation data using the specified metric
     if verbose_level > 0:
-        logger.info("Evaluating model on validation data with deterministic action selection")
-    results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-    best_return = results["total_return_pct"]
+        logger.info(f"Evaluating model on validation data with {evaluation_metric} metric")
+    
+    # Use the appropriate evaluation function based on the metric
+    if evaluation_metric == "prediction_accuracy":
+        # Need to import from walk_forward module
+        from walk_forward import evaluate_agent_prediction_accuracy
+        results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=verbose_level, deterministic=True)
+        best_metric_value = results["prediction_accuracy"]
+        metric_name = "prediction_accuracy"
+    elif evaluation_metric == "hit_rate":
+        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+        best_metric_value = results["hit_rate"]
+        metric_name = "hit_rate"
+    else:  # Default to "return"
+        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+        best_metric_value = results["total_return_pct"]
+        metric_name = "return"
+    
+    # Store best model and results
     best_model = model
     best_results = results
     
     # Save the initial model as the best model so far
     best_model.save("best_model")
     
-    logger.info(f"Initial training completed. Validation Return: {best_return:.2f}%, Validation Portfolio: ${results['final_portfolio_value']:.2f}")
+    # Log evaluation results based on metric
+    logger.info(f"Initial training completed. Validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, " 
+                f"Validation Portfolio: ${results['final_portfolio_value']:.2f}")
     
     # Store all results for comparison
     all_results = [results]
+    
+    # Add metric information to results
+    results["metric_used"] = metric_name
     
     # Counter for consecutive iterations without significant improvement
     stagnant_counter = 0
@@ -114,23 +151,39 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             logger.info(f"Starting iteration {iteration} training for {additional_timesteps} timesteps")
         model.learn(total_timesteps=additional_timesteps)
         
-        # Evaluate the model on validation data (deterministic)
-        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-        current_return = results["total_return_pct"]
+        # Evaluate the model on validation data using the specified metric
+        if evaluation_metric == "prediction_accuracy":
+            from walk_forward import evaluate_agent_prediction_accuracy
+            results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=verbose_level, deterministic=True)
+            current_metric_value = results["prediction_accuracy"]
+        elif evaluation_metric == "hit_rate":
+            results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+            current_metric_value = results["hit_rate"]
+        else:  # Default to "return"
+            results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+            current_metric_value = results["total_return_pct"]
+        
+        # Add metric information to results
+        results["metric_used"] = metric_name
+        results["is_best"] = False  # Will update this if it becomes the best model
+        
         all_results.append(results)
         
         # Calculate improvement
-        improvement = current_return - best_return
-        logger.info(f"Iteration {iteration} - Validation Return: {current_return:.2f}%, " 
+        improvement = current_metric_value - best_metric_value
+        logger.info(f"Iteration {iteration} - Validation {metric_name.replace('_', ' ').title()}: {current_metric_value:.2f}%, " 
                    f"Validation Portfolio: ${results['final_portfolio_value']:.2f}, "
                    f"Improvement: {improvement:.2f}%")
         
         # Check if this is the best model so far based on validation performance
-        if current_return > best_return + improvement_threshold:
-            best_return = current_return
+        if current_metric_value > best_metric_value + improvement_threshold:
+            best_metric_value = current_metric_value
             best_model = model
             best_results = results
-            logger.info(f"New best model found! Validation Return: {best_return:.2f}%, " 
+            # Mark this result as the new best
+            results["is_best"] = True
+            
+            logger.info(f"New best model found! Validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, " 
                        f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
             
             # Save the best model
@@ -149,7 +202,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             logger.info(f"Stopping training after {n_stagnant_loops} consecutive iterations without significant improvement")
             break
     
-    logger.info(f"Iterative training completed. Best validation return: {best_return:.2f}%, " 
+    logger.info(f"Iterative training completed. Best validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, " 
                f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
     return best_model, best_results, all_results
 
@@ -467,6 +520,128 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
     trade_history_df = pd.DataFrame(trade_history)
     trade_history_df.to_csv(filename, index=False)
     logger.info("Trade history saved to %s", filename)
+
+def train_walk_forward_model(train_data, validation_data, initial_timesteps=20000, additional_timesteps=10000, 
+                         max_iterations=200, n_stagnant_loops=10, improvement_threshold=0.05, window_folder=None,
+                         run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None):
+    """
+    Train a model using walk-forward optimization.
+    
+    Args:
+        train_data (pd.DataFrame): Training dataset.
+        validation_data (pd.DataFrame): Validation dataset for model selection.
+        initial_timesteps (int): Initial number of training timesteps.
+        additional_timesteps (int): Number of additional timesteps for each iteration.
+        max_iterations (int): Maximum number of training iterations.
+        n_stagnant_loops (int): Number of consecutive iterations without improvement before stopping.
+        improvement_threshold (float): Minimum percentage improvement considered significant.
+        window_folder (str): Path to save model and results for this window.
+        run_hyperparameter_tuning (bool): Whether to run hyperparameter tuning.
+        tuning_trials (int): Number of trials for hyperparameter tuning.
+        tuning_folder (str): Path to save hyperparameter tuning results.
+        
+    Returns:
+        tuple: (trained_model, training_stats)
+    """
+    # Log the start of training
+    logger.info(f"Starting model training with parameters:")
+    logger.info(f"- initial_timesteps: {initial_timesteps}")
+    logger.info(f"- additional_timesteps: {additional_timesteps}")
+    logger.info(f"- max_iterations: {max_iterations}")
+    logger.info(f"- n_stagnant_loops: {n_stagnant_loops}")
+    logger.info(f"- improvement_threshold: {improvement_threshold}")
+    
+    # Get the evaluation metric from config
+    evaluation_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
+    logger.info(f"Using {evaluation_metric} as the evaluation metric for model selection")
+    
+    model_params = None
+    
+    # Perform hyperparameter tuning if enabled
+    if run_hyperparameter_tuning:
+        logger.info(f"Starting hyperparameter tuning with {tuning_trials} trials using {evaluation_metric} metric")
+        
+        # Import the hyperparameter tuning function
+        from walk_forward import hyperparameter_tuning
+        
+        # Run hyperparameter tuning with specified metric
+        best_params = hyperparameter_tuning(
+            train_data=train_data,
+            validation_data=validation_data,
+            n_trials=tuning_trials,
+            eval_metric=evaluation_metric
+        )
+        
+        logger.info(f"Hyperparameter tuning completed. Best parameters: {best_params}")
+        
+        # Use the best parameters for model training
+        model_params = best_params
+        
+        # Save tuning results if a folder is provided
+        if tuning_folder:
+            os.makedirs(tuning_folder, exist_ok=True)
+            with open(os.path.join(tuning_folder, "best_params.json"), "w") as f:
+                json.dump(best_params, f, indent=4)
+    
+    # Log the model parameters being used
+    logger.info(f"Training model with parameters: {model_params if model_params else 'default parameters'}")
+    
+    # Train the model iteratively
+    model, validation_results, all_results = train_agent_iteratively(
+        train_data, 
+        validation_data,
+        initial_timesteps=initial_timesteps,
+        additional_timesteps=additional_timesteps,
+        max_iterations=max_iterations,
+        n_stagnant_loops=n_stagnant_loops,
+        improvement_threshold=improvement_threshold,
+        evaluation_metric=evaluation_metric,
+        model_params=model_params
+    )
+    
+    # Save validation results
+    if window_folder:
+        os.makedirs(window_folder, exist_ok=True)
+        
+        # Save validation results in json format
+        validation_results_json = {
+            "final_portfolio_value": validation_results.get("final_portfolio_value", 0),
+            "total_return_pct": validation_results.get("total_return_pct", 0),
+            "trade_count": validation_results.get("trade_count", 0),
+            "profitable_trades": validation_results.get("profitable_trades", 0),
+            "hit_rate": validation_results.get("hit_rate", 0),
+            "prediction_accuracy": validation_results.get("prediction_accuracy", 0),
+            "correct_predictions": validation_results.get("correct_predictions", 0),
+            "total_predictions": validation_results.get("total_predictions", 0),
+            "final_position": validation_results.get("final_position", 0),
+            "evaluation_metric_used": evaluation_metric
+        }
+        
+        with open(os.path.join(window_folder, "validation_results.json"), "w") as f:
+            json.dump(validation_results_json, f, indent=4)
+        
+        # Save model
+        model.save(os.path.join(window_folder, "model"))
+        
+        # Prepare training stats for all iterations
+        training_stats = []
+        for i, result in enumerate(all_results):
+            entry = {
+                "iteration": i,
+                "return_pct": result.get("total_return_pct", 0),
+                "portfolio_value": result.get("final_portfolio_value", 0),
+                "hit_rate": result.get("hit_rate", 0),
+                "prediction_accuracy": result.get("prediction_accuracy", 0),
+                "is_best": result.get("is_best", False),
+                "metric_used": result.get("metric_used", evaluation_metric)
+            }
+            training_stats.append(entry)
+        
+        # Save training stats
+        with open(os.path.join(window_folder, "training_stats.json"), "w") as f:
+            json.dump(training_stats, f, indent=4)
+    
+    return model, training_stats
 
 def main():
     # Load data using settings from YAML with three-way split and direct Yahoo Finance download

@@ -9,10 +9,11 @@ from typing import List, Dict, Tuple
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 import optuna
+import math
 
 from environment import TradingEnv
 from get_data import get_data
-from train import evaluate_agent, plot_results
+from train import evaluate_agent, plot_results, train_walk_forward_model
 from trade import trade_with_risk_management, save_trade_history  # Import trade_with_risk_management and save_trade_history
 from config import config
 import money
@@ -277,6 +278,152 @@ def calculate_hit_rate_from_trade_results(results: Dict) -> Dict:
     
     return results
 
+def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministic=True):
+    """
+    Evaluate a trained agent's prediction accuracy on test data.
+    
+    This function focuses on measuring how accurately the model predicts price direction
+    (up or down) in the next candle, rather than measuring returns.
+    
+    Args:
+        model: Trained PPO model
+        test_data: Test data DataFrame
+        verbose: Verbosity level (0=silent, 1=info)
+        deterministic: Whether to make deterministic predictions
+        
+    Returns:
+        Dict: Results including prediction accuracy metrics
+    """
+    # Create evaluation environment
+    env = TradingEnv(
+        test_data,
+        initial_balance=config["environment"]["initial_balance"],
+        transaction_cost=config["environment"].get("transaction_cost", 0.0),
+        position_size=config["environment"].get("position_size", 1)
+    )
+    
+    # Initialize tracking variables
+    total_predictions = 0
+    correct_predictions = 0
+    
+    # Portfolio tracking
+    initial_balance = config["environment"]["initial_balance"]
+    current_portfolio = money.to_decimal(initial_balance)
+    
+    # Position tracking
+    current_position = 0  # 0 = no position, 1 = long, -1 = short
+    
+    # Trade tracking
+    trade_history = []
+    trade_count = 0
+    
+    # Track action history for plotting
+    action_history = []
+    portfolio_history = [float(initial_balance)]
+    
+    # Reset environment to start evaluation
+    obs, _ = env.reset()
+    done = False
+    
+    if verbose > 0:
+        logger.info("Starting model evaluation with prediction accuracy tracking")
+    
+    # Step through the environment until done
+    while not done:
+        # Get current step and price before taking action
+        current_step = env.current_step
+        current_price = money.to_decimal(test_data.iloc[current_step]["Close"])
+        
+        # Get model's action
+        action, _ = model.predict(obs, deterministic=deterministic)
+        action_history.append(int(action))
+        
+        # Convert action to position (0 = long/buy, 1 = short/sell)
+        new_position = 1 if action == 0 else -1
+        
+        # Check if we're at the last step or not
+        # We need the next price to determine if prediction was correct
+        if current_step < len(test_data) - 1:
+            # Get next price
+            next_price = money.to_decimal(test_data.iloc[current_step + 1]["Close"])
+            price_change = next_price - current_price
+            
+            # Evaluate prediction accuracy
+            # If long and price goes up OR short and price goes down, prediction is correct
+            prediction_correct = (new_position == 1 and price_change > 0) or (new_position == -1 and price_change < 0)
+            
+            # Record prediction
+            total_predictions += 1
+            if prediction_correct:
+                correct_predictions += 1
+                
+            # Log information if verbose
+            if verbose > 0 and total_predictions % 100 == 0:
+                accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
+                logger.info(f"Step {current_step}: Predictions so far - {correct_predictions}/{total_predictions} correct ({accuracy:.2f}%)")
+        
+        # Track trade if position changed
+        if new_position != current_position:
+            # Record trade
+            trade_count += 1
+            trade_info = {
+                "step": current_step,
+                "action": "BUY" if new_position == 1 else "SELL",
+                "price": float(current_price),
+                "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step])
+            }
+            trade_history.append(trade_info)
+            
+            # Update position
+            current_position = new_position
+        
+        # Take step in environment
+        new_obs, reward, done, truncated, info = env.step(action)
+        obs = new_obs
+        done = done or truncated
+        
+        # Update portfolio from environment
+        current_portfolio = env.net_worth
+        portfolio_history.append(float(current_portfolio))
+    
+    # Calculate final metrics
+    prediction_accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
+    total_return_pct = money.calculate_return_pct(current_portfolio, initial_balance)
+    
+    # Calculate hit rate (percentage of profitable trades)
+    hit_rate = 0
+    profitable_trades = 0
+    if trade_count > 0:
+        # For simplicity, estimate profitable trades based on overall performance
+        # In a more detailed implementation, we'd track each trade's profitability
+        profitable_trades = int(trade_count * (prediction_accuracy / 100))
+        hit_rate = (profitable_trades / trade_count) * 100
+    
+    # Create results dictionary
+    results = {
+        "prediction_accuracy": prediction_accuracy,
+        "correct_predictions": correct_predictions,
+        "total_predictions": total_predictions,
+        "total_return_pct": float(total_return_pct),
+        "final_portfolio_value": float(current_portfolio),
+        "initial_portfolio_value": float(initial_balance),
+        "trade_count": trade_count,
+        "trade_history": trade_history,
+        "hit_rate": hit_rate,
+        "profitable_trades": profitable_trades,
+        "final_position": current_position,
+        "portfolio_history": portfolio_history,
+        "action_history": action_history
+    }
+    
+    # Log summary
+    if verbose > 0:
+        logger.info(f"Evaluation complete: {correct_predictions}/{total_predictions} correct predictions ({prediction_accuracy:.2f}%)")
+        logger.info(f"Return: {float(total_return_pct):.2f}%, Final portfolio: ${float(current_portfolio):.2f}")
+        logger.info(f"Total trades: {trade_count}")
+    
+    return results
+
 def export_consolidated_trade_history(all_window_results: List[Dict], session_folder: str) -> None:
     """
     Consolidate trade histories from all windows into a single CSV file.
@@ -511,7 +658,7 @@ def walk_forward_testing(
         
         save_json(window_periods, f'{window_folder}/window_periods.json')
         
-        # Create and train model
+        # Train model
         model, training_stats = train_walk_forward_model(
             train_data, 
             validation_data,
@@ -522,7 +669,8 @@ def walk_forward_testing(
             improvement_threshold=improvement_threshold,
             window_folder=window_folder,
             run_hyperparameter_tuning=run_hyperparameter_tuning,
-            tuning_trials=tuning_trials
+            tuning_trials=tuning_trials,
+            tuning_folder=None
         )
         
         # Evaluate on test data
@@ -675,12 +823,20 @@ def walk_forward_testing(
     hit_rates = [res.get("hit_rate", 0) for res in all_window_results]
     profitable_trades = [res.get("profitable_trades", 0) for res in all_window_results]
     
+    # Also aggregate prediction accuracies if that metric is used
+    prediction_accuracies = [res.get("prediction_accuracy", 0) for res in all_window_results]
+    correct_predictions = [res.get("correct_predictions", 0) for res in all_window_results]
+    total_predictions = [res.get("total_predictions", 0) for res in all_window_results]
+    
     # Calculate average metrics
     avg_return = np.mean(returns)
     avg_portfolio = np.mean(portfolio_values)
     avg_trades = np.mean(trade_counts)
     avg_hit_rate = np.mean(hit_rates) if hit_rates else 0
     avg_profitable_trades = np.mean(profitable_trades) if profitable_trades else 0
+    avg_prediction_accuracy = np.mean(prediction_accuracies) if prediction_accuracies else 0
+    avg_correct_predictions = np.mean(correct_predictions) if correct_predictions else 0
+    avg_total_predictions = np.mean(total_predictions) if total_predictions else 0
     
     logger.info(f"\n{'='*80}\nWalk-Forward Testing Summary\n{'='*80}")
     logger.info(f"Number of windows: {num_windows}")
@@ -689,6 +845,9 @@ def walk_forward_testing(
     if eval_metric == "hit_rate":
         logger.info(f"Average hit rate: {avg_hit_rate:.2f}%")
         logger.info(f"Average profitable trades: {avg_profitable_trades:.2f} out of {avg_trades:.2f}")
+    elif eval_metric == "prediction_accuracy":
+        logger.info(f"Average prediction accuracy: {avg_prediction_accuracy:.2f}%")
+        logger.info(f"Average correct predictions: {avg_correct_predictions:.2f} out of {avg_total_predictions:.2f}")
     
     logger.info(f"Average final portfolio: ${avg_portfolio:.2f}")
     logger.info(f"Average trade count: {avg_trades:.2f}")
@@ -697,9 +856,12 @@ def walk_forward_testing(
     summary_results = {
         "avg_return": avg_return,
         "avg_hit_rate": avg_hit_rate,
+        "avg_prediction_accuracy": avg_prediction_accuracy,
         "avg_portfolio": avg_portfolio,
         "avg_trades": avg_trades,
         "avg_profitable_trades": avg_profitable_trades,
+        "avg_correct_predictions": avg_correct_predictions,
+        "avg_total_predictions": avg_total_predictions,
         "num_windows": num_windows,
         "timestamp": timestamp,
         "evaluation_metric": eval_metric
@@ -728,14 +890,14 @@ def hyperparameter_tuning(
     hit_rate_min_trades: int = 5
 ) -> Dict:
     """
-    Perform hyperparameter tuning using Optuna.
+    Run hyperparameter tuning using Optuna.
     
     Args:
-        train_data: Training data
-        validation_data: Validation data for evaluation
-        n_trials: Number of trials for Optuna
-        window_folder: Folder to save results
-        eval_metric: Evaluation metric ("return" or "hit_rate")
+        train_data: Training data DataFrame
+        validation_data: Validation data DataFrame
+        n_trials: Number of trials for Optuna optimization
+        window_folder: Folder to save visualization results
+        eval_metric: Evaluation metric to optimize for
         hit_rate_min_trades: Minimum number of trades required for hit rate to be meaningful
         
     Returns:
@@ -744,43 +906,32 @@ def hyperparameter_tuning(
     logger.info(f"Starting hyperparameter tuning with {n_trials} trials")
     logger.info(f"Evaluation metric: {eval_metric}")
     
-    # Get risk management configuration from config
-    risk_config = config.get("risk_management", {})
-    risk_enabled = risk_config.get("enabled", False)
+    # Get minimum predictions for prediction accuracy metric
+    min_predictions = config.get("training", {}).get("evaluation", {}).get("min_predictions", 10)
     
-    # Initialize risk parameters
-    stop_loss_pct = None
-    take_profit_pct = None
-    trailing_stop_pct = None
-    position_size = 1.0
-    max_risk_per_trade_pct = 2.0
+    # Get risk management parameters from config
+    risk_enabled = config.get("risk_management", {}).get("enabled", False)
     
-    # Apply risk management configuration if enabled
+    # Set up risk management parameters if enabled
+    stop_loss_pct = 0
+    take_profit_pct = 0
+    trailing_stop_pct = 0
+    position_size = 1
+    max_risk_per_trade_pct = 1.0
+    
     if risk_enabled:
-        logger.info("Risk management is enabled for model evaluation")
-        # Stop loss configuration
-        stop_loss_config = risk_config.get("stop_loss", {})
-        if stop_loss_config.get("enabled", False):
-            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
-            logger.info(f"Stop loss enabled at {stop_loss_pct}%")
-        
-        # Take profit configuration
-        take_profit_config = risk_config.get("take_profit", {})
-        if take_profit_config.get("enabled", False):
-            take_profit_pct = take_profit_config.get("percentage", 2.0)
-            logger.info(f"Take profit enabled at {take_profit_pct}%")
-        
-        # Trailing stop configuration
-        trailing_stop_config = risk_config.get("trailing_stop", {})
-        if trailing_stop_config.get("enabled", False):
-            trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
-            logger.info(f"Trailing stop enabled at {trailing_stop_pct}%")
-        
-        # Position sizing configuration
-        position_sizing_config = risk_config.get("position_sizing", {})
-        if position_sizing_config.get("enabled", False):
-            position_size = position_sizing_config.get("size_multiplier", 1.0)
-            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
+        stop_loss_pct = config.get("risk_management", {}).get("stop_loss", {}).get("percentage", 0)
+        take_profit_pct = config.get("risk_management", {}).get("take_profit", {}).get("percentage", 0)
+        trailing_stop_pct = config.get("risk_management", {}).get("trailing_stop", {}).get("percentage", 0)
+        position_size = config["environment"].get("position_size", 1)
+        max_risk_per_trade_pct = config.get("risk_management", {}).get("position_sizing", {}).get("max_risk_per_trade_percentage", 1.0)
+        logger.info(f"Risk management is enabled: SL={stop_loss_pct}%, TP={take_profit_pct}%, TS={trailing_stop_pct}%")
+    else:
+        logger.info("Risk management is disabled")
+    
+    # Create Optuna study
+    study_name = f"wf_hyperparam_tuning_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    study = optuna.create_study(direction="maximize", study_name=study_name)
     
     def objective(trial):
         # Define hyperparameters to tune
@@ -817,7 +968,7 @@ def hyperparameter_tuning(
         model.learn(total_timesteps=total_timesteps)
         
         # Evaluate on validation data
-        if risk_enabled and window_folder:
+        if risk_enabled and window_folder and eval_metric != "prediction_accuracy":
             # Save the model temporarily for evaluation with risk management
             temp_model_path = f"{window_folder}/temp_model_trial_{trial.number}"
             model.save(temp_model_path)
@@ -844,6 +995,9 @@ def hyperparameter_tuning(
                 
             # Calculate hit rate from trade results
             results = calculate_hit_rate_from_trade_results(results)
+        elif eval_metric == "prediction_accuracy":
+            # Use prediction accuracy evaluation
+            results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=0, deterministic=True)
         else:
             # Use standard evaluation without risk management
             results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
@@ -851,49 +1005,43 @@ def hyperparameter_tuning(
         # Determine metric value to optimize
         if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
             metric_value = results["hit_rate"]
-            logger.info(f"Trial {trial.number}: Hit Rate = {metric_value:.2f}% ({results['profitable_trades']}/{results['trade_count']} trades)")
+            logger.info(f"Trial {trial.number}: Hit Rate = {metric_value:.2f}% ({results.get('profitable_trades', 0)}/{results['trade_count']} trades)")
+        elif eval_metric == "prediction_accuracy" and results.get("total_predictions", 0) >= min_predictions:
+            metric_value = results["prediction_accuracy"]
+            logger.info(f"Trial {trial.number}: Prediction Accuracy = {metric_value:.2f}% ({results.get('correct_predictions', 0)}/{results.get('total_predictions', 0)} predictions)")
         else:
             metric_value = results["total_return_pct"]
             logger.info(f"Trial {trial.number}: Return = {metric_value:.2f}%")
+            
             if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
                 logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
+            elif eval_metric == "prediction_accuracy" and results.get("total_predictions", 0) < min_predictions:
+                logger.warning(f"Not enough predictions ({results.get('total_predictions', 0)}) for prediction accuracy metric. Using return instead.")
         
-        # Log all hyperparameters and results
+        # Log all hyperparameters
         logger.info(f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, ent_coef={ent_coef:.6f}, "
-                   f"batch_size={batch_size}, gamma={gamma:.4f}, gae_lambda={gae_lambda:.4f}")
+                  f"batch_size={batch_size}, gamma={gamma:.4f}, gae_lambda={gae_lambda:.4f}")
         
-        # Return metric value (negative since Optuna minimizes)
-        return -metric_value
+        return metric_value
     
-    # Create and run Optuna study
-    study = optuna.create_study()
+    # Run optimization
     study.optimize(objective, n_trials=n_trials)
     
     # Get best parameters
     best_params = study.best_params
-    best_value = -study.best_value  # Convert back to positive
+    best_value = study.best_value
     
     logger.info("\n" + "="*80)
     logger.info("Hyperparameter Tuning Results:")
-    logger.info(f"Best {eval_metric}: {best_value:.2f}" + ("%" if eval_metric == "return" else "% (hit rate)"))
+    logger.info(f"Best {eval_metric}: {best_value:.2f}%")
     logger.info("Best parameters:")
     for param, value in best_params.items():
         logger.info(f"  {param}: {value}")
     
-    # Save results if window_folder is provided
+    # Save visualization if folder is provided
     if window_folder:
-        # Save best parameters
-        tuning_results = {
-            "best_params": best_params,
-            "best_value": best_value,
-            "eval_metric": eval_metric,
-            "n_trials": n_trials,
-            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        save_json(tuning_results, f'{window_folder}/hyperparameter_tuning_results.json')
-        
-        # Create a visualization of the optimization history
         try:
+            # Create optimization visualization plots
             fig1 = optuna.visualization.plot_optimization_history(study)
             fig1.write_image(f'{window_folder}/optimization_history.png')
             
@@ -910,461 +1058,82 @@ def hyperparameter_tuning(
         "study": study
     }
 
-def train_walk_forward_model(
-    train_data: pd.DataFrame,
-    validation_data: pd.DataFrame,
-    initial_timesteps: int = 10000,
-    additional_timesteps: int = 5000,
-    max_iterations: int = 10,
-    n_stagnant_loops: int = 3,
-    improvement_threshold: float = 0.1,
-    window_folder: str = None,
-    run_hyperparameter_tuning: bool = False,
-    tuning_trials: int = 30
-) -> Tuple[PPO, List[Dict]]:
-    """
-    Train a model for a single walk-forward window.
-    
-    Args:
-        train_data: Training data for this window
-        validation_data: Validation data for this window
-        initial_timesteps: Initial number of training timesteps
-        additional_timesteps: Number of additional timesteps for each training iteration
-        max_iterations: Maximum number of training iterations
-        n_stagnant_loops: Number of consecutive iterations without improvement before stopping
-        improvement_threshold: Minimum percentage improvement considered significant
-        window_folder: Folder to save training statistics
-        run_hyperparameter_tuning: Whether to run hyperparameter tuning before training
-        tuning_trials: Number of trials for hyperparameter tuning
-        
-    Returns:
-        Tuple[PPO, List[Dict]]: Trained model and training statistics
-    """
-    # Get evaluation metric from config
-    eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
-    hit_rate_min_trades = config.get("training", {}).get("evaluation", {}).get("hit_rate_min_trades", 5)
-    
-    # Run hyperparameter tuning if enabled
-    model_params = {}
-    if run_hyperparameter_tuning:
-        logger.info(f"Running hyperparameter tuning with {tuning_trials} trials")
-        tuning_results = hyperparameter_tuning(
-            train_data=train_data,
-            validation_data=validation_data,
-            n_trials=tuning_trials,
-            window_folder=window_folder,
-            eval_metric=eval_metric,
-            hit_rate_min_trades=hit_rate_min_trades
-        )
-        model_params = tuning_results["best_params"]
-        logger.info(f"Using tuned hyperparameters: {model_params}")
-    
-    # Initialize training environment
-    train_env = TradingEnv(
-        train_data,
-        initial_balance=config["environment"]["initial_balance"],
-        transaction_cost=0.0,
-        position_size=config["environment"].get("position_size", 1)
-    )
-    
-    # Initialize model with either tuned parameters or config parameters
-    if model_params:
-        model = PPO(
-            "MlpPolicy", 
-            train_env, 
-            verbose=0,
-            **model_params
-        )
-    else:
-        model = PPO(
-            "MlpPolicy", 
-            train_env, 
-            verbose=0,
-            ent_coef=config["model"].get("ent_coef", 0.01),
-            learning_rate=config["model"].get("learning_rate", 0.0003),
-            n_steps=config["model"].get("n_steps", 2048),
-            batch_size=config["model"].get("batch_size", 64),
-            gamma=0.99,
-            gae_lambda=0.95,
-        )
-    
-    # Initialize training statistics list
-    training_stats = []
-    
-    # Get evaluation metric from config
-    eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
-    hit_rate_min_trades = config.get("training", {}).get("evaluation", {}).get("hit_rate_min_trades", 5)
-    
-    # Log which metric we're using for evaluation
-    if eval_metric == "hit_rate":
-        logger.info(f"Using hit rate as evaluation metric with minimum {hit_rate_min_trades} trades")
-    else:
-        logger.info(f"Using return percentage as evaluation metric")
-    
-    # Get risk management configuration from config
-    risk_config = config.get("risk_management", {})
-    risk_enabled = risk_config.get("enabled", False)
-    
-    # Initialize risk parameters
-    stop_loss_pct = None
-    take_profit_pct = None
-    trailing_stop_pct = None
-    position_size = 1.0
-    max_risk_per_trade_pct = 2.0
-    
-    # Apply risk management configuration if enabled
-    if risk_enabled:
-        logger.info("Risk management is enabled for model evaluation")
-        # Stop loss configuration
-        stop_loss_config = risk_config.get("stop_loss", {})
-        if stop_loss_config.get("enabled", False):
-            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
-            logger.info(f"Stop loss enabled at {stop_loss_pct}%")
-        
-        # Take profit configuration
-        take_profit_config = risk_config.get("take_profit", {})
-        if take_profit_config.get("enabled", False):
-            take_profit_pct = take_profit_config.get("percentage", 2.0)
-            logger.info(f"Take profit enabled at {take_profit_pct}%")
-        
-        # Trailing stop configuration
-        trailing_stop_config = risk_config.get("trailing_stop", {})
-        if trailing_stop_config.get("enabled", False):
-            trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
-            logger.info(f"Trailing stop enabled at {trailing_stop_pct}%")
-        
-        # Position sizing configuration
-        position_sizing_config = risk_config.get("position_sizing", {})
-        if position_sizing_config.get("enabled", False):
-            position_size = position_sizing_config.get("size_multiplier", 1.0)
-            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
-            logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
-        else:
-            logger.info("  - Position sizing: Disabled")
-    else:
-        logger.info("Risk management is disabled for model evaluation")
-    
-    # Initial training
-    logger.info(f"Starting initial training for {initial_timesteps} timesteps")
-    model.learn(total_timesteps=initial_timesteps)
-    
-    # Evaluate initial model on validation data
-    if risk_enabled and window_folder:
-        # Save the model temporarily for evaluation with risk management
-        temp_model_path = f"{window_folder}/temp_model_initial"
-        model.save(temp_model_path)
-        
-        # Evaluate with risk management
-        results = trade_with_risk_management(
-            model_path=temp_model_path,
-            test_data=validation_data,
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-            trailing_stop_pct=trailing_stop_pct,
-            position_size=position_size,
-            max_risk_per_trade_pct=max_risk_per_trade_pct,
-            initial_balance=config["environment"]["initial_balance"],
-            transaction_cost=config["environment"].get("transaction_cost", 0.0),
-            verbose=0,
-            deterministic=True,
-            close_at_end_of_day=True
-        )
-        
-        # Clean up temporary model file
-        if os.path.exists(f"{temp_model_path}.zip"):
-            os.remove(f"{temp_model_path}.zip")
-        
-        # Calculate hit rate from trade results
-        results = calculate_hit_rate_from_trade_results(results)
-    else:
-        # Use standard evaluation without risk management
-        results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-    
-    # Log detailed trade statistics for debugging
-    logger.info(f"Initial evaluation - Trade count: {results['trade_count']}, " +
-               f"Profitable trades: {results.get('profitable_trades', 0)}, " +
-               f"Hit rate: {results.get('hit_rate', 0):.2f}%")
-
-    # Print a sample of trade history for debugging
-    if 'trade_history' in results and results['trade_history']:
-        sample_size = min(5, len(results['trade_history']))
-        logger.info(f"Sample of first {sample_size} trades:")
-        for i, trade in enumerate(results['trade_history'][:sample_size]):
-            logger.info(f"Trade {i+1}: {trade.get('action', 'N/A')}, " +
-                        f"Price: {trade.get('price', 'N/A')}, " +
-                        f"Profit: {trade.get('profit', 'N/A')}")
-    
-    # Determine best metric value depending on config
-    if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
-        best_metric_value = results["hit_rate"]
-        best_metric_name = "hit rate"
-    else:
-        # Default to return if hit_rate is selected but not enough trades, or if return is selected
-        best_metric_value = results["total_return_pct"]
-        best_metric_name = "return"
-        if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
-            logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
-    
-    best_model = model
-    
-    # Record initial training statistics
-    initial_stats = {
-        "iteration": 0,
-        "timesteps": initial_timesteps,
-        "return_pct": results["total_return_pct"],
-        "hit_rate": results.get("hit_rate", 0),
-        "portfolio_value": results["final_portfolio_value"],
-        "trade_count": results["trade_count"],
-        "profitable_trades": results.get("profitable_trades", 0),
-        "metric_used": best_metric_name,
-        "metric_value": best_metric_value,
-        "is_best": True
-    }
-    training_stats.append(initial_stats)
-    
-    logger.info(f"Initial validation {best_metric_name}: {best_metric_value:.2f}" + 
-               (f"%" if best_metric_name == "return" else "% (profitable trades)"))
-    
-    # Counter for consecutive iterations without significant improvement
-    stagnant_counter = 0
-    
-    # Continue training until max_iterations or n_stagnant_loops consecutive iterations without improvement
-    for iteration in range(1, max_iterations + 1):
-        # Train for additional timesteps
-        model.learn(total_timesteps=additional_timesteps)
-        
-        # Evaluate on validation data
-        if risk_enabled and window_folder:
-            # Save the model temporarily for evaluation with risk management
-            temp_model_path = f"{window_folder}/temp_model_iteration_{iteration}"
-            model.save(temp_model_path)
-            
-            # Evaluate with risk management
-            results = trade_with_risk_management(
-                model_path=temp_model_path,
-                test_data=validation_data,
-                stop_loss_pct=stop_loss_pct,
-                take_profit_pct=take_profit_pct,
-                trailing_stop_pct=trailing_stop_pct,
-                position_size=position_size,
-                max_risk_per_trade_pct=max_risk_per_trade_pct,
-                initial_balance=config["environment"]["initial_balance"],
-                transaction_cost=config["environment"].get("transaction_cost", 0.0),
-                verbose=0,
-                deterministic=True,
-                close_at_end_of_day=True
-            )
-            
-            # Clean up temporary model file
-            if os.path.exists(f"{temp_model_path}.zip"):
-                os.remove(f"{temp_model_path}.zip")
-            
-            # Calculate hit rate from trade results
-            results = calculate_hit_rate_from_trade_results(results)
-        else:
-            # Use standard evaluation without risk management
-            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-        
-        # Log detailed trade statistics for debugging
-        logger.info(f"Iteration {iteration} - Trade count: {results['trade_count']}, " +
-                   f"Profitable trades: {results.get('profitable_trades', 0)}, " +
-                   f"Hit rate: {results.get('hit_rate', 0):.2f}%")
-        
-        # Determine current metric value depending on config
-        if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
-            current_metric_value = results["hit_rate"]
-            current_metric_name = "hit rate"
-        else:
-            # Default to return if hit_rate is selected but not enough trades
-            current_metric_value = results["total_return_pct"]
-            current_metric_name = "return"
-            if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
-                logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
-        
-        # Calculate improvement
-        improvement = current_metric_value - best_metric_value
-        
-        # Log different formats based on metric type
-        if current_metric_name == "hit_rate":
-            logger.info(f"Iteration {iteration} - Validation {current_metric_name}: {current_metric_value:.2f}% " +
-                       f"({results['profitable_trades']}/{results['trade_count']} trades), " +
-                       f"Improvement: {improvement:.2f}%")
-        else:
-            logger.info(f"Iteration {iteration} - Validation {current_metric_name}: {current_metric_value:.2f}%, " +
-                       f"Improvement: {improvement:.2f}%")
-        
-        # Record training statistics
-        is_best = current_metric_value > best_metric_value + improvement_threshold
-        iteration_stats = {
-            "iteration": iteration,
-            "timesteps": additional_timesteps,
-            "return_pct": results["total_return_pct"],
-            "hit_rate": results.get("hit_rate", 0),
-            "portfolio_value": results["final_portfolio_value"],
-            "trade_count": results["trade_count"],
-            "profitable_trades": results.get("profitable_trades", 0),
-            "metric_used": current_metric_name,
-            "metric_value": current_metric_value,
-            "improvement": improvement,
-            "is_best": is_best
-        }
-        training_stats.append(iteration_stats)
-        
-        # Check if this is the best model so far
-        if is_best:
-            best_metric_value = current_metric_value
-            best_metric_name = current_metric_name
-            best_model = model
-            
-            # Format the log message based on the metric
-            if best_metric_name == "hit_rate":
-                logger.info(f"New best model found! Validation {best_metric_name}: {best_metric_value:.2f}% " +
-                           f"({results['profitable_trades']}/{results['trade_count']} trades)")
-            else:
-                logger.info(f"New best model found! Validation {best_metric_name}: {best_metric_value:.2f}%")
-            
-            # Save intermediate best model
-            if window_folder:
-                best_model.save(f"{window_folder}/best_model_iteration_{iteration}")
-                logger.info(f"Saved best model at iteration {iteration}")
-            
-            # Reset stagnant counter since we found improvement
-            stagnant_counter = 0
-        else:
-            # Increment stagnant counter if no significant improvement
-            stagnant_counter += 1
-            logger.info(f"No significant improvement. Stagnant iterations: {stagnant_counter}/{n_stagnant_loops}")
-        
-        # Stop if we've had n_stagnant_loops consecutive iterations without improvement
-        if stagnant_counter >= n_stagnant_loops:
-            logger.info(f"Stopping training after {n_stagnant_loops} consecutive iterations without significant improvement")
-            break
-    
-    logger.info(f"Training completed. Best validation {best_metric_name}: {best_metric_value:.2f}" + 
-               (f"%" if best_metric_name == "return" else "% (profitable trades)"))
-    
-    # Plot training progress
-    if window_folder:
-        plot_training_progress(training_stats, window_folder)
-        
-        # Save training statistics
-        save_json(training_stats, f'{window_folder}/training_stats.json')
-    
-    # Final evaluation for logging trade examples
-    if risk_enabled and window_folder:
-        # Save the model temporarily for evaluation with risk management
-        temp_model_path = f"{window_folder}/temp_best_model_final"
-        best_model.save(temp_model_path)
-        
-        # Evaluate with risk management
-        final_results = trade_with_risk_management(
-            model_path=temp_model_path,
-            test_data=validation_data,
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-            trailing_stop_pct=trailing_stop_pct,
-            position_size=position_size,
-            max_risk_per_trade_pct=max_risk_per_trade_pct,
-            initial_balance=config["environment"]["initial_balance"],
-            transaction_cost=config["environment"].get("transaction_cost", 0.0),
-            verbose=1,
-            deterministic=True,
-            close_at_end_of_day=True
-        )
-        
-        # Clean up temporary model file
-        if os.path.exists(f"{temp_model_path}.zip"):
-            os.remove(f"{temp_model_path}.zip")
-        
-        # Calculate hit rate from final results
-        final_results = calculate_hit_rate_from_trade_results(final_results)
-    else:
-        # Use standard evaluation without risk management
-        final_results = evaluate_agent(best_model, validation_data, verbose=1, deterministic=True)
-    
-    # Save trade history to CSV
-    if 'trade_history' in final_results and final_results['trade_history']:
-        # Convert to DataFrame and save
-        validation_trade_history_path = f'{window_folder}/validation_trade_history.csv'
-        save_trade_history(final_results['trade_history'], validation_trade_history_path)
-        logger.info(f"Saved validation trade history to {validation_trade_history_path}")
-        
-        # Create a summary of validation trade performance stats
-        if risk_enabled and window_folder:
-            validation_trade_summary = {}
-            exit_reasons = final_results.get('exit_reasons', {})
-            
-            validation_trade_summary['total_trades'] = final_results['trade_count']
-            validation_trade_summary['profitable_trades'] = final_results.get('profitable_trades', 0)
-            validation_trade_summary['hit_rate'] = final_results.get('hit_rate', 0)
-            
-            # Count trades by exit reason
-            validation_trade_summary['stop_loss_exits'] = exit_reasons.get('stop_loss', 0)
-            validation_trade_summary['take_profit_exits'] = exit_reasons.get('take_profit', 0)
-            validation_trade_summary['trailing_stop_exits'] = exit_reasons.get('trailing_stop', 0)
-            validation_trade_summary['model_signal_exits'] = exit_reasons.get('model_signal', 0)
-            
-            # Calculate percentages of exit reasons
-            total_exits = sum(exit_reasons.values())
-            if total_exits > 0:
-                validation_trade_summary['stop_loss_pct'] = (exit_reasons.get('stop_loss', 0) / total_exits) * 100
-                validation_trade_summary['take_profit_pct'] = (exit_reasons.get('take_profit', 0) / total_exits) * 100
-                validation_trade_summary['trailing_stop_pct'] = (exit_reasons.get('trailing_stop', 0) / total_exits) * 100
-                validation_trade_summary['model_signal_pct'] = (exit_reasons.get('model_signal', 0) / total_exits) * 100
-            
-            # Save validation trade summary
-            save_json(validation_trade_summary, f'{window_folder}/validation_trade_summary.json')
-            logger.info(f"Saved validation trade summary to {window_folder}/validation_trade_summary.json")
-    
-    return best_model, training_stats
-
 def plot_training_progress(training_stats: List[Dict], window_folder: str) -> None:
     """
-    Plot the training progress for a window.
+    Plot the training progress over iterations.
     
     Args:
         training_stats: List of training statistics dictionaries
         window_folder: Folder to save the plot
     """
+    # Extract data from training statistics
     iterations = [stat["iteration"] for stat in training_stats]
+    returns = [stat["return_pct"] for stat in training_stats]
+    portfolio_values = [stat["portfolio_value"] for stat in training_stats]
     is_best = [stat["is_best"] for stat in training_stats]
     
-    # Determine which metric to plot
-    # Get the metric used in the most recent iteration
-    if training_stats:
-        metric_name = training_stats[-1].get("metric_used", "return")
-    else:
-        metric_name = "return"  # Default if no stats
+    # Determine which metric to highlight
+    metric_name = training_stats[0]["metric_used"]
     
+    # Create figure
+    plt.figure(figsize=(10, 6))
+    
+    # Set metric-specific values
     if metric_name == "hit_rate":
         metric_values = [stat["hit_rate"] for stat in training_stats]
         y_label = 'Hit Rate (%)'
         title_prefix = 'Hit Rate'
+    elif metric_name == "prediction_accuracy":
+        metric_values = [stat["prediction_accuracy"] for stat in training_stats]
+        y_label = 'Prediction Accuracy (%)'
+        title_prefix = 'Prediction Accuracy'
     else:
         metric_values = [stat["return_pct"] for stat in training_stats]
         y_label = 'Return (%)'
         title_prefix = 'Return'
     
-    plt.figure(figsize=(10, 6))
-    
     # Plot metric values
-    plt.plot(iterations, metric_values, marker='o', linestyle='-', color='blue', 
-             label=f'Validation {metric_name.title()}')
-    
-    # Highlight best models
-    best_iterations = [iterations[i] for i in range(len(iterations)) if is_best[i]]
-    best_metrics = [metric_values[i] for i in range(len(metric_values)) if is_best[i]]
-    plt.scatter(best_iterations, best_metrics, color='green', s=100, marker='*', label='Best Model')
+    for i, (iteration, value, best) in enumerate(zip(iterations, metric_values, is_best)):
+        color = 'green' if best else 'blue'
+        plt.bar(iteration, value, color=color, alpha=0.7)
+        
+        # Add text label for value
+        plt.text(iteration, value, f"{value:.1f}%", 
+                ha='center', va='bottom', fontsize=8)
+        
+        # Add star for best models
+        if best:
+            plt.text(iteration, value, '⭐', 
+                    ha='center', va='top', fontsize=12)
     
     plt.xlabel('Training Iteration')
     plt.ylabel(y_label)
-    plt.title(f'Training Progress - {title_prefix}')
+    plt.title(f'{title_prefix} by Training Iteration')
     plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend()
     
-    # Save the plot
+    # Use integer x-axis ticks
+    plt.xticks(iterations)
+    
     plt.tight_layout()
     plt.savefig(f'{window_folder}/training_progress.png')
+    plt.close()
+    
+    # Second plot for portfolio value
+    plt.figure(figsize=(10, 6))
+    plt.bar(iterations, portfolio_values, color='purple', alpha=0.7)
+    
+    for i, (iteration, value) in enumerate(zip(iterations, portfolio_values)):
+        plt.text(iteration, value, f"${value:.0f}", 
+                ha='center', va='bottom', fontsize=8)
+    
+    plt.xlabel('Training Iteration')
+    plt.ylabel('Portfolio Value ($)')
+    plt.title('Portfolio Value by Training Iteration')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.xticks(iterations)
+    
+    plt.tight_layout()
+    plt.savefig(f'{window_folder}/portfolio_progress.png')
     plt.close()
     
     # Additional plot for trade count if using hit rate
@@ -1384,6 +1153,25 @@ def plot_training_progress(training_stats: List[Dict], window_folder: str) -> No
         
         plt.tight_layout()
         plt.savefig(f'{window_folder}/trade_performance.png')
+        plt.close()
+    
+    # Additional plot for prediction accuracy if using that metric
+    elif metric_name == "prediction_accuracy":
+        plt.figure(figsize=(10, 6))
+        total_predictions = [stat["total_predictions"] for stat in training_stats]
+        correct_predictions = [stat.get("correct_predictions", 0) for stat in training_stats]
+        
+        plt.bar(iterations, total_predictions, color='blue', alpha=0.7, label='Total Predictions')
+        plt.bar(iterations, correct_predictions, color='green', alpha=0.7, label='Correct Predictions')
+        
+        plt.xlabel('Training Iteration')
+        plt.ylabel('Number of Predictions')
+        plt.title('Prediction Performance by Iteration')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f'{window_folder}/prediction_performance.png')
         plt.close()
 
 def plot_window_performance(test_data: pd.DataFrame, test_results: Dict, window_folder: str, window_num: int) -> None:
@@ -1460,8 +1248,13 @@ def plot_walk_forward_results(all_window_results: List[Dict], session_folder: st
     hit_rates = [res.get("hit_rate", 0) for res in all_window_results]
     profitable_trades = [res.get("profitable_trades", 0) for res in all_window_results]
     
+    # Get prediction accuracy metrics if that metric is used
+    prediction_accuracies = [res.get("prediction_accuracy", 0) for res in all_window_results]
+    correct_predictions = [res.get("correct_predictions", 0) for res in all_window_results]
+    total_predictions = [res.get("total_predictions", 0) for res in all_window_results]
+    
     # Number of subplots depends on which metric is being used
-    num_plots = 4 if eval_metric == "hit_rate" else 3
+    num_plots = 4 if eval_metric in ["hit_rate", "prediction_accuracy"] else 3
     
     # Create figure with appropriate number of subplots
     fig, axs = plt.subplots(num_plots, 1, figsize=(12, 5 * num_plots), sharex=True)
@@ -1492,6 +1285,23 @@ def plot_walk_forward_results(all_window_results: List[Dict], session_folder: st
                                      ha='center')
         plot_idx += 1
     
+    # Plot prediction accuracy if that metric is used
+    elif eval_metric == "prediction_accuracy":
+        axs[plot_idx].bar(windows, prediction_accuracies, color='green')
+        axs[plot_idx].set_ylabel('Prediction Accuracy (%)')
+        axs[plot_idx].set_title('Prediction Accuracies by Walk-Forward Window')
+        axs[plot_idx].grid(True, linestyle='--', alpha=0.7)
+        
+        # Add text annotations showing number of predictions
+        for i, (pa, cp, tp) in enumerate(zip(prediction_accuracies, correct_predictions, total_predictions)):
+            if tp > 0:  # Only annotate windows with predictions
+                axs[plot_idx].annotate(f"{int(cp)}/{int(tp)}", 
+                                     (windows[i], pa),
+                                     textcoords="offset points", 
+                                     xytext=(0,5), 
+                                     ha='center')
+        plot_idx += 1
+    
     # Plot portfolio values
     axs[plot_idx].bar(windows, portfolio_values, color='purple')
     axs[plot_idx].set_ylabel('Final Portfolio Value ($)')
@@ -1510,6 +1320,10 @@ def plot_walk_forward_results(all_window_results: List[Dict], session_folder: st
     if eval_metric == "hit_rate":
         axs[plot_idx].bar(windows, profitable_trades, color='green', alpha=0.7)
         axs[plot_idx].legend(['Total Trades', 'Profitable Trades'])
+    # If using prediction accuracy, add correct predictions as a second bar
+    elif eval_metric == "prediction_accuracy":
+        axs[plot_idx].bar(windows, correct_predictions, color='green', alpha=0.7)
+        axs[plot_idx].legend(['Total Predictions', 'Correct Predictions'])
     
     # Adjust layout
     plt.tight_layout()
@@ -1536,6 +1350,19 @@ def plot_walk_forward_results(all_window_results: List[Dict], session_folder: st
         ax2.set_ylabel('Cumulative Hit Rate (%)', color='green')
         ax2.tick_params(axis='y', labelcolor='green')
     
+    # If using prediction accuracy, also plot cumulative prediction accuracy
+    elif eval_metric == "prediction_accuracy":
+        # Calculate cumulative prediction accuracy (cumulative correct predictions / cumulative total predictions)
+        cum_predictions = np.cumsum(total_predictions)
+        cum_correct = np.cumsum(correct_predictions)
+        cum_accuracy = [100 * cum_correct[i] / cum_predictions[i] if cum_predictions[i] > 0 else 0 for i in range(len(cum_predictions))]
+        
+        # Add to plot with secondary y-axis
+        ax2 = plt.gca().twinx()
+        ax2.plot(windows, cum_accuracy, marker='s', linestyle='-', color='green', label='Cumulative Prediction Accuracy (%)')
+        ax2.set_ylabel('Cumulative Prediction Accuracy (%)', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
+    
     plt.xlabel('Walk-Forward Window')
     plt.ylabel('Cumulative Return (%)', color='blue')
     plt.tick_params(axis='y', labelcolor='blue')
@@ -1544,7 +1371,7 @@ def plot_walk_forward_results(all_window_results: List[Dict], session_folder: st
     
     # Create legend that incorporates both axes
     lines1, labels1 = plt.gca().get_legend_handles_labels()
-    if eval_metric == "hit_rate":
+    if eval_metric in ["hit_rate", "prediction_accuracy"]:
         lines2, labels2 = ax2.get_legend_handles_labels()
         plt.legend(lines1 + lines2, labels1 + labels2, loc='best')
     else:
