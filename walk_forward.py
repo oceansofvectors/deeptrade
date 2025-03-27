@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 import optuna
 import math
+from decimal import Decimal
 
 from environment import TradingEnv
 from get_data import get_data
@@ -42,12 +43,16 @@ class TimestampJSONEncoder(json.JSONEncoder):
         # Handle numpy types
         if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
             return int(obj)
-        if isinstance(obj, (np.float, np.float64, np.float32, np.float16)):
+        # Fix for deprecated np.float
+        if isinstance(obj, (np.float64, np.float32, np.float16)):
             return float(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         if isinstance(obj, np.bool_):
             return bool(obj)
+        # Handle Decimal objects
+        if isinstance(obj, Decimal):
+            return float(obj)
         return super(TimestampJSONEncoder, self).default(obj)
 
 # Function to safely save JSON data

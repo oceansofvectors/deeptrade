@@ -461,20 +461,44 @@ def trade_with_risk_management(
             # For exit price, use the appropriate price based on exit reason and position
             exit_price = current_price  # Default to close price
             
-            if risk_manager.position == 1:  # Long position
-                if exit_reason == "stop_loss":
-                    exit_price = current_low  # Use low price for stop loss (worst case)
-                elif exit_reason == "take_profit":
-                    exit_price = current_high  # Use high price for take profit (best case)
-                elif exit_reason == "trailing_stop":
-                    exit_price = current_low  # Use low price for trailing stop (worst case)
-            else:  # Short position
-                if exit_reason == "stop_loss":
-                    exit_price = current_high  # Use high price for stop loss (worst case)
-                elif exit_reason == "take_profit":
-                    exit_price = current_low  # Use low price for take profit (best case)
-                elif exit_reason == "trailing_stop":
-                    exit_price = current_high  # Use high price for trailing stop (worst case)
+            if exit_reason == "stop_loss":
+                # For futures, we need to work backwards from desired P&L to price
+                point_value = money.to_decimal(20.0)  # $20 per point for NQ
+                
+                # Calculate how many points we need to move to achieve exact stop loss
+                # stop_loss_pct is % of portfolio, so we convert to dollars first
+                target_loss_dollars = risk_manager.entry_portfolio_value * (risk_manager.stop_loss_pct / 100)
+                
+                # Calculate how many points that equals based on contracts
+                target_loss_points = target_loss_dollars / (point_value * risk_manager.current_contracts)
+                
+                # Calculate exact exit price
+                if risk_manager.position == 1:  # Long position
+                    exit_price = risk_manager.entry_price - target_loss_points
+                else:  # Short position
+                    exit_price = risk_manager.entry_price + target_loss_points
+                
+                logging.info(f"Stop loss at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}, points={float(target_loss_points)}")
+            elif exit_reason == "take_profit":
+                # For futures, we need to work backwards from desired P&L to price
+                point_value = money.to_decimal(20.0)  # $20 per point for NQ
+                
+                # Calculate how many points we need to move to achieve exact take profit
+                # take_profit_pct is % of portfolio, so we convert to dollars first
+                target_profit_dollars = risk_manager.entry_portfolio_value * (risk_manager.take_profit_pct / 100)
+                
+                # Calculate how many points that equals based on contracts
+                target_profit_points = target_profit_dollars / (point_value * risk_manager.current_contracts)
+                
+                # Calculate exact exit price
+                if risk_manager.position == 1:  # Long position
+                    exit_price = risk_manager.entry_price + target_profit_points
+                else:  # Short position
+                    exit_price = risk_manager.entry_price - target_profit_points
+                
+                logging.info(f"Take profit at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}, points={float(target_profit_points)}")
+            elif exit_reason == "trailing_stop":
+                exit_price = current_low  # Use low price for trailing stop (worst case)
             
             # Record portfolio value before exit for profit checking
             portfolio_before_exit = risk_manager.net_worth

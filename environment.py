@@ -190,9 +190,6 @@ class TradingEnv(gym.Env):
             # Otherwise, set position to long
             if self.position != 1:
                 self.position = 1
-                # Add a small reward for changing position to encourage exploration
-                if old_position != 0:  # Only if changing from an existing position, not from neutral
-                    reward += Decimal('0.1')
             else:
                 pass  # No position duration tracking needed
         else:  # Go short
@@ -200,9 +197,6 @@ class TradingEnv(gym.Env):
             # Otherwise, set position to short
             if self.position != -1:
                 self.position = -1
-                # Add a small reward for changing position to encourage exploration
-                if old_position != 0:  # Only if changing from an existing position, not from neutral
-                    reward += Decimal('0.1')
             else:
                 pass  # No position duration tracking needed
             
@@ -213,13 +207,15 @@ class TradingEnv(gym.Env):
             
             # If long and price goes up OR short and price goes down, prediction is correct
             if (self.position == 1 and price_change > Decimal('0')) or (self.position == -1 and price_change < Decimal('0')):
-                reward += self.correct_prediction_reward
+                raw_reward = self.correct_prediction_reward
             else:
-                reward += self.incorrect_prediction_reward
+                raw_reward = self.incorrect_prediction_reward
                 
-            # Normalize reward based on the magnitude of price change
-            price_change_pct = abs(price_change / current_price)
-            reward *= min(Decimal('1.0'), price_change_pct * Decimal('100'))  # Scale by percentage change, capped at 1.0
+            # Apply logarithmic transformation to the reward
+            if raw_reward > Decimal('0'):
+                reward += Decimal(np.log1p(float(raw_reward)))
+            else:
+                reward -= Decimal(np.log1p(float(abs(raw_reward))))
 
         # Advance to next step
         self.current_step += 1

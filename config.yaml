@@ -2,9 +2,9 @@ training:
   total_timesteps: 20000
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 200
-  improvement_threshold: 0.05
-  additional_timesteps: 200
+  max_iterations: 2000
+  improvement_threshold: 0.02
+  additional_timesteps: 100
   n_stagnant_loops: 20
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
@@ -27,23 +27,23 @@ indicators:
     length: 10
     multiplier: 3
   rsi:
-    enabled: false
+    enabled: true
     length: 14
   cci:
-    enabled: false
+    enabled: true
     length: 20
   adx:
     enabled: true
     length: 14
   adx_pos:
-    enabled: false
+    enabled: true
   adx_neg:
-    enabled: false
+    enabled: true
   stoch_k:
-    enabled: false
+    enabled: true
     length: 14
   stoch_d:
-    enabled: true
+    enabled: false
     length: 3
   macd:
     enabled: true
@@ -54,7 +54,7 @@ indicators:
     enabled: false
     length: 10
   williams_r:
-    enabled: false
+    enabled: true
     length: 14
   sma:
     enabled: false
@@ -86,25 +86,27 @@ environment:
   transaction_cost: 0.0  # Transaction cost as percentage
 
 model:
-  ent_coef: 0.35
-  learning_rate: 0.003
-  n_steps: 2048
-  batch_size: 10
+  ent_coef: 0.008912821142407127
+  learning_rate: 0.001674157230227225
+  n_steps: 1600
+  batch_size: 16
+  gamma: 0.9643054823182142
+  gae_lambda: 0.991768403565142
 
 # Risk management configuration for trade.py
 risk_management:
   # Enable/disable risk management features
-  enabled: true  # Master switch to enable/disable all risk management
+  enabled: false  # Master switch to enable/disable all risk management
   
   # Stop loss configuration
   stop_loss:
     enabled: true
-    percentage: 20  # Stop loss as percentage of portfolio value
+    percentage: 5  # Stop loss as percentage of portfolio value
   
   # Take profit configuration
   take_profit:
     enabled: true
-    percentage: 20  # Take profit as percentage of portfolio value
+    percentage: 5  # Take profit as percentage of portfolio value
   
   # Trailing stop loss configuration
   trailing_stop:
@@ -120,12 +122,12 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
-  window_size: 40  # Size of each walk-forward window in trading days (NYSE business days)
+  window_size: 70  # Size of each walk-forward window in trading days (NYSE business days)
   step_size: 3     # Number of trading days to step forward at each iteration (NYSE business days)
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: true  # Set to true to enable hyperparameter tuning during training
+  enabled: false  # Set to true to enable hyperparameter tuning during training
   n_trials: 30     # Number of trials for the optimization
   # Parameters to tune (these are the search spaces)
   parameters:

@@ -83,8 +83,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             "learning_rate": config["model"].get("learning_rate", 0.0003),
             "n_steps": config["model"].get("n_steps", 2048),
             "batch_size": config["model"].get("batch_size", 64),
-            "gamma": 0.99,
-            "gae_lambda": 0.95,
+            "gamma": config["model"].get("gamma", 0.99),
+            "gae_lambda": config["model"].get("gae_lambda", 0.95),
         }
     
     # Initialize the PPO model with the specified parameters
