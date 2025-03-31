@@ -1,24 +1,22 @@
 training:
-  total_timesteps: 20000
+  total_timesteps: 10000
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 2000
+  max_iterations: 200
   improvement_threshold: 0.02
-  additional_timesteps: 100
+  additional_timesteps: 200
   n_stagnant_loops: 20
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
   evaluation:
-    metric: "prediction_accuracy"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
-    hit_rate_min_trades: 3  # Minimum number of trades required for hit rate to be meaningful
-    min_predictions: 10  # Minimum number of predictions required for prediction accuracy to be meaningful
+    metric: "return"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
 
 data:
   symbol: "NQ=F"
   period: "60d"
   interval: "5m"
-  train_ratio: 0.7
-  validation_ratio: 0.2
+  train_ratio: 0.8
+  validation_ratio: 0.1
   market_hours_only: true  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
 
 indicators:
@@ -33,14 +31,14 @@ indicators:
     enabled: true
     length: 20
   adx:
-    enabled: true
+    enabled: false
     length: 14
   adx_pos:
-    enabled: true
+    enabled: false
   adx_neg:
-    enabled: true
+    enabled: false
   stoch_k:
-    enabled: true
+    enabled: false
     length: 14
   stoch_d:
     enabled: false
@@ -54,7 +52,7 @@ indicators:
     enabled: false
     length: 10
   williams_r:
-    enabled: true
+    enabled: false
     length: 14
   sma:
     enabled: false
@@ -77,8 +75,8 @@ indicators:
     af: 0.02
     max_af: 0.2
   volume:
-    enabled: false
-    ma_length: 20  # For volume moving average normalization
+    enabled: true
+    ma_length: 20  
 
 environment:
   initial_balance: 10000.0
@@ -86,27 +84,32 @@ environment:
   transaction_cost: 0.0  # Transaction cost as percentage
 
 model:
-  ent_coef: 0.008912821142407127
-  learning_rate: 0.001674157230227225
-  n_steps: 1600
-  batch_size: 16
-  gamma: 0.9643054823182142
-  gae_lambda: 0.991768403565142
+  ent_coef: 0.00011640494075069245
+  learning_rate: 0.0029977835304081614
+  n_steps: 465
+  batch_size: 17
+  gamma: 0.9420950542553452
+  gae_lambda: 0.9234921190880474
 
 # Risk management configuration for trade.py
 risk_management:
   # Enable/disable risk management features
   enabled: false  # Master switch to enable/disable all risk management
   
+  # Daily risk limit configuration
+  daily_risk_limit:
+    enabled: true  # Enable/disable daily risk limit
+    max_daily_loss: 1000.0  # Maximum dollar loss allowed per trading day
+  
   # Stop loss configuration
   stop_loss:
-    enabled: true
-    percentage: 5  # Stop loss as percentage of portfolio value
+    enabled: false
+    percentage: 10  # Stop loss as percentage of portfolio value
   
   # Take profit configuration
   take_profit:
-    enabled: true
-    percentage: 5  # Take profit as percentage of portfolio value
+    enabled: false
+    percentage: 10  # Take profit as percentage of portfolio value
   
   # Trailing stop loss configuration
   trailing_stop:
@@ -122,13 +125,20 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
-  window_size: 70  # Size of each walk-forward window in trading days (NYSE business days)
-  step_size: 3     # Number of trading days to step forward at each iteration (NYSE business days)
+  window_size: 30  # Size of each walk-forward window in trading days (NYSE business days)
+  step_size: 7     # Number of trading days to step forward at each iteration (NYSE business days)
+  parallel_processing:
+    enabled: true   # Enable parallel processing of walk-forward windows
+    n_processes: 0  # Number of processes to use (0 = auto-detect based on CPU cores)
+    max_workers: 0  # Maximum number of workers (0 = use n_processes)
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: false  # Set to true to enable hyperparameter tuning during training
+  enabled: true  # Set to true to enable hyperparameter tuning during training
   n_trials: 30     # Number of trials for the optimization
+  parallel_processing:
+    enabled: true  # Whether to run trials in parallel
+    n_jobs: 0      # Number of parallel jobs (0 = auto-detect based on CPU cores)
   # Parameters to tune (these are the search spaces)
   parameters:
     learning_rate: 

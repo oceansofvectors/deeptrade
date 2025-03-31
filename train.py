@@ -233,7 +233,7 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
     trade_history = []
     trade_count = 0
     profitable_trades = 0  # Track number of profitable trades
-    action_counts = {0: 0, 1: 0}  # Track action distribution (0: long/buy, 1: short/sell)
+    action_counts = {0: 0, 1: 0, 2: 0}  # Track action distribution (0: long/buy, 1: short/sell, 2: hold)
 
     # Records for plotting
     # Get the actual dates from the index
@@ -359,7 +359,7 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
         
         # Log action distribution only if verbose > 1
         if verbose > 1:
-            logger.info(f"Action distribution - Long: {action_counts[0]}, Short: {action_counts[1]}")
+            logger.info(f"Action distribution - Long: {action_counts[0]}, Short: {action_counts[1]}, Hold: {action_counts[2]}")
 
     return {
         "final_portfolio_value": float(money.format_money(env.net_worth, 2)),
@@ -376,6 +376,7 @@ def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, de
         "buy_prices": buy_prices,
         "sell_dates": sell_dates,
         "sell_prices": sell_prices,
+        "action_counts": action_counts  # Include action counts in results
     }
 
 def plot_results(results):

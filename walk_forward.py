@@ -11,6 +11,9 @@ from stable_baselines3 import PPO
 import optuna
 import math
 from decimal import Decimal
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+import concurrent.futures
 
 from environment import TradingEnv
 from get_data import get_data
@@ -343,8 +346,13 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
         action, _ = model.predict(obs, deterministic=deterministic)
         action_history.append(int(action))
         
-        # Convert action to position (0 = long/buy, 1 = short/sell)
-        new_position = 1 if action == 0 else -1
+        # Convert action to position (0 = long/buy, 1 = short/sell, 2 = hold)
+        if action == 0:  # Long
+            new_position = 1
+        elif action == 1:  # Short
+            new_position = -1
+        else:  # Hold - maintain current position
+            new_position = current_position
         
         # Check if we're at the last step or not
         # We need the next price to determine if prediction was correct
@@ -353,9 +361,18 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
             next_price = money.to_decimal(test_data.iloc[current_step + 1]["Close"])
             price_change = next_price - current_price
             
-            # Evaluate prediction accuracy
-            # If long and price goes up OR short and price goes down, prediction is correct
-            prediction_correct = (new_position == 1 and price_change > 0) or (new_position == -1 and price_change < 0)
+            # Evaluate prediction accuracy based on action type
+            prediction_correct = False
+            
+            if action == 0:  # Long - prediction is correct if price goes up
+                prediction_correct = price_change > 0
+            elif action == 1:  # Short - prediction is correct if price goes down
+                prediction_correct = price_change < 0
+            elif action == 2:  # Hold - prediction is correct if price doesn't change much
+                # For hold, we'll define "correct" as the price not changing significantly
+                # Using a threshold of 0.1% of the current price
+                threshold = current_price * money.to_decimal(0.001)
+                prediction_correct = abs(price_change) <= threshold
             
             # Record prediction
             total_predictions += 1
@@ -367,20 +384,19 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
                 accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
                 logger.info(f"Step {current_step}: Predictions so far - {correct_predictions}/{total_predictions} correct ({accuracy:.2f}%)")
         
-        # Track trade if position changed
-        if new_position != current_position:
-            # Record trade
-            trade_count += 1
-            trade_info = {
-                "step": current_step,
-                "action": "BUY" if new_position == 1 else "SELL",
-                "price": float(current_price),
-                "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step])
-            }
-            trade_history.append(trade_info)
-            
-            # Update position
-            current_position = new_position
+        # Record every action, including HOLD actions
+        trade_count += 1
+        trade_info = {
+            "step": current_step,
+            "action": "BUY" if action == 0 else "SELL" if action == 1 else "HOLD",
+            "price": float(current_price),
+            "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step]),
+            "position_change": new_position != current_position
+        }
+        trade_history.append(trade_info)
+        
+        # Update position
+        current_position = new_position
         
         # Take step in environment
         new_obs, reward, done, truncated, info = env.step(action)
@@ -477,6 +493,188 @@ def export_consolidated_trade_history(all_window_results: List[Dict], session_fo
     
     logger.info(f"Exported consolidated trade history from {len(windows_with_history)} windows "
                f"with {len(all_trades)} trades to {export_path}")
+
+def process_single_window(
+    window_idx: int,
+    num_windows: int,
+    window_data: pd.DataFrame,
+    train_data: pd.DataFrame,
+    validation_data: pd.DataFrame,
+    test_data: pd.DataFrame,
+    window_folder: str,
+    initial_timesteps: int,
+    additional_timesteps: int,
+    max_iterations: int,
+    n_stagnant_loops: int,
+    improvement_threshold: float,
+    run_hyperparameter_tuning: bool,
+    tuning_trials: int
+) -> Dict:
+    """
+    Process a single walk-forward window.
+    
+    Args:
+        window_idx: Index of the window (1-based)
+        num_windows: Total number of windows
+        window_data: Data for this window
+        train_data: Training data for this window
+        validation_data: Validation data for this window
+        test_data: Test data for this window
+        window_folder: Folder to store window results
+        initial_timesteps: Initial number of training timesteps
+        additional_timesteps: Number of additional timesteps for each training iteration
+        max_iterations: Maximum number of training iterations
+        n_stagnant_loops: Number of consecutive iterations without improvement before stopping
+        improvement_threshold: Minimum percentage improvement considered significant
+        run_hyperparameter_tuning: Whether to run hyperparameter tuning before training
+        tuning_trials: Number of trials for hyperparameter tuning
+        
+    Returns:
+        Dict: Results for this window
+    """
+    window_logger = logging.getLogger(f"walk_forward.window_{window_idx}")
+    window_logger.info(f"\n{'='*80}\nProcessing window {window_idx}/{num_windows}\n{'='*80}")
+    
+    # Save window periods
+    window_periods = {
+        "window": window_idx,
+        "train_start": train_data.index[0],
+        "train_end": train_data.index[-1],
+        "validation_start": validation_data.index[0],
+        "validation_end": validation_data.index[-1],
+        "test_start": test_data.index[0],
+        "test_end": test_data.index[-1]
+    }
+    
+    save_json(window_periods, f'{window_folder}/window_periods.json')
+    
+    # Train model
+    model, training_stats = train_walk_forward_model(
+        train_data, 
+        validation_data,
+        initial_timesteps=initial_timesteps,
+        additional_timesteps=additional_timesteps,
+        max_iterations=max_iterations,
+        n_stagnant_loops=n_stagnant_loops,
+        improvement_threshold=improvement_threshold,
+        window_folder=window_folder,
+        run_hyperparameter_tuning=run_hyperparameter_tuning,
+        tuning_trials=tuning_trials,
+        tuning_folder=None
+    )
+    
+    # Evaluate on test data
+    # Get risk management configuration from config
+    risk_config = config.get("risk_management", {})
+    risk_enabled = risk_config.get("enabled", False)
+    
+    if risk_enabled:
+        # Initialize risk parameters
+        stop_loss_pct = None
+        take_profit_pct = None
+        trailing_stop_pct = None
+        position_size = 1.0
+        max_risk_per_trade_pct = 2.0
+        
+        # Apply risk management configuration
+        # Stop loss configuration
+        stop_loss_config = risk_config.get("stop_loss", {})
+        if stop_loss_config.get("enabled", False):
+            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+        
+        # Take profit configuration
+        take_profit_config = risk_config.get("take_profit", {})
+        if take_profit_config.get("enabled", False):
+            take_profit_pct = take_profit_config.get("percentage", 2.0)
+        
+        # Trailing stop configuration
+        trailing_stop_config = risk_config.get("trailing_stop", {})
+        if trailing_stop_config.get("enabled", False):
+            trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
+        
+        # Position sizing configuration
+        position_sizing_config = risk_config.get("position_sizing", {})
+        if position_sizing_config.get("enabled", False):
+            position_size = position_sizing_config.get("size_multiplier", 1.0)
+            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
+            window_logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
+        
+        # Evaluate with risk management
+        window_logger.info(f"Evaluating window {window_idx} with risk management")
+        test_results = trade_with_risk_management(
+            model_path=f"{window_folder}/best_model.zip",
+            test_data=test_data,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct,
+            position_size=position_size,
+            max_risk_per_trade_pct=max_risk_per_trade_pct,
+            initial_balance=config["environment"]["initial_balance"],
+            transaction_cost=config["environment"].get("transaction_cost", 0.0),
+            verbose=1
+        )
+    else:
+        # Evaluate without risk management
+        window_logger.info(f"Evaluating window {window_idx} without risk management")
+        test_env = TradingEnv(
+            test_data,
+            initial_balance=config["environment"]["initial_balance"],
+            transaction_cost=0.0
+        )
+        
+        test_results = evaluate_agent(
+            model, 
+            test_data,
+            deterministic=True
+        )
+    
+    # Plot results
+    plot_window_performance(test_data, test_results, window_folder, window_idx)
+    
+    # Save test results
+    test_results_path = f'{window_folder}/test_results.json'
+    save_json(test_results, test_results_path)
+    window_logger.info(f"Test results saved to {test_results_path}")
+    
+    # Compile window result
+    window_result = {
+        "window": window_idx,
+        "window_folder": window_folder,
+        "return": test_results["total_return_pct"],
+        "portfolio_value": test_results["final_portfolio_value"],
+        "trade_count": test_results["trade_count"],
+        "final_position": test_results["final_position"],
+        "train_start": train_data.index[0],
+        "train_end": train_data.index[-1],
+        "test_start": test_data.index[0],
+        "test_end": test_data.index[-1]
+    }
+    
+    # Add additional results if available
+    if "hit_rate" in test_results:
+        window_result["hit_rate"] = test_results["hit_rate"]
+        window_result["profitable_trades"] = test_results.get("profitable_trades", 0)
+    
+    if "prediction_accuracy" in test_results:
+        window_result["prediction_accuracy"] = test_results["prediction_accuracy"]
+        window_result["correct_predictions"] = test_results.get("correct_predictions", 0)
+        window_result["total_predictions"] = test_results.get("total_predictions", 0)
+    
+    window_logger.info(f"Window {window_idx} Return: {test_results['total_return_pct']:.2f}%, "
+                      f"Portfolio Value: ${test_results['final_portfolio_value']:.2f}, "
+                      f"Trades: {test_results['trade_count']}")
+    
+    if "trade_history" in test_results:
+        window_result["has_trade_history"] = True
+        
+        # Save trade history
+        trade_history_path = f'{window_folder}/trade_history.csv'
+        save_trade_history(test_results["trade_history"], trade_history_path)
+        window_logger.info(f"Trade history saved to {trade_history_path}")
+    else:
+        window_result["has_trade_history"] = False
+    
+    return window_result
 
 def walk_forward_testing(
     data: pd.DataFrame,
@@ -580,6 +778,26 @@ def walk_forward_testing(
     # Get evaluation metric from config
     eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
     
+    # Get parallel processing configuration
+    parallel_config = config.get("walk_forward", {}).get("parallel_processing", {})
+    use_parallel = parallel_config.get("enabled", False)
+    n_processes = parallel_config.get("n_processes", 0)
+    max_workers = parallel_config.get("max_workers", 0)
+    
+    # If n_processes is 0, use the number of available CPU cores
+    if n_processes <= 0:
+        n_processes = multiprocessing.cpu_count()
+    
+    # If max_workers is 0, use n_processes
+    if max_workers <= 0:
+        max_workers = n_processes
+    
+    # Log parallelization settings
+    if use_parallel:
+        logger.info(f"Parallel processing enabled with {max_workers} workers (out of {n_processes} CPU cores)")
+    else:
+        logger.info(f"Parallel processing disabled. Processing {num_windows} windows sequentially.")
+    
     # Save session parameters
     session_params = {
         "timestamp": timestamp,
@@ -598,15 +816,17 @@ def walk_forward_testing(
         "data_length": len(data),
         "total_trading_days": len(trading_days),
         "market_hours_only": True,
-        "evaluation_metric": eval_metric
+        "evaluation_metric": eval_metric,
+        "parallel_processing": use_parallel,
+        "n_processes": n_processes,
+        "max_workers": max_workers
     }
     
     save_json(session_params, f'{session_folder}/reports/session_parameters.json')
     
-    # Walk-forward testing
+    # Prepare window data for all windows
+    window_data_list = []
     for i in range(num_windows):
-        logger.info(f"\n{'='*80}\nStarting walk-forward window {i+1}/{num_windows}\n{'='*80}")
-        
         # Create window folder
         window_folder = f'{session_folder}/models/window_{i+1}'
         os.makedirs(window_folder, exist_ok=True)
@@ -619,8 +839,6 @@ def walk_forward_testing(
         
         start_day = trading_days[start_day_idx]
         end_day = trading_days[end_day_idx - 1]  # -1 because end_day_idx is exclusive
-        
-        logger.info(f"Window {i+1} trading days: {start_day} to {end_day}")
         
         # Convert to Eastern timezone for proper day-based filtering
         eastern = pytz.timezone('US/Eastern')
@@ -646,182 +864,94 @@ def walk_forward_testing(
         validation_data = window_data.iloc[train_idx:validation_idx].copy()
         test_data = window_data.iloc[validation_idx:].copy()
         
-        logger.info(f"Train period: {train_data.index[0]} to {train_data.index[-1]}")
-        logger.info(f"Validation period: {validation_data.index[0]} to {validation_data.index[-1]}")
-        logger.info(f"Test period: {test_data.index[0]} to {test_data.index[-1]}")
+        logger.info(f"Window {i+1} - Train period: {train_data.index[0]} to {train_data.index[-1]}")
+        logger.info(f"Window {i+1} - Validation period: {validation_data.index[0]} to {validation_data.index[-1]}")
+        logger.info(f"Window {i+1} - Test period: {test_data.index[0]} to {test_data.index[-1]}")
         
-        # Save window periods
-        window_periods = {
-            "window": i+1,
-            "train_start": train_data.index[0],
-            "train_end": train_data.index[-1],
-            "validation_start": validation_data.index[0],
-            "validation_end": validation_data.index[-1],
-            "test_start": test_data.index[0],
-            "test_end": test_data.index[-1]
-        }
+        # Store window data
+        window_data_list.append({
+            "window_idx": i+1,
+            "window_data": window_data,
+            "train_data": train_data,
+            "validation_data": validation_data,
+            "test_data": test_data,
+            "window_folder": window_folder
+        })
+    
+    # Process windows - either in parallel or sequentially
+    if use_parallel and num_windows > 1:
+        # Process windows in parallel
+        logger.info(f"Processing {num_windows} windows in parallel with {max_workers} workers")
         
-        save_json(window_periods, f'{window_folder}/window_periods.json')
-        
-        # Train model
-        model, training_stats = train_walk_forward_model(
-            train_data, 
-            validation_data,
-            initial_timesteps=initial_timesteps,
-            additional_timesteps=additional_timesteps,
-            max_iterations=max_iterations,
-            n_stagnant_loops=n_stagnant_loops,
-            improvement_threshold=improvement_threshold,
-            window_folder=window_folder,
-            run_hyperparameter_tuning=run_hyperparameter_tuning,
-            tuning_trials=tuning_trials,
-            tuning_folder=None
-        )
-        
-        # Evaluate on test data
-        # Get risk management configuration from config
-        risk_config = config.get("risk_management", {})
-        risk_enabled = risk_config.get("enabled", False)
-        
-        if risk_enabled:
-            # Initialize risk parameters
-            stop_loss_pct = None
-            take_profit_pct = None
-            trailing_stop_pct = None
-            position_size = 1.0
-            max_risk_per_trade_pct = 2.0
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
             
-            # Apply risk management configuration
-            # Stop loss configuration
-            stop_loss_config = risk_config.get("stop_loss", {})
-            if stop_loss_config.get("enabled", False):
-                stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            # Submit all windows for processing
+            for window_data_dict in window_data_list:
+                futures.append(
+                    executor.submit(
+                        process_single_window,
+                        window_data_dict["window_idx"],
+                        num_windows,
+                        window_data_dict["window_data"],
+                        window_data_dict["train_data"],
+                        window_data_dict["validation_data"],
+                        window_data_dict["test_data"],
+                        window_data_dict["window_folder"],
+                        initial_timesteps,
+                        additional_timesteps,
+                        max_iterations,
+                        n_stagnant_loops,
+                        improvement_threshold,
+                        run_hyperparameter_tuning,
+                        tuning_trials
+                    )
+                )
             
-            # Take profit configuration
-            take_profit_config = risk_config.get("take_profit", {})
-            if take_profit_config.get("enabled", False):
-                take_profit_pct = take_profit_config.get("percentage", 2.0)
-            
-            # Trailing stop configuration
-            trailing_stop_config = risk_config.get("trailing_stop", {})
-            if trailing_stop_config.get("enabled", False):
-                trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
-            
-            # Position sizing configuration
-            position_sizing_config = risk_config.get("position_sizing", {})
-            if position_sizing_config.get("enabled", False):
-                position_size = position_sizing_config.get("size_multiplier", 1.0)
-                max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
-                logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
-            else:
-                logger.info("  - Position sizing: Disabled")
-            
-            # Save the model temporarily for evaluation
-            temp_model_path = f"{window_folder}/temp_test_model"
-            model.save(temp_model_path)
-            
-            # Evaluate with risk management
-            test_results = trade_with_risk_management(
-                model_path=temp_model_path,
-                test_data=test_data,
-                stop_loss_pct=stop_loss_pct,
-                take_profit_pct=take_profit_pct,
-                trailing_stop_pct=trailing_stop_pct,
-                position_size=position_size,
-                max_risk_per_trade_pct=max_risk_per_trade_pct,
-                initial_balance=config["environment"]["initial_balance"],
-                transaction_cost=config["environment"].get("transaction_cost", 0.0),
-                verbose=1,
-                deterministic=True,
-                close_at_end_of_day=True
-            )
-            
-            # Clean up temporary model file
-            if os.path.exists(f"{temp_model_path}.zip"):
-                os.remove(f"{temp_model_path}.zip")
-                
-            # Calculate hit rate from trade results
-            test_results = calculate_hit_rate_from_trade_results(test_results)
-            
-            logger.info(f"Evaluated model with risk management: stop_loss={stop_loss_pct}%, " +
-                      f"take_profit={take_profit_pct}%, trailing_stop={trailing_stop_pct}%")
-        else:
-            # Use standard evaluation without risk management
-            test_results = evaluate_agent(model, test_data, deterministic=True)
-            logger.info("Evaluated model without risk management")
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    window_result = future.result()
+                    all_window_results.append(window_result)
+                    logger.info(f"Completed window {window_result['window']}/{num_windows}")
+                except Exception as e:
+                    logger.error(f"Error processing window: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
         
-        # Log appropriate metrics based on evaluation metric
-        if eval_metric == "hit_rate" and test_results["trade_count"] > 0:
-            logger.info(f"Test Results - Hit Rate: {test_results['hit_rate']:.2f}% " +
-                       f"({test_results['profitable_trades']}/{test_results['trade_count']} trades), " +
-                       f"Portfolio: ${test_results['final_portfolio_value']:.2f}")
-        else:
-            logger.info(f"Test Results - Return: {test_results['total_return_pct']:.2f}%, " +
-                      f"Portfolio: ${test_results['final_portfolio_value']:.2f}")
+        # Sort results by window number
+        all_window_results.sort(key=lambda x: x["window"])
+    else:
+        # Process windows sequentially
+        logger.info(f"Processing {num_windows} windows sequentially")
         
-        # Save trade history to CSV if available
-        if 'trade_history' in test_results and test_results['trade_history']:
-            # Create CSV file path for this window's trade history
-            trade_history_file = f'{window_folder}/test_trade_history.csv'
-            
-            # Save trade history
-            save_trade_history(test_results['trade_history'], trade_history_file)
-            logger.info(f"Saved test trade history to {trade_history_file}")
-            
-            # Create a summary of trade performance stats
-            trade_summary = {}
-            
-            # Extract stop loss, take profit, and trailing stop info if available
-            if risk_enabled:
-                exit_reasons = test_results.get('exit_reasons', {})
-                
-                trade_summary['total_trades'] = test_results['trade_count']
-                trade_summary['profitable_trades'] = test_results.get('profitable_trades', 0)
-                trade_summary['hit_rate'] = test_results.get('hit_rate', 0)
-                
-                # Count trades by exit reason
-                trade_summary['stop_loss_exits'] = exit_reasons.get('stop_loss', 0)
-                trade_summary['take_profit_exits'] = exit_reasons.get('take_profit', 0)
-                trade_summary['trailing_stop_exits'] = exit_reasons.get('trailing_stop', 0)
-                trade_summary['model_signal_exits'] = exit_reasons.get('model_signal', 0)
-                
-                # Calculate percentages of exit reasons
-                total_exits = sum(exit_reasons.values())
-                if total_exits > 0:
-                    trade_summary['stop_loss_pct'] = (exit_reasons.get('stop_loss', 0) / total_exits) * 100
-                    trade_summary['take_profit_pct'] = (exit_reasons.get('take_profit', 0) / total_exits) * 100
-                    trade_summary['trailing_stop_pct'] = (exit_reasons.get('trailing_stop', 0) / total_exits) * 100
-                    trade_summary['model_signal_pct'] = (exit_reasons.get('model_signal', 0) / total_exits) * 100
-                
-                # Save trade summary
-                save_json(trade_summary, f'{window_folder}/trade_summary.json')
-                logger.info(f"Saved trade summary to {window_folder}/trade_summary.json")
-        
-        # Save results for this window
-        test_results["window"] = i + 1
-        test_results["train_start"] = train_data.index[0]
-        test_results["train_end"] = train_data.index[-1]
-        test_results["validation_start"] = validation_data.index[0]
-        test_results["validation_end"] = validation_data.index[-1]
-        test_results["test_start"] = test_data.index[0]
-        test_results["test_end"] = test_data.index[-1]
-        test_results["training_stats"] = training_stats
-        
-        all_window_results.append(test_results)
-        
-        # Save test results
-        save_json(test_results, f'{window_folder}/test_results.json')
-        
-        # Save model for this window
-        model.save(f"{window_folder}/model")
-        logger.info(f"Saved model for window {i+1} to {window_folder}/model")
-        
-        # Plot window performance
-        plot_window_performance(test_data, test_results, window_folder, i+1)
-        
+        for window_data_dict in window_data_list:
+            try:
+                window_result = process_single_window(
+                    window_data_dict["window_idx"],
+                    num_windows,
+                    window_data_dict["window_data"],
+                    window_data_dict["train_data"],
+                    window_data_dict["validation_data"],
+                    window_data_dict["test_data"],
+                    window_data_dict["window_folder"],
+                    initial_timesteps,
+                    additional_timesteps,
+                    max_iterations,
+                    n_stagnant_loops,
+                    improvement_threshold,
+                    run_hyperparameter_tuning,
+                    tuning_trials
+                )
+                all_window_results.append(window_result)
+            except Exception as e:
+                logger.error(f"Error processing window {window_data_dict['window_idx']}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
     # Aggregate results across all windows
-    returns = [res["total_return_pct"] for res in all_window_results]
-    portfolio_values = [res["final_portfolio_value"] for res in all_window_results]
+    returns = [res["return"] for res in all_window_results]
+    portfolio_values = [res["portfolio_value"] for res in all_window_results]
     trade_counts = [res["trade_count"] for res in all_window_results]
     
     # Also aggregate hit rates if that metric is used
@@ -1245,8 +1375,8 @@ def plot_walk_forward_results(all_window_results: List[Dict], session_folder: st
         eval_metric: Evaluation metric used for the walk-forward testing
     """
     windows = [res["window"] for res in all_window_results]
-    returns = [res["total_return_pct"] for res in all_window_results]
-    portfolio_values = [res["final_portfolio_value"] for res in all_window_results]
+    returns = [res["return"] for res in all_window_results]
+    portfolio_values = [res["portfolio_value"] for res in all_window_results]
     trade_counts = [res["trade_count"] for res in all_window_results]
     
     # Also get hit rates if that metric is used

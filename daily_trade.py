@@ -8,6 +8,7 @@ import os
 from typing import Tuple, Dict, List
 from dateutil.relativedelta import relativedelta
 import optuna  # Add import for optuna
+import multiprocessing
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
@@ -19,6 +20,8 @@ from trade import trade_with_risk_management, plot_results, save_trade_history
 from get_data import filter_market_hours, get_data
 # Import evaluate_agent_prediction_accuracy from walk_forward
 from walk_forward import evaluate_agent_prediction_accuracy, calculate_hit_rate_from_trade_results
+# Import parallel hyperparameter tuning
+from hyperparameter_tuning import parallel_hyperparameter_tuning
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -155,6 +158,30 @@ def hyperparameter_tuning(
     logger.info(f"Starting hyperparameter tuning with {n_trials} trials")
     logger.info(f"Evaluation metric: {eval_metric}")
     
+    # Get parallel processing configuration
+    parallel_config = config.get("hyperparameter_tuning", {}).get("parallel_processing", {})
+    use_parallel = parallel_config.get("enabled", False)
+    n_jobs = parallel_config.get("n_jobs", 0)
+    
+    # If n_jobs is 0, use the number of available CPU cores
+    if n_jobs <= 0:
+        n_jobs = multiprocessing.cpu_count()
+    
+    if use_parallel:
+        logger.info(f"Using parallel hyperparameter tuning with {n_jobs} workers")
+        # Use the parallel implementation
+        results = parallel_hyperparameter_tuning(
+            train_data=train_data,
+            validation_data=validation_data,
+            n_trials=n_trials,
+            eval_metric=eval_metric,
+            hit_rate_min_trades=hit_rate_min_trades,
+            min_predictions=min_predictions,
+            n_jobs=n_jobs
+        )
+        return results
+    
+    # Fall back to the original sequential implementation if parallel is disabled
     # Get risk management parameters from config
     risk_config = config.get("risk_management", {})
     risk_enabled = risk_config.get("enabled", False)

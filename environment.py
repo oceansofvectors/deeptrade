@@ -13,6 +13,7 @@ class TradingEnv(gym.Env):
     Action Space:
         0: Long (Buy)
         1: Short (Sell)
+        2: Hold (Stay in current position or do nothing)
     """
 
     metadata = {"render.modes": ["human"]}
@@ -36,8 +37,8 @@ class TradingEnv(gym.Env):
         self.data = data.reset_index(drop=True)
         self.total_steps = len(self.data) - 1  # Last valid index
 
-        # Action space: 0 = long (buy), 1 = short (sell)
-        self.action_space = spaces.Discrete(2)
+        # Action space: 0 = long (buy), 1 = short (sell), 2 = hold (stay in current position)
+        self.action_space = spaces.Discrete(3)
 
         # Define the technical indicators to include in the observation space
         self.technical_indicators = []
@@ -109,13 +110,10 @@ class TradingEnv(gym.Env):
         self.initial_balance = money.to_decimal(initial_balance)
         self.net_worth = self.initial_balance
         self.transaction_cost = money.to_decimal(transaction_cost)
+        self.previous_net_worth = self.initial_balance  # Track previous net worth for reward calculation
         
         # Position sizing
         self.position_size = position_size
-        
-        # Reward normalization parameters
-        self.correct_prediction_reward = Decimal('1.0')
-        self.incorrect_prediction_reward = Decimal('-1.0')
 
     def reset(self, seed=None, options=None):
         """
@@ -137,6 +135,7 @@ class TradingEnv(gym.Env):
         self.position = 0  # Will be immediately set by first action
         self.entry_price = Decimal('0.0')
         self.net_worth = self.initial_balance
+        self.previous_net_worth = self.initial_balance  # Reset previous net worth for reward calculation
         obs = self._get_obs()
         return obs, {}
 
@@ -169,13 +168,15 @@ class TradingEnv(gym.Env):
         Apply an action, update the portfolio, and return the next observation.
 
         Args:
-            action (int): Action to execute (0: long/buy, 1: short/sell).
+            action (int): Action to execute (0: long/buy, 1: short/sell, 2: hold).
 
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
         """
         info = {}
-        reward = Decimal('0.0')
+        
+        # Store the previous net worth for reward calculation
+        self.previous_net_worth = self.net_worth
 
         # Current price based on actual 'Close'
         current_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
@@ -184,39 +185,27 @@ class TradingEnv(gym.Env):
         old_position = self.position
 
         # Update position based on action
-        # Only change position if the action is different from current position
         if action == 0:  # Go long
             # If already long (position == 1), maintain position
             # Otherwise, set position to long
             if self.position != 1:
                 self.position = 1
+                self.entry_price = current_price
             else:
-                pass  # No position duration tracking needed
-        else:  # Go short
+                pass  # Already long, no change
+                
+        elif action == 1:  # Go short
             # If already short (position == -1), maintain position
             # Otherwise, set position to short
             if self.position != -1:
                 self.position = -1
+                self.entry_price = current_price
             else:
-                pass  # No position duration tracking needed
-            
-        # Calculate reward based on correctness of prediction about next candle
-        if self.current_step < self.total_steps:
-            next_price = money.to_decimal(self.data.loc[self.current_step + 1, "Close"])
-            price_change = next_price - current_price
-            
-            # If long and price goes up OR short and price goes down, prediction is correct
-            if (self.position == 1 and price_change > Decimal('0')) or (self.position == -1 and price_change < Decimal('0')):
-                raw_reward = self.correct_prediction_reward
-            else:
-                raw_reward = self.incorrect_prediction_reward
+                pass  # Already short, no change
                 
-            # Apply logarithmic transformation to the reward
-            if raw_reward > Decimal('0'):
-                reward += Decimal(np.log1p(float(raw_reward)))
-            else:
-                reward -= Decimal(np.log1p(float(abs(raw_reward))))
-
+        elif action == 2:  # Hold current position
+            pass  # No change to position
+            
         # Advance to next step
         self.current_step += 1
         
@@ -252,6 +241,13 @@ class TradingEnv(gym.Env):
 
         if terminated:
             self.current_step = self.total_steps  # Clamp to last valid index
+        
+        # Calculate reward based on logarithmic return
+        if self.previous_net_worth > Decimal('0.0'):
+            reward = float(np.log(float(self.net_worth / self.previous_net_worth)))
+        else:
+            reward = 0.0
+        
         obs = self._get_obs()
         
         # Add info about current state
