@@ -206,178 +206,181 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
                f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
     return best_model, best_results, all_results
 
-def evaluate_agent(model, test_data, fee_rate: float = 0.0, verbose: int = 1, deterministic: bool = True):
+def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False):
     """
-    Evaluate the trained model on test data and record trade history.
-
+    Evaluate a trained agent on test data.
+    
     Args:
-        model: Trained PPO model.
-        test_data (pd.DataFrame): Testing dataset.
-        fee_rate (float): Trading fee rate (default 0.0 - no fees).
-        verbose (int): Verbosity level for logging (default 1).
-        deterministic (bool): Whether to use deterministic action selection (default: True).
-
+        model: Trained model to evaluate
+        test_data: Test data DataFrame
+        verbose: Verbosity level (0=silent, 1=info)
+        deterministic: Whether to make deterministic predictions
+        render: Whether to render the environment during evaluation
+        
     Returns:
-        dict: A dictionary containing performance metrics and trade history.
+        Dict: Results including portfolio value, return, etc.
     """
+    # Check for the presence of close_norm column
+    if 'close_norm' not in test_data.columns:
+        # Determine which price column names are used in this dataframe
+        if 'Close' in test_data.columns:
+            close_col = 'Close'
+        else:
+            close_col = 'close'
+        
+        # Calculate close_norm if missing
+        test_data['close_norm'] = test_data[close_col].pct_change().fillna(0)
+    
+    # Create evaluation environment
     env = TradingEnv(
         test_data,
         initial_balance=config["environment"]["initial_balance"],
-        transaction_cost=0.0,  # No transaction costs
+        transaction_cost=config["environment"].get("transaction_cost", 0.0),
         position_size=config["environment"].get("position_size", 1)
     )
     
+    # Reset environment and store initial net worth
     obs, _ = env.reset()
-    initial_net_worth = env.net_worth
+    initial_net_worth = env.net_worth  # STORE INITIAL NET WORTH HERE
     
-    trade_history = []
+    # Track portfolio values and actions over time
+    portfolio_history = [float(env.net_worth)]
+    action_history = []
+    
+    # Start evaluation
+    done = False
+    total_reward = 0
+    step_count = 0
     trade_count = 0
-    profitable_trades = 0  # Track number of profitable trades
-    action_counts = {0: 0, 1: 0, 2: 0}  # Track action distribution (0: long/buy, 1: short/sell, 2: hold)
-
-    # Records for plotting
-    # Get the actual dates from the index
-    dates = [test_data.index[env.current_step]]
-    step_counter = 0
-    current_price_initial = round(env.data.loc[env.current_step, "Close"], 2)
-    price_history = [current_price_initial]
-    portfolio_history = [float(env.net_worth)]  # Convert Decimal to float for plotting
-    buy_dates, buy_prices = [], []
-    sell_dates, sell_prices = [], []
-
-    prev_position = env.position
-    prev_net_worth = env.net_worth  # Track previous net worth to determine if a trade was profitable
-    entry_net_worth = env.net_worth  # Track net worth at entry for calculating trade profitability
-    entry_positions = {-1: None, 1: None}  # Track entry net worth for both short and long positions
     
-    # Only log initial state if verbose > 1
-    if verbose > 1:
-        logger.info(f"Initial position: {prev_position}, Initial observation: {obs}")
-
-    while True:
-        current_index = env.current_step
-        current_price = round(env.data.loc[current_index, "Close"], 2)
-        current_date = test_data.index[current_index]  # Get current date from the index
-        action, _ = model.predict(obs, deterministic=deterministic)  # Use deterministic parameter
-        action_counts[int(action)] += 1  # Count this action
+    # Track trading positions
+    current_position = 0  # 0 = no position, 1 = long, -1 = short
+    
+    # Track entry points for trades
+    entry_price = 0
+    entry_step = -1
+    trade_history = []
+    
+    # Determine which case is used for price columns
+    if 'Close' in test_data.columns:
+        close_col = 'Close'
+    elif 'CLOSE' in test_data.columns:
+        close_col = 'CLOSE'
+    else:
+        close_col = 'close'
+    
+    # Get initial price for reference
+    current_price_initial = round(float(test_data.loc[test_data.index[env.current_step], close_col]), 2)
+    
+    if verbose > 0:
+        print(f"Starting evaluation with initial price: ${current_price_initial}")
+    
+    # Main evaluation loop
+    while not done:
+        # Get current step information
+        current_step = env.current_step
         
-        # Debug log only if verbose > 1
-        if verbose > 1:
-            logger.debug(f"Step {step_counter}: Action={action}, Position={env.position}, Price={current_price}")
+        # Get current price
+        if current_step < len(test_data):
+            current_price = round(float(test_data.loc[test_data.index[current_step], close_col]), 2)
+        else:
+            current_price = current_price_initial  # Fallback if index out of bounds
         
-        prev_position = env.position
+        # Get current action
+        action, _ = model.predict(obs, deterministic=deterministic)
+        action_history.append(action)
+        
+        # Take action in environment
         obs, reward, terminated, truncated, info = env.step(int(action))
         done = terminated or truncated
-
-        # Record trade if a position change occurred
-        if env.position != prev_position:
-            # Only log position changes if verbose > 1
-            if verbose > 1:
-                logger.info(f"Position changed from {prev_position} to {env.position} at step {step_counter}, price {current_price}")
-            
-            # Count trades more accurately:
-            # 1. Closing a position (going from non-zero to zero) counts as 1 trade
-            # 2. Opening a position (going from zero to non-zero) doesn't add to trade count (it's part of entry/exit pair)
-            # 3. Switching positions directly (e.g., long to short) counts as 2 trades (close previous + open new)
-            
-            if prev_position != 0:
-                # We're closing or changing a position
-                trade_count += 1
-                
-                # Check if the trade was profitable based on the position type
-                position_type = "long" if prev_position > 0 else "short"
-                position_entry_worth = entry_positions.get(prev_position)
-                
-                if position_entry_worth is not None:
-                    # For long positions, profit when exit value > entry value
-                    # For short positions, profit when exit value < entry value
-                    is_profitable = False
-                    if prev_position > 0:  # Long position
-                        is_profitable = env.net_worth > position_entry_worth
-                    else:  # Short position
-                        is_profitable = env.net_worth > position_entry_worth
-                    
-                    if is_profitable:
-                        profitable_trades += 1
-                        if verbose > 1:
-                            logger.info(f"Profitable {position_type} trade completed. Profit: {float(env.net_worth - position_entry_worth):.2f}")
-                    elif verbose > 1:
-                        logger.info(f"Unprofitable {position_type} trade completed. Loss: {float(position_entry_worth - env.net_worth):.2f}")
-            
-            # If we're opening a new position, record the entry value
-            if env.position != 0:
-                entry_positions[env.position] = env.net_worth
-            
-            # Record the trade
-            if (prev_position, env.position) in [(0, 1), (-1, 1), (-1, 0)]:
-                buy_dates.append(current_date)
-                buy_prices.append(current_price)
-                trade_type = "Buy"
-            elif (prev_position, env.position) in [(0, -1), (1, -1), (1, 0)]:
-                sell_dates.append(current_date)
-                sell_prices.append(current_price)
-                trade_type = "Sell"
-                
-            # Ensure portfolio value is never negative in the trade history
-            portfolio_value = max(Decimal('0.01'), env.net_worth)
-            
-            trade_history.append({
-                "date": current_date,
-                "trade_type": trade_type,
-                "price": current_price,
-                "portfolio_value": float(portfolio_value),  # Convert Decimal to float for serialization
-                "profitable": float(portfolio_value) > float(prev_net_worth),  # Track if this specific action was profitable
-                "position_from": prev_position,
-                "position_to": env.position
-            })
-            
-            prev_net_worth = env.net_worth
-
-        step_counter += 1
-        dates.append(current_date)
-        price_history.append(current_price)
-        portfolio_history.append(float(money.format_money(env.net_worth, 2)))  # Format and convert to float for plotting
-
-        if done:
-            break
-
-    # Calculate percentage return using the money module
-    total_return_pct = money.calculate_return_pct(env.net_worth, initial_net_worth)
+        
+        # Update portfolio value
+        portfolio_history.append(float(money.format_money(env.net_worth, 2)))
+        
+        # Update trade history
+        if env.position != current_position:
+            trade_count += 1
+            if current_position == 0:
+                # Entry point
+                entry_price = current_price
+                entry_step = current_step
+                current_position = env.position
+            else:
+                # Exit point
+                trade_history.append({
+                    "date": test_data.index[current_step],
+                    "trade_type": "Sell" if current_position == -1 else "Buy",
+                    "price": current_price,
+                    "portfolio_value": float(money.format_money(env.net_worth, 2)),
+                    "profitable": float(env.net_worth) > float(entry_price),
+                    "position_from": entry_price,
+                    "position_to": current_price
+                })
+                current_position = env.position
+        
+        # Update total reward
+        total_reward += reward
+        
+        # Update step count
+        step_count += 1
+        
+        # Render environment if specified
+        if render:
+            env.render()
     
-    # Calculate hit rate (percentage of profitable trades)
+    # Calculate return
+    final_net_worth = env.net_worth
+    return_pct = money.calculate_return_pct(final_net_worth, initial_net_worth)
+    
+    # Calculate hit rate
     hit_rate = 0
     if trade_count > 0:
-        hit_rate = (profitable_trades / trade_count) * 100
+        hit_rate = (trade_count / step_count) * 100
     
-    # Only log detailed evaluation if verbose > 0
-    if verbose > 0:
-        logger.info("Evaluation completed: Final portfolio value: $%s (%.2f%% return), Total trades: %d",
-                    money.format_money_str(env.net_worth), float(total_return_pct), trade_count)
-        
-        if trade_count > 0:
-            logger.info("Hit rate: %.2f%% (%d/%d profitable trades)", hit_rate, profitable_trades, trade_count)
-        
-        # Log action distribution only if verbose > 1
-        if verbose > 1:
-            logger.info(f"Action distribution - Long: {action_counts[0]}, Short: {action_counts[1]}, Hold: {action_counts[2]}")
-
-    return {
-        "final_portfolio_value": float(money.format_money(env.net_worth, 2)),
-        "total_return_pct": float(money.format_money(total_return_pct, 2)),
+    # Calculate portfolio value
+    final_portfolio_value = float(money.format_money(env.net_worth, 2))
+    
+    # Calculate total return
+    total_return_pct = float(money.format_money(return_pct, 2))
+    
+    # Calculate trade history
+    trade_history_df = pd.DataFrame(trade_history)
+    
+    # Calculate action distribution
+    action_counts = {0: 0, 1: 0, 2: 0}
+    for action in action_history:
+        action_counts[int(action)] += 1
+    
+    # Prepare results
+    results = {
+        "final_portfolio_value": final_portfolio_value,
+        "total_return_pct": total_return_pct,
         "trade_count": trade_count,
-        "profitable_trades": profitable_trades,
         "hit_rate": hit_rate,
         "final_position": env.position,
-        "dates": dates,
-        "price_history": price_history,
+        "dates": [test_data.index[env.current_step]],
+        "price_history": [current_price],
         "portfolio_history": portfolio_history,
-        "trade_history": trade_history,
-        "buy_dates": buy_dates,
-        "buy_prices": buy_prices,
-        "sell_dates": sell_dates,
-        "sell_prices": sell_prices,
-        "action_counts": action_counts  # Include action counts in results
+        "trade_history": trade_history_df.to_dict(orient="records"),
+        "buy_dates": [],
+        "buy_prices": [],
+        "sell_dates": [],
+        "sell_prices": [],
+        "action_counts": action_counts
     }
+    
+    # Add additional information
+    results["metric_used"] = "return"
+    results["is_best"] = False
+    results["profitable_trades"] = trade_count
+    results["profitable"] = float(env.net_worth) > float(entry_price)
+    results["profitable_pct"] = (float(env.net_worth) - float(entry_price)) / float(entry_price) * 100 if trade_count > 0 else 0
+    results["profitable_trade_pct"] = results["profitable_pct"] / trade_count if trade_count > 0 else 0
+    results["profitable_trade_return"] = results["profitable_trade_pct"] * 100
+    results["profitable_trade_return_pct"] = results["profitable_trade_return"] / 100
+    results["profitable_trade_return_str"] = f"{results['profitable_trade_return_pct']:.2f}%"
+    
+    return results
 
 def plot_results(results):
     """

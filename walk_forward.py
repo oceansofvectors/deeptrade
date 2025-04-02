@@ -65,7 +65,7 @@ def save_json(data, filepath):
         json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
     logger.info(f"Saved JSON data to {filepath}")
 
-def load_tradingview_data(csv_filepath: str = "data/trading_view_nq.csv") -> pd.DataFrame:
+def load_tradingview_data(csv_filepath: str = "data/data/NQ_2024_unix.csv") -> pd.DataFrame:
     """
     Load and process data from a TradingView CSV export file.
     
@@ -139,15 +139,6 @@ def load_tradingview_data(csv_filepath: str = "data/trading_view_nq.csv") -> pd.
             for col in df.columns:
                 if col.lower() == tv_col.lower():
                     df[our_col] = df[col]
-        
-        # Rename price columns to match expected format
-        column_mapping = {
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close'
-        }
-        df = df.rename(columns=column_mapping)
         
         # Process technical indicators using the same logic as in get_data
         from get_data import process_technical_indicators
@@ -302,6 +293,14 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
     Returns:
         Dict: Results including prediction accuracy metrics
     """
+    # Determine which case is used for price columns
+    if 'Close' in test_data.columns:
+        close_col = 'Close'
+    elif 'CLOSE' in test_data.columns:
+        close_col = 'CLOSE'
+    else:
+        close_col = 'close'
+        
     # Create evaluation environment
     env = TradingEnv(
         test_data,
@@ -340,7 +339,7 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
     while not done:
         # Get current step and price before taking action
         current_step = env.current_step
-        current_price = money.to_decimal(test_data.iloc[current_step]["Close"])
+        current_price = money.to_decimal(test_data.iloc[current_step][close_col])
         
         # Get model's action
         action, _ = model.predict(obs, deterministic=deterministic)
@@ -358,7 +357,7 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
         # We need the next price to determine if prediction was correct
         if current_step < len(test_data) - 1:
             # Get next price
-            next_price = money.to_decimal(test_data.iloc[current_step + 1]["Close"])
+            next_price = money.to_decimal(test_data.iloc[current_step + 1][close_col])
             price_change = next_price - current_price
             
             # Evaluate prediction accuracy based on action type
@@ -511,33 +510,13 @@ def process_single_window(
     tuning_trials: int
 ) -> Dict:
     """
-    Process a single walk-forward window.
-    
-    Args:
-        window_idx: Index of the window (1-based)
-        num_windows: Total number of windows
-        window_data: Data for this window
-        train_data: Training data for this window
-        validation_data: Validation data for this window
-        test_data: Test data for this window
-        window_folder: Folder to store window results
-        initial_timesteps: Initial number of training timesteps
-        additional_timesteps: Number of additional timesteps for each training iteration
-        max_iterations: Maximum number of training iterations
-        n_stagnant_loops: Number of consecutive iterations without improvement before stopping
-        improvement_threshold: Minimum percentage improvement considered significant
-        run_hyperparameter_tuning: Whether to run hyperparameter tuning before training
-        tuning_trials: Number of trials for hyperparameter tuning
-        
-    Returns:
-        Dict: Results for this window
+    Process a single window in the walk-forward analysis.
     """
+    # Create a logger for this window
     window_logger = logging.getLogger(f"walk_forward.window_{window_idx}")
-    window_logger.info(f"\n{'='*80}\nProcessing window {window_idx}/{num_windows}\n{'='*80}")
     
     # Save window periods
     window_periods = {
-        "window": window_idx,
         "train_start": train_data.index[0],
         "train_end": train_data.index[-1],
         "validation_start": validation_data.index[0],
@@ -545,13 +524,12 @@ def process_single_window(
         "test_start": test_data.index[0],
         "test_end": test_data.index[-1]
     }
+    save_json(window_periods, f"{window_folder}/window_periods.json")
     
-    save_json(window_periods, f'{window_folder}/window_periods.json')
-    
-    # Train model
+    # Train the model
     model, training_stats = train_walk_forward_model(
-        train_data, 
-        validation_data,
+        train_data=train_data,
+        validation_data=validation_data,
         initial_timesteps=initial_timesteps,
         additional_timesteps=additional_timesteps,
         max_iterations=max_iterations,
@@ -559,50 +537,71 @@ def process_single_window(
         improvement_threshold=improvement_threshold,
         window_folder=window_folder,
         run_hyperparameter_tuning=run_hyperparameter_tuning,
-        tuning_trials=tuning_trials,
-        tuning_folder=None
+        tuning_trials=tuning_trials
     )
     
-    # Evaluate on test data
-    # Get risk management configuration from config
+    # Plot training progress
+    plot_training_progress(training_stats, window_folder)
+    
+    # Load the best model for testing
+    model = PPO.load(f"{window_folder}/model")
+    
+    # Get risk management parameters from config
     risk_config = config.get("risk_management", {})
     risk_enabled = risk_config.get("enabled", False)
     
+    # Initialize risk parameters with default values (disabled)
+    stop_loss_pct = None
+    take_profit_pct = None
+    trailing_stop_pct = None
+    position_size = 1.0
+    max_risk_per_trade_pct = 0.0
+    
+    # Only set risk parameters if risk management is enabled
     if risk_enabled:
-        # Initialize risk parameters
-        stop_loss_pct = None
-        take_profit_pct = None
-        trailing_stop_pct = None
-        position_size = 1.0
-        max_risk_per_trade_pct = 2.0
-        
-        # Apply risk management configuration
         # Stop loss configuration
         stop_loss_config = risk_config.get("stop_loss", {})
         if stop_loss_config.get("enabled", False):
-            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            stop_loss_pct = stop_loss_config.get("percentage", 0.0)
         
         # Take profit configuration
         take_profit_config = risk_config.get("take_profit", {})
         if take_profit_config.get("enabled", False):
-            take_profit_pct = take_profit_config.get("percentage", 2.0)
+            take_profit_pct = take_profit_config.get("percentage", 0.0)
         
         # Trailing stop configuration
         trailing_stop_config = risk_config.get("trailing_stop", {})
         if trailing_stop_config.get("enabled", False):
-            trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
+            trailing_stop_pct = trailing_stop_config.get("percentage", 0.0)
         
         # Position sizing configuration
         position_sizing_config = risk_config.get("position_sizing", {})
         if position_sizing_config.get("enabled", False):
             position_size = position_sizing_config.get("size_multiplier", 1.0)
-            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
-            window_logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
-        
-        # Evaluate with risk management
+            max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 0.0)
+    
+    # Log risk management settings
+    window_logger.info("Risk Management Settings:")
+    window_logger.info(f"  Risk Management Enabled: {risk_enabled}")
+    if risk_enabled:
+        window_logger.info(f"  Stop Loss: {'Enabled' if stop_loss_pct is not None else 'Disabled'}" + 
+                         (f" ({stop_loss_pct}%)" if stop_loss_pct is not None else ""))
+        window_logger.info(f"  Take Profit: {'Enabled' if take_profit_pct is not None else 'Disabled'}" + 
+                         (f" ({take_profit_pct}%)" if take_profit_pct is not None else ""))
+        window_logger.info(f"  Trailing Stop: {'Enabled' if trailing_stop_pct is not None else 'Disabled'}" + 
+                         (f" ({trailing_stop_pct}%)" if trailing_stop_pct is not None else ""))
+        window_logger.info(f"  Position Size: {position_size}")
+        window_logger.info(f"  Max Risk per Trade: {max_risk_per_trade_pct}%")
+    
+    # Evaluate with risk management if enabled
+    if risk_enabled:
         window_logger.info(f"Evaluating window {window_idx} with risk management")
+        
+        # Convert all numeric parameters to Decimal before passing to trade_with_risk_management
+        import money
+        
         test_results = trade_with_risk_management(
-            model_path=f"{window_folder}/best_model.zip",
+            model_path=f"{window_folder}/model",
             test_data=test_data,
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
@@ -821,6 +820,17 @@ def walk_forward_testing(
         "n_processes": n_processes,
         "max_workers": max_workers
     }
+    
+    # Add enabled indicators from config
+    indicators_config = config.get("indicators", {})
+    enabled_indicators = {}
+    
+    for indicator_name, indicator_config in indicators_config.items():
+        if indicator_config.get("enabled", False):
+            enabled_indicators[indicator_name] = indicator_config
+    
+    # Add enabled indicators to session parameters
+    session_params["enabled_indicators"] = enabled_indicators
     
     save_json(session_params, f'{session_folder}/reports/session_parameters.json')
     
@@ -1326,6 +1336,9 @@ def plot_window_performance(test_data: pd.DataFrame, test_results: Dict, window_
     portfolio_history = test_results['portfolio_history']
     action_history = test_results.get('action_history', [])
     
+    # Ensure action_history is always an array
+    action_history = np.atleast_1d(action_history)
+    
     plt.figure(figsize=(12, 8))
     
     # Plot portfolio value
@@ -1336,29 +1349,53 @@ def plot_window_performance(test_data: pd.DataFrame, test_results: Dict, window_
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
     
-    # Plot price and trades if available
-    if 'close' in test_data.columns and len(action_history) > 0:
-        plt.subplot(2, 1, 2)
+    # Plot price and buy/sell signals
+    plt.subplot(2, 1, 2)
+    
+    # Plot price line
+    if 'CLOSE' in test_data.columns:
+        plt.plot(test_data.index, test_data['CLOSE'], color='gray', label='Price')
+    elif 'Close' in test_data.columns:
+        plt.plot(test_data.index, test_data['Close'], color='gray', label='Price')
+    else:
         plt.plot(test_data.index, test_data['close'], color='gray', label='Price')
+    
+    # Plot buy signals
+    buy_indices = np.where(action_history == 0)[0]
+    if buy_indices.size > 0:
+        # Ensure buy_indices are within range
+        buy_dates = test_data.index[buy_indices[buy_indices < len(test_data)]]
         
-        # Plot buy and sell points
-        buy_indices = [i for i, action in enumerate(action_history) if action == 1]
-        sell_indices = [i for i, action in enumerate(action_history) if action == 2]
-        
-        if buy_indices:
-            buy_dates = [test_data.index[i] for i in buy_indices if i < len(test_data)]
+        # Get buy prices with proper column name handling
+        if 'CLOSE' in test_data.columns:
+            buy_prices = [test_data['CLOSE'].iloc[i] for i in buy_indices if i < len(test_data)]
+        elif 'Close' in test_data.columns:
+            buy_prices = [test_data['Close'].iloc[i] for i in buy_indices if i < len(test_data)]
+        else:
             buy_prices = [test_data['close'].iloc[i] for i in buy_indices if i < len(test_data)]
-            plt.scatter(buy_dates, buy_prices, color='green', marker='^', s=100, label='Buy')
             
-        if sell_indices:
-            sell_dates = [test_data.index[i] for i in sell_indices if i < len(test_data)]
+        plt.scatter(buy_dates, buy_prices, color='green', marker='^', s=100, label='Buy')
+    
+    # Plot sell signals
+    sell_indices = np.where(action_history == 1)[0]
+    if sell_indices.size > 0:
+        # Ensure sell_indices are within range
+        sell_dates = test_data.index[sell_indices[sell_indices < len(test_data)]]
+        
+        # Get sell prices with proper column name handling
+        if 'CLOSE' in test_data.columns:
+            sell_prices = [test_data['CLOSE'].iloc[i] for i in sell_indices if i < len(test_data)]
+        elif 'Close' in test_data.columns:
+            sell_prices = [test_data['Close'].iloc[i] for i in sell_indices if i < len(test_data)]
+        else:
             sell_prices = [test_data['close'].iloc[i] for i in sell_indices if i < len(test_data)]
-            plt.scatter(sell_dates, sell_prices, color='red', marker='v', s=100, label='Sell')
             
-        plt.xlabel('Date')
-        plt.ylabel('Price')
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend()
+        plt.scatter(sell_dates, sell_prices, color='red', marker='v', s=100, label='Sell')
+    
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
     
     # Save the plot
     plt.tight_layout()
@@ -1522,7 +1559,7 @@ def main():
     os.makedirs('models/logs', exist_ok=True)
     
     # Load data from TradingView CSV instead of Yahoo Finance
-    full_data = load_tradingview_data("data/trading_view_nq.csv")
+    full_data = load_tradingview_data("data/NQ_2024_unix.csv")
     
     # Check if data loading was successful
     if full_data is None or len(full_data) == 0:

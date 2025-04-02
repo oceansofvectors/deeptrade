@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from typing import Dict, List, Tuple, Optional, Union
 from decimal import Decimal
 import pytz
+from collections import defaultdict
 
 from stable_baselines3 import PPO
 from environment import TradingEnv
@@ -403,225 +404,142 @@ class RiskManager:
 def trade_with_risk_management(
     model_path: str,
     test_data: pd.DataFrame,
-    stop_loss_pct: Optional[float] = None,
-    take_profit_pct: Optional[float] = None,
-    trailing_stop_pct: Optional[float] = None,
+    stop_loss_pct: float = 0.0,
+    take_profit_pct: float = 0.0,
+    trailing_stop_pct: float = 0.0,
     position_size: float = 1.0,
-    max_risk_per_trade_pct: float = 2.0,
+    max_risk_per_trade_pct: float = 0.0,
     initial_balance: float = 10000.0,
     transaction_cost: float = 0.0,
-    verbose: int = 1,
-    deterministic: bool = True,  # Added parameter with default True for trading
-    close_at_end_of_day: bool = False,  # Add parameter to close positions at end of trading day
-    daily_risk_limit: Optional[float] = None  # Add daily risk limit parameter
+    verbose: int = 0,
+    deterministic: bool = True,
+    close_at_end_of_day: bool = True
 ) -> Dict:
     """
-    Trade with risk management using a trained model.
-    
-    This implementation uses portfolio-based risk management:
-    - Stop loss: Exits when unrealized loss reaches stop_loss_pct% of portfolio value
-    - Take profit: Exits when unrealized gain reaches take_profit_pct% of portfolio value
-    - Trailing stop: Tracks highest unrealized profit and exits if profit falls by trailing_stop_pct%
-    - Daily risk limit: Closes all positions and stops trading for the day if daily loss exceeds limit
+    Trade with risk management features enabled.
     
     Args:
-        model_path: Path to the trained model file
-        test_data: Testing dataset
-        stop_loss_pct: Stop loss percentage of portfolio value (None to disable)
-        take_profit_pct: Take profit percentage of portfolio value (None to disable)
-        trailing_stop_pct: Trailing stop percentage (None to disable)
+        model_path: Path to the trained model
+        test_data: DataFrame containing test data
+        stop_loss_pct: Stop loss as percentage of portfolio value (0 to disable)
+        take_profit_pct: Take profit as percentage of portfolio value (0 to disable)
+        trailing_stop_pct: Trailing stop as percentage of highest/lowest price (0 to disable)
         position_size: Position size as a multiplier (1.0 = 100% of available capital)
         max_risk_per_trade_pct: Maximum risk per trade as percentage of portfolio
         initial_balance: Initial portfolio balance
         transaction_cost: Transaction cost as percentage
-        verbose: Verbosity level for logging (default 1)
-        deterministic: Whether to use deterministic action selection (default: True)
-        close_at_end_of_day: Whether to close positions at the end of the trading day (default: False)
-        daily_risk_limit: Maximum dollar loss allowed per trading day (None to disable)
+        verbose: Verbosity level (0=minimal, 1=normal, 2=detailed)
+        deterministic: Whether to use deterministic actions
+        close_at_end_of_day: Whether to close positions at end of day
         
     Returns:
-        Dict: A dictionary containing performance metrics and trade history
+        Dict containing test results
     """
     # Load the model
     model = PPO.load(model_path)
     
-    # Create trading environment
-    env = TradingEnv(
-        test_data,
-        initial_balance=initial_balance,
-        transaction_cost=0.0,  # We'll handle transaction costs in the risk manager
-        position_size=1  # We'll handle position sizing in the risk manager
-    )
-    
-    # Initialize risk manager
+    # Initialize risk manager with risk management parameters
+    # Only enable features that have non-zero values
     risk_manager = RiskManager(
-        stop_loss_pct=stop_loss_pct,
-        take_profit_pct=take_profit_pct,
-        trailing_stop_pct=trailing_stop_pct,
-        position_size=position_size,
-        max_risk_per_trade_pct=max_risk_per_trade_pct,
+        stop_loss_pct=stop_loss_pct if stop_loss_pct and stop_loss_pct > 0 else None,
+        take_profit_pct=take_profit_pct if take_profit_pct and take_profit_pct > 0 else None,
+        trailing_stop_pct=trailing_stop_pct if trailing_stop_pct and trailing_stop_pct > 0 else None,
         initial_balance=initial_balance,
-        transaction_cost=transaction_cost,
-        daily_risk_limit=daily_risk_limit  # Add daily risk limit parameter
+        transaction_cost=transaction_cost
     )
     
-    # Reset environment
+    # Set position size and max risk per trade
+    # Convert to Decimal to prevent type errors
+    risk_manager.position_size = money.to_decimal(position_size)
+    risk_manager.max_risk_per_trade_pct = money.to_decimal(max_risk_per_trade_pct)
+    
+    # Initialize lists to store trade data
+    buy_dates = []
+    buy_prices = []
+    sell_dates = []
+    sell_prices = []
+    exit_reasons = defaultdict(int)
+    
+    # Track unrealistic profits
+    unrealistic_profit_count = 0
+    unrealistic_profit_threshold = 10000.0  # $10,000
+    multiplier_threshold = 2.0  # Allow up to 2x expected max profit
+    
+    # Get the last trading day from the data
+    last_trading_day = test_data.index[-1].date()
+    
+    # Track daily portfolio values
+    daily_portfolio_values = {}
+    
+    # Make sure all column names are consistent
+    if 'close' in test_data.columns and 'Close' not in test_data.columns:
+        # Use lowercase column names consistently
+        required_columns = ['close', 'high', 'low', 'open']
+        column_mapping = {}
+        for col in test_data.columns:
+            if col.lower() in required_columns and col != col.lower():
+                column_mapping[col] = col.lower()
+        if column_mapping:
+            test_data = test_data.rename(columns=column_mapping)
+    elif 'Close' in test_data.columns and 'close' not in test_data.columns:
+        # Use uppercase column names consistently
+        required_columns = ['Close', 'High', 'Low', 'Open']
+        column_mapping = {}
+        for col in test_data.columns:
+            if col.upper() in [c.upper() for c in required_columns] and col != col.upper():
+                column_mapping[col] = col.upper()
+        if column_mapping:
+            test_data = test_data.rename(columns=column_mapping)
+    
+    # Debug log the column names after standardization
+    logger.info(f"Column names after standardization: {test_data.columns.tolist()}")
+    
+    # Initialize environment
+    env = TradingEnv(
+        data=test_data,
+        initial_balance=initial_balance,
+        transaction_cost=transaction_cost
+    )
+    
+    # Get initial observation
     obs, _ = env.reset()
     
-    # Records for plotting
-    dates = [test_data.index[env.current_step]]
-    price_history = [test_data.loc[test_data.index[env.current_step], "Close"]]
-    portfolio_history = [float(risk_manager.net_worth)]  # Convert Decimal to float for plotting
-    buy_dates, buy_prices = [], []
-    sell_dates, sell_prices = [], []
+    # Initialize arrays to store history data
+    dates = []
+    price_history = []
+    portfolio_history = []
+    action_counts = {0: 0, 1: 0, 2: 0}  # Action counts (0=long, 1=short, 2=hold)
     
-    # Track action counts
-    action_counts = {0: 0, 1: 0, 2: 0}  # 0: long/buy, 1: short/sell, 2: hold
-    
-    # Track exit reasons
-    exit_reasons = {
-        "stop_loss": 0,
-        "take_profit": 0,
-        "trailing_stop": 0,
-        "model_signal": 0,
-        "end_of_day": 0,
-        "end_of_period": 0,
-        "daily_risk_limit": 0,  # Add daily risk limit to exit reasons
-        "second_to_last_candle": 0  # Add reason for second-to-last candle exit
-    }
-    
-    # Add flags for monitoring unrealistic profits
-    unrealistic_profit_threshold = money.to_decimal(500)  # $500 per point is unrealistic
-    unrealistic_profit_count = 0
-    last_valid_profit = None
-    multiplier_threshold = money.to_decimal(1.5)  # Convert threshold multiplier to Decimal
-    
-    # Dictionary to track last candles for each trading day
-    eastern = pytz.timezone('US/Eastern')
-    trading_day_candles = {}
-    
-    # Pre-process data to identify the last and second-to-last candles for each trading day
+    # Process each candle
     for i in range(len(test_data)):
-        # Get the date in Eastern Time
-        candle_date = test_data.index[i]
-        if candle_date.tz is None:
-            candle_date = candle_date.tz_localize('UTC')
-        candle_date_et = candle_date.tz_convert(eastern)
+        current_date = test_data.index[i]
+        current_date_et = current_date.tz_convert('America/New_York')
         
-        # Use date as key for identifying trading days
-        trading_day = candle_date_et.date()
-        
-        # Track candle indices for each trading day
-        if trading_day not in trading_day_candles:
-            trading_day_candles[trading_day] = []
-        trading_day_candles[trading_day].append(i)
-    
-    # Identify last and second-to-last candles for each trading day
-    last_candles = {}  # Index of last candle for each trading day
-    second_to_last_candles = {}  # Index of second-to-last candle for each trading day
-    
-    for day, candles in trading_day_candles.items():
-        if len(candles) >= 2:
-            last_candles[day] = candles[-1]
-            second_to_last_candles[day] = candles[-2]
-        elif len(candles) == 1:
-            last_candles[day] = candles[0]
-            # No second-to-last candle for this day
-    
-    if verbose > 0:
-        logger.info(f"Identified {len(trading_day_candles)} trading days in the data")
-        logger.info(f"Will prevent trading on last candle and close positions on second-to-last candle")
-    
-    # Main trading loop
-    while True:
-        # Get current price and date
-        current_index = env.current_step
-        current_price = test_data.loc[test_data.index[current_index], "Close"]
-        current_high = test_data.loc[test_data.index[current_index], "High"]
-        current_low = test_data.loc[test_data.index[current_index], "Low"]
-        current_date = test_data.index[current_index]
-        
-        # Convert to Eastern Time for day detection
-        if current_date.tz is None:
-            current_date_et = current_date.tz_localize('UTC').tz_convert(eastern)
+        # Get price data using the actual column names from the DataFrame
+        if 'CLOSE' in test_data.columns:
+            current_price = test_data['CLOSE'].iloc[i]
+            current_high = test_data['HIGH'].iloc[i]
+            current_low = test_data['LOW'].iloc[i]
+        elif 'Close' in test_data.columns:
+            current_price = test_data['Close'].iloc[i]
+            current_high = test_data['High'].iloc[i]
+            current_low = test_data['Low'].iloc[i]
         else:
-            current_date_et = current_date.tz_convert(eastern)
-        current_day = current_date_et.date()
-        
-        # Check if this is the second-to-last candle of the day
-        is_second_to_last_candle = second_to_last_candles.get(current_day) == current_index
+            current_price = test_data['close'].iloc[i]
+            current_high = test_data['high'].iloc[i]
+            current_low = test_data['low'].iloc[i]
         
         # Check if this is the last candle of the day
-        is_last_candle = last_candles.get(current_day) == current_index
+        is_last_candle = current_date.date() == last_trading_day and i == len(test_data) - 1
+        is_second_to_last_candle = current_date.date() == last_trading_day and i == len(test_data) - 2
         
-        # For debugging
-        if verbose > 1 and (is_second_to_last_candle or is_last_candle):
-            if is_second_to_last_candle:
-                logger.info(f"Second-to-last candle detected at {current_date_et}")
-            if is_last_candle:
-                logger.info(f"Last candle detected at {current_date_et}")
+        # Update daily portfolio value
+        if current_date.date() not in daily_portfolio_values:
+            daily_portfolio_values[current_date.date()] = risk_manager.net_worth
         
-        # Check daily risk limit first
-        daily_limit_exceeded, daily_limit_reason = risk_manager.check_daily_risk_limit(current_date)
-        if daily_limit_exceeded:
-            # Close any open position
-            if risk_manager.position != 0:
-                # For daily risk limit, use close price
-                exit_price = current_price
-                
-                # Record portfolio value before exit for profit checking
-                portfolio_before_exit = risk_manager.net_worth
-                
-                # Exit position
-                risk_manager.exit_position(exit_price, current_date, daily_limit_reason)
-                
-                # Calculate profit from this trade
-                trade_profit = risk_manager.net_worth - portfolio_before_exit
-                
-                # Check for unrealistic profits
-                price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-                expected_max_profit = price_diff * money.to_decimal(20)  # $20 per point for NQ
-                
-                if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
-                    unrealistic_profit_count += 1
-                    logger.warning(f"Unrealistic profit detected: ${float(trade_profit):.2f} "
-                                  f"from price change of {price_diff:.2f} points. "
-                                  f"Expected max: ${expected_max_profit:.2f}")
-                
-                # Record exit
-                if risk_manager.position == 1:  # Was long, now exiting
-                    sell_dates.append(current_date)
-                    sell_prices.append(exit_price)
-                else:  # Was short, now exiting
-                    buy_dates.append(current_date)
-                    buy_prices.append(exit_price)
-                    
-                # Count exit reason
-                exit_reasons[daily_limit_reason] += 1
-            
-            # Skip trading for the rest of the day
-            risk_manager.daily_trading_enabled = False
-            logger.info(f"Daily risk limit exceeded. Stopping trading for the day at {current_date}")
-            
-            # Take a step in the environment to advance to next day
-            obs, _, terminated, truncated, _ = env.step(2)  # Use hold action
-            done = terminated or truncated
-            
-            # Record data for plotting
-            dates.append(current_date)
-            price_history.append(current_price)
-            portfolio_history.append(float(risk_manager.net_worth))
-            
-            if done:
-                break
-            continue
-        
-        # Check if we need to exit based on risk management rules
-        exit_triggered, exit_reason = risk_manager.check_exits(
-            close_price=current_price,
-            high_price=current_high,
-            low_price=current_low
-        )
+        # Update stops and check for exits
+        risk_manager.update_stops(current_price, current_high, current_low)
+        exit_triggered, exit_reason = risk_manager.check_exits(current_price, current_high, current_low)
         
         if exit_triggered:
             # For exit price, use the appropriate price based on exit reason and position
@@ -663,7 +581,7 @@ def trade_with_risk_management(
                     exit_price = risk_manager.entry_price - target_profit_points
                 
                 logging.info(f"Take profit at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}, points={float(target_profit_points)}")
-            elif exit_reason == "trailing_stop":
+            elif exit_reason == "trailing_stop" and trailing_stop_pct and trailing_stop_pct > 0:  # Only use trailing stop if enabled
                 exit_price = current_low  # Use low price for trailing stop (worst case)
             
             # Record portfolio value before exit for profit checking
@@ -677,7 +595,7 @@ def trade_with_risk_management(
             
             # Check for unrealistic profits
             price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-            expected_max_profit = price_diff * money.to_decimal(20)  # $20 per point for NQ
+            expected_max_profit = price_diff * money.to_decimal(20)
             
             if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
                 unrealistic_profit_count += 1
@@ -704,7 +622,12 @@ def trade_with_risk_management(
                     logger.info(f"Second-to-last candle of day detected at {current_date_et}. Closing position.")
                 
                 # For second-to-last candle exit, use open price instead of close price
-                exit_price = test_data.loc[test_data.index[current_index], "Open"]
+                if 'OPEN' in test_data.columns:
+                    exit_price = test_data.loc[test_data.index[i], "OPEN"]
+                elif 'Open' in test_data.columns:
+                    exit_price = test_data.loc[test_data.index[i], "Open"]
+                else:
+                    exit_price = test_data.loc[test_data.index[i], "open"]
                 
                 # Record portfolio value before exit for profit checking
                 portfolio_before_exit = risk_manager.net_worth
@@ -755,118 +678,96 @@ def trade_with_risk_management(
                         low_price=current_low
                     )
                 
-                # Process model's action
-                if current_action == 0:  # Model suggests long
-                    if risk_manager.position == -1:  # Currently short, need to exit
-                        # For short exit on model signal, use the close price
-                        exit_price = current_price  # Use closing price for model signal exits
-                        
-                        # Record portfolio value before exit for profit checking
+                # Process the model's action
+                if is_last_candle or is_second_to_last_candle:
+                    # On last or second-to-last candle, only exit positions, no new entries
+                    if risk_manager.position != 0:
+                        exit_price = current_price
                         portfolio_before_exit = risk_manager.net_worth
-                        
-                        # Exit short position
-                        risk_manager.exit_position(exit_price, current_date, "model_signal")
-                        
-                        # Calculate profit from this trade
+                        reason = "last_candle" if is_last_candle else "second_to_last_candle"
+                        risk_manager.exit_position(exit_price, current_date, reason)
                         trade_profit = risk_manager.net_worth - portfolio_before_exit
-                        
-                        # Check for unrealistic profits
-                        price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-                        expected_max_profit = price_diff * money.to_decimal(20)  # $20 per point for NQ
-                        
-                        if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
-                            unrealistic_profit_count += 1
-                            logger.warning(f"Unrealistic profit detected: ${float(trade_profit):.2f} "
-                                          f"from price change of {price_diff:.2f} points. "
-                                          f"Expected max: ${expected_max_profit:.2f}")
-                        
-                        exit_reasons["model_signal"] += 1
-                        
-                        # Record exit
-                        buy_dates.append(current_date)
-                        buy_prices.append(exit_price)
-                        
-                    elif risk_manager.position == 0:  # Not in a position, enter long
-                        # Calculate position size
-                        contracts = risk_manager.calculate_position_size(current_price)
-                        
-                        # Only enter position if contracts > 0 (sufficient portfolio size)
-                        if contracts > 0:
-                            # Enter long position
-                            risk_manager.enter_position(1, current_price, current_date, contracts)
+                        logger.info(f"{reason} trade P&L: ${float(trade_profit):.2f}")
+                        exit_reasons[reason] += 1
+                        logger.info(f"Position closed at {reason}. Exit reason recorded: {reason}")
+                else:
+                    # Normal trading logic for non-end-of-day candles
+                    if current_action == 0:  # Long signal
+                        if risk_manager.position != 1:  # Only enter if not already long
+                            # First exit any existing position
+                            if risk_manager.position != 0:
+                                risk_manager.exit_position(current_price, current_date, "signal_change")
                             
-                            # Record entry
-                            buy_dates.append(current_date)
-                            buy_prices.append(current_price)
-                        else:
-                            logger.warning(f"Skipped entering long position - insufficient portfolio size (${float(risk_manager.net_worth):.2f})")
-                    
-                elif current_action == 1:  # Model suggests short
-                    if risk_manager.position == 1:  # Currently long, need to exit
-                        # For long exit on model signal, use the close price
-                        exit_price = current_price  # Use closing price for model signal exits
-                        
-                        # Record portfolio value before exit for profit checking
-                        portfolio_before_exit = risk_manager.net_worth
-                        
-                        # Exit long position
-                        risk_manager.exit_position(exit_price, current_date, "model_signal")
-                        
-                        # Calculate profit from this trade
-                        trade_profit = risk_manager.net_worth - portfolio_before_exit
-                        
-                        # Check for unrealistic profits
-                        price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-                        expected_max_profit = price_diff * money.to_decimal(20)  # $20 per point for NQ
-                        
-                        if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
-                            unrealistic_profit_count += 1
-                            logger.warning(f"Unrealistic profit detected: ${float(trade_profit):.2f} "
-                                          f"from price change of {price_diff:.2f} points. "
-                                          f"Expected max: ${expected_max_profit:.2f}")
-                        
-                        exit_reasons["model_signal"] += 1
-                        
-                        # Record exit
-                        sell_dates.append(current_date)
-                        sell_prices.append(exit_price)
-                        
-                    elif risk_manager.position == 0:  # Not in a position, enter short
-                        # Calculate position size
-                        contracts = risk_manager.calculate_position_size(current_price)
-                        
-                        # Only enter position if contracts > 0 (sufficient portfolio size)
-                        if contracts > 0:
-                            # Enter short position
-                            risk_manager.enter_position(-1, current_price, current_date, contracts)
+                            # Then enter long position
+                            contracts = risk_manager.calculate_position_size(current_price)
+                            if contracts > 0:
+                                risk_manager.enter_position(1, current_price, current_date, contracts)
+                                buy_dates.append(current_date)
+                                buy_prices.append(current_price)
+                            else:
+                                logger.warning(f"Insufficient portfolio size to enter long position at {current_date_et}")
+                    elif current_action == 1:  # Short signal
+                        if risk_manager.position != -1:  # Only enter if not already short
+                            # First exit any existing position
+                            if risk_manager.position != 0:
+                                risk_manager.exit_position(current_price, current_date, "signal_change")
                             
-                            # Record entry
-                            sell_dates.append(current_date)
-                            sell_prices.append(current_price)
-                        else:
-                            logger.warning(f"Skipped entering short position - insufficient portfolio size (${float(risk_manager.net_worth):.2f})")
-                
-                else:  # Model suggests hold (action 2)
-                    # No position change, just maintain current position
-                    pass
+                            # Then enter short position
+                            contracts = risk_manager.calculate_position_size(current_price)
+                            if contracts > 0:
+                                risk_manager.enter_position(-1, current_price, current_date, contracts)
+                                sell_dates.append(current_date)
+                                sell_prices.append(current_price)
+                            else:
+                                logger.warning(f"Insufficient portfolio size to enter short position at {current_date_et}")
+                    else:  # Model suggests hold (action 2)
+                        # No position change, just maintain current position
+                        pass
             # If we're on the last candle of the day or second-to-last candle, hold
             else:
                 if verbose > 1:
                     if is_last_candle:
-                        logger.info(f"Last candle of the day: {current_date_et}. Holding position (no new trades).")
+                        logger.info(f"Last candle of the day: {current_date_et}. Closing any open positions.")
+                        # Close any open position on the last candle
+                        if risk_manager.position != 0:
+                            # For last candle exit, use close price
+                            exit_price = current_price
+                            
+                            # Record portfolio value before exit for profit checking
+                            portfolio_before_exit = risk_manager.net_worth
+                            
+                            # Exit position with last_candle reason
+                            risk_manager.exit_position(exit_price, current_date, "last_candle")
+                            
+                            # Calculate actual profit/loss from this trade
+                            trade_profit = risk_manager.net_worth - portfolio_before_exit
+                            logger.info(f"Last candle trade P&L: ${float(trade_profit):.2f}")
+                            
+                            # Record exit
+                            if risk_manager.position == 1:  # Was long, now exiting
+                                sell_dates.append(current_date)
+                                sell_prices.append(exit_price)
+                            else:  # Was short, now exiting
+                                buy_dates.append(current_date)
+                                buy_prices.append(exit_price)
+                            
+                            # Count exit reason
+                            exit_reasons["last_candle"] += 1
+                            logger.info(f"Position closed at last candle. Exit reason recorded: last_candle")
                     elif is_second_to_last_candle:
                         logger.info(f"Second-to-last candle of the day: {current_date_et}. Holding position (no new trades).")
-                
-                # Force hold action on last candle
-                current_action = 2
-                action_counts[2] += 1
-        else:
-            # If trading is disabled for the day, use hold action
-            action = 2
-            action_counts[2] += 1
+                        # On second-to-last candle, we should exit any open position
+                        if risk_manager.position != 0:
+                            exit_price = current_price
+                            portfolio_before_exit = risk_manager.net_worth
+                            risk_manager.exit_position(exit_price, current_date, "second_to_last_candle")
+                            trade_profit = risk_manager.net_worth - portfolio_before_exit
+                            logger.info(f"Second-to-last candle trade P&L: ${float(trade_profit):.2f}")
+                            exit_reasons["second_to_last_candle"] += 1
+                            logger.info(f"Position closed at second-to-last candle. Exit reason recorded: second_to_last_candle")
         
         # Take a step in the environment
-        obs, _, terminated, truncated, _ = env.step(int(action))
+        obs, _, terminated, truncated, _ = env.step(2)  # Use hold action
         done = terminated or truncated
         
         # Record data for plotting
@@ -916,8 +817,8 @@ def trade_with_risk_management(
             current_date_eastern = current_date.tz_convert(eastern)
             
             # Get next timestamp in eastern time
-            if current_index + 1 < len(test_data):
-                next_date_eastern = test_data.index[current_index + 1].tz_convert(eastern)
+            if i + 1 < len(test_data):
+                next_date_eastern = test_data.index[i + 1].tz_convert(eastern)
             else:
                 next_date_eastern = None
             
@@ -1220,38 +1121,34 @@ def save_trade_history(trade_history: List[Dict], filename: str = "risk_managed_
     # Some might have 'action' field, others might have 'trade_type' field
     action_field = 'action' if 'action' in trade_history_df.columns else 'trade_type'
     
-    # Check if the required columns for grouping exist
-    if 'date' in trade_history_df.columns and action_field in trade_history_df.columns:
-        # Filter out duplicate trades
-        # After analyzing the data, we understand that:
-        # 1. Same timestamp, same action: This is a duplicate and we should keep only one (preferably with profit/exit_reason)
-        # 2. Same timestamp, different actions: This is NOT a duplicate - it's an exit of one position and entry of another
+    # Ensure exit_reason is included in the output
+    if 'exit_reason' not in trade_history_df.columns:
+        trade_history_df['exit_reason'] = None
         
-        filtered_df = pd.DataFrame()
+    # Ensure we have position_from and position_to columns
+    if 'position_from' not in trade_history_df.columns:
+        trade_history_df['position_from'] = 0
+    if 'position_to' not in trade_history_df.columns:
+        trade_history_df['position_to'] = 0
         
-        # Group by date and action to find duplicates with same timestamp and action
-        grouped = trade_history_df.groupby(['date', action_field])
-        
-        for (date, action), group in grouped:
-            if len(group) > 1:
-                # Duplicate entries with same timestamp and action
-                # Keep the one with profit/exit_reason if available
-                if 'profit' in group.columns and group['profit'].notna().any():
-                    filtered_df = pd.concat([filtered_df, group[group['profit'].notna()]])
-                else:
-                    # If no profit info, keep the first one
-                    filtered_df = pd.concat([filtered_df, group.iloc[[0]]])
+    # Calculate position changes
+    for i in range(len(trade_history_df)):
+        if i > 0:
+            prev_trade = trade_history_df.iloc[i-1]
+            curr_trade = trade_history_df.iloc[i]
+            
+            # If this is an exit trade (has exit_reason)
+            if 'exit_reason' in curr_trade and pd.notna(curr_trade['exit_reason']):
+                # Set position_from based on the previous trade's position_to
+                trade_history_df.at[i, 'position_from'] = prev_trade['position_to']
+                # Set position_to to 0 for exits
+                trade_history_df.at[i, 'position_to'] = 0
             else:
-                # Not a duplicate, keep it
-                filtered_df = pd.concat([filtered_df, group])
-                
-        # Use the filtered dataframe if it's not empty
-        if not filtered_df.empty:
-            trade_history_df = filtered_df
-    else:
-        # If we don't have the required columns for grouping, just use the original DataFrame
-        pass
-        
+                # For entry trades, set position_from to 0
+                trade_history_df.at[i, 'position_from'] = 0
+                # Set position_to based on the action
+                trade_history_df.at[i, 'position_to'] = 1 if curr_trade[action_field] == 'buy' else -1
+    
     # Save to CSV
     trade_history_df.to_csv(filename, index=False)
     logging.info(f"Trade history saved to {filename}")

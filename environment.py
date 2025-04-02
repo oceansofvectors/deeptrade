@@ -146,11 +146,26 @@ class TradingEnv(gym.Env):
         Returns:
             np.ndarray: Array with [close_norm, technical_indicators..., position].
         """
-        # Start with close_norm
-        close_norm = self.data.loc[self.current_step, "close_norm"]
+        # Get close_norm value - check for any capitalization variant
+        if "CLOSE_NORM" in self.data.columns:
+            close_norm = self.data.loc[self.current_step, "CLOSE_NORM"]
+        elif "Close_norm" in self.data.columns:
+            close_norm = self.data.loc[self.current_step, "Close_norm"]
+        else:
+            close_norm = self.data.loc[self.current_step, "close_norm"]
         
         # Add all technical indicators
-        indicators = [self.data.loc[self.current_step, indicator] for indicator in self.technical_indicators]
+        indicators = []
+        for indicator in self.technical_indicators:
+            # For each indicator, try to find it in any capitalization format
+            if indicator in self.data.columns:
+                indicators.append(self.data.loc[self.current_step, indicator])
+            elif indicator.lower() in self.data.columns:
+                indicators.append(self.data.loc[self.current_step, indicator.lower()])
+            elif indicator.upper() in self.data.columns:
+                indicators.append(self.data.loc[self.current_step, indicator.upper()])
+            elif indicator.capitalize() in self.data.columns:
+                indicators.append(self.data.loc[self.current_step, indicator.capitalize()])
         
         # Add position
         position = float(self.position)
@@ -178,8 +193,13 @@ class TradingEnv(gym.Env):
         # Store the previous net worth for reward calculation
         self.previous_net_worth = self.net_worth
 
-        # Current price based on actual 'Close'
-        current_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
+        # Current price - check for any capitalization of 'Close'/'close'/'CLOSE'
+        if 'CLOSE' in self.data.columns:
+            current_price = money.to_decimal(self.data.loc[self.current_step, "CLOSE"])
+        elif 'Close' in self.data.columns:
+            current_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
+        else:
+            current_price = money.to_decimal(self.data.loc[self.current_step, "close"])
         
         # Track old position to detect changes for transaction cost
         old_position = self.position
@@ -211,7 +231,13 @@ class TradingEnv(gym.Env):
         
         # Calculate portfolio value change based on position and price change
         if self.current_step < self.total_steps:
-            next_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
+            # Next price - check for any capitalization of 'Close'/'close'/'CLOSE'
+            if 'CLOSE' in self.data.columns:
+                next_price = money.to_decimal(self.data.loc[self.current_step, "CLOSE"])
+            elif 'Close' in self.data.columns:
+                next_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
+            else:
+                next_price = money.to_decimal(self.data.loc[self.current_step, "close"])
             
             # Calculate price change using the same function as in RiskManager
             if self.position != 0:  # Only if we have an active position

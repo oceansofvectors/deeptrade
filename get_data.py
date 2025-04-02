@@ -161,25 +161,43 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
     try:
         logger.info("Processing technical indicators")
         
-        # Check if we have the required columns
-        required_cols = ['Open', 'High', 'Low', 'Close']
-        if not all(col in df.columns for col in required_cols):
+        # Check if we have the required columns - allow for both uppercase and lowercase
+        required_caps = ['Open', 'High', 'Low', 'Close']
+        required_lower = ['open', 'high', 'low', 'close']
+        
+        if all(col in df.columns for col in required_caps):
+            # We have uppercase column names
+            price_cols = required_caps
+            logger.info("Using uppercase price column names")
+        elif all(col in df.columns for col in required_lower):
+            # We have lowercase column names
+            price_cols = required_lower
+            logger.info("Using lowercase price column names")
+        else:
             logger.error(f"Missing required columns for indicator processing. Available: {df.columns.tolist()}")
             return df
         
+        # Use the detected column names
+        open_col = price_cols[0]  # 'Open' or 'open'
+        high_col = price_cols[1]  # 'High' or 'high'
+        low_col = price_cols[2]   # 'Low' or 'low'
+        close_col = price_cols[3] # 'Close' or 'close'
+        
         # Fill NaN values in price columns
-        for col in required_cols:
+        for col in price_cols:
             if df[col].isna().any():
                 logger.warning(f"Found NaN values in {col} column. Filling with forward fill.")
                 df[col] = df[col].fillna(method='ffill')
         
         # Add 'Volume' column with defaults if not present
-        if 'Volume' not in df.columns:
+        volume_col = 'Volume' if 'Volume' in df.columns else 'volume' if 'volume' in df.columns else None
+        if volume_col is None:
             logger.warning("Volume column not found. Adding placeholder values.")
-            df['Volume'] = 1000  # Default volume
+            df['volume'] = 1000  # Default volume
+            volume_col = 'volume'
         
-        # Calculate normalized close
-        df['close_norm'] = df['Close'].pct_change().fillna(0)
+        # Calculate normalized close - create lowercase version for consistency
+        df['close_norm'] = df[close_col].pct_change().fillna(0)
         
         # Add trend direction based on price movement
         df['trend_direction'] = np.sign(df['close_norm']).fillna(0).astype(int)
@@ -200,7 +218,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 if df['RSI'].max() > 1:
                     df['RSI'] = df['RSI'] / 100.0
             else:
-                df['RSI'] = ta.rsi(df['Close'], length=config["indicators"]["rsi"]["length"]) / 100.0
+                df['RSI'] = ta.rsi(df[close_col], length=config["indicators"]["rsi"]["length"]) / 100.0
         else:
             df['RSI'] = 0.0
             
@@ -212,7 +230,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                     max_abs = max(abs(df['CCI'].max()), abs(df['CCI'].min()))
                     df['CCI'] = df['CCI'] / max_abs
             else:
-                df['CCI'] = ta.cci(df['High'], df['Low'], df['Close'], 
+                df['CCI'] = ta.cci(df[high_col], df[low_col], df[close_col], 
                                    length=config["indicators"]["cci"]["length"]) / 100.0
         
         # ADX (Average Directional Index)
@@ -223,7 +241,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                     df['ADX'] = df['ADX'] / 100.0
             else:
                 adx_length = config["indicators"]["adx"]["length"]
-                adx_result = ta.adx(df['High'], df['Low'], df['Close'], length=adx_length)
+                adx_result = ta.adx(df[high_col], df[low_col], df[close_col], length=adx_length)
                 
                 # Check the actual column names in the result
                 logger.info(f"ADX result columns: {adx_result.columns}")
@@ -243,7 +261,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 else:
                     if 'adx_result' not in locals():
                         adx_length = config["indicators"]["adx"]["length"]
-                        adx_result = ta.adx(df['High'], df['Low'], df['Close'], length=adx_length)
+                        adx_result = ta.adx(df[high_col], df[low_col], df[close_col], length=adx_length)
                     
                     if f'DMP_{adx_length}' in adx_result.columns:
                         df['ADX_POS'] = adx_result[f'DMP_{adx_length}'] / 100.0
@@ -258,7 +276,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 else:
                     if 'adx_result' not in locals():
                         adx_length = config["indicators"]["adx"]["length"]
-                        adx_result = ta.adx(df['High'], df['Low'], df['Close'], length=adx_length)
+                        adx_result = ta.adx(df[high_col], df[low_col], df[close_col], length=adx_length)
                     
                     if f'DMN_{adx_length}' in adx_result.columns:
                         df['ADX_NEG'] = adx_result[f'DMN_{adx_length}'] / 100.0
@@ -283,7 +301,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                         df['STOCH_D'] = df['STOCH_D'] / 100.0
             else:
                 # Calculate stochastic indicators
-                stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=k_length, d=d_length, smooth_k=3)
+                stoch = ta.stoch(df[high_col], df[low_col], df[close_col], k=k_length, d=d_length, smooth_k=3)
                 
                 # Check the actual column names in the result
                 logger.info(f"Stochastic result columns: {stoch.columns}")
@@ -326,7 +344,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                     df['MACD_HIST'] = df['Histogram']
             else:
                 # Calculate MACD
-                macd = ta.macd(df['Close'], 
+                macd = ta.macd(df[close_col], 
                                fast=config["indicators"]["macd"]["fast"], 
                                slow=config["indicators"]["macd"]["slow"], 
                                signal=config["indicators"]["macd"]["signal"])
@@ -367,7 +385,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 if max_abs > 1:
                     df['ROC'] = df['ROC'] / max_abs
             else:
-                df['ROC'] = ta.roc(df['Close'], length=config["indicators"]["roc"]["length"])
+                df['ROC'] = ta.roc(df[close_col], length=config["indicators"]["roc"]["length"])
                 
                 # Normalize ROC
                 max_abs = max(abs(df['ROC'].max()), abs(df['ROC'].min()))
@@ -381,7 +399,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 if df['WILLIAMS_R'].min() < -1:
                     df['WILLIAMS_R'] = df['WILLIAMS_R'] / 100.0
             else:
-                df['WILLIAMS_R'] = ta.willr(df['High'], df['Low'], df['Close'], 
+                df['WILLIAMS_R'] = ta.willr(df[high_col], df[low_col], df[close_col], 
                                            length=config["indicators"]["williams_r"]["length"]) / 100.0
         
         # SMA (Simple Moving Average)
@@ -389,22 +407,22 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             sma_length = config["indicators"]["sma"]["length"]
             if 'SMA' in df.columns:
                 # Use existing SMA data
-                df['SMA_NORM'] = (df['Close'] - df['SMA']) / df['Close']
+                df['SMA_NORM'] = (df[close_col] - df['SMA']) / df[close_col]
             else:
-                df['SMA'] = ta.sma(df['Close'], length=sma_length)
+                df['SMA'] = ta.sma(df[close_col], length=sma_length)
                 # Normalize SMA relative to close price
-                df['SMA_NORM'] = (df['Close'] - df['SMA']) / df['Close']
+                df['SMA_NORM'] = (df[close_col] - df['SMA']) / df[close_col]
         
         # EMA (Exponential Moving Average)
         if config["indicators"].get("ema", {}).get("enabled", False):
             ema_length = config["indicators"]["ema"]["length"]
             if 'EMA' in df.columns:
                 # Use existing EMA data
-                df['EMA_NORM'] = (df['Close'] - df['EMA']) / df['Close']
+                df['EMA_NORM'] = (df[close_col] - df['EMA']) / df[close_col]
             else:
-                df['EMA'] = ta.ema(df['Close'], length=ema_length)
+                df['EMA'] = ta.ema(df[close_col], length=ema_length)
                 # Normalize EMA relative to close price
-                df['EMA_NORM'] = (df['Close'] - df['EMA']) / df['Close']
+                df['EMA_NORM'] = (df[close_col] - df['EMA']) / df[close_col]
         
         # Disparity Index
         if config["indicators"].get("disparity", {}).get("enabled", False):
@@ -414,28 +432,28 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             else:
                 if 'SMA' not in df.columns:
                     sma_length = config["indicators"].get("sma", {}).get("length", 20)
-                    df['SMA'] = ta.sma(df['Close'], length=sma_length)
-                df['DISPARITY'] = ((df['Close'] / df['SMA']) - 1)
+                    df['SMA'] = ta.sma(df[close_col], length=sma_length)
+                df['DISPARITY'] = ((df[close_col] / df['SMA']) - 1)
         
         # ATR (Average True Range)
         if config["indicators"].get("atr", {}).get("enabled", False):
             if 'ATR' in df.columns:
                 # Use existing ATR data, normalize if needed
-                df['ATR'] = df['ATR'] / df['Close']
+                df['ATR'] = df['ATR'] / df[close_col]
             else:
                 atr_length = config["indicators"]["atr"]["length"]
-                atr = ta.atr(df['High'], df['Low'], df['Close'], length=atr_length)
+                atr = ta.atr(df[high_col], df[low_col], df[close_col], length=atr_length)
                 
                 # Check if atr is a Series or DataFrame
                 if isinstance(atr, pd.Series):
-                    df['ATR'] = atr / df['Close']
+                    df['ATR'] = atr / df[close_col]
                 else:
                     # If it's a DataFrame, get the first column
                     logger.info(f"ATR result columns: {atr.columns}")
                     if f'ATR_{atr_length}' in atr.columns:
-                        df['ATR'] = atr[f'ATR_{atr_length}'] / df['Close']
+                        df['ATR'] = atr[f'ATR_{atr_length}'] / df[close_col]
                     else:
-                        df['ATR'] = atr.iloc[:, 0] / df['Close']
+                        df['ATR'] = atr.iloc[:, 0] / df[close_col]
         
         # OBV (On-Balance Volume)
         if config["indicators"].get("obv", {}).get("enabled", False):
@@ -448,7 +466,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 else:
                     df['OBV_NORM'] = 0
             else:
-                df['OBV'] = ta.obv(df['Close'], df['Volume'])
+                df['OBV'] = ta.obv(df[close_col], df[volume_col])
                 # Normalize OBV
                 max_obv = df['OBV'].max()
                 min_obv = df['OBV'].min()
@@ -463,19 +481,19 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 # Use existing CMF data
                 pass
             else:
-                df['CMF'] = ta.cmf(df['High'], df['Low'], df['Close'], df['Volume'], 
+                df['CMF'] = ta.cmf(df[high_col], df[low_col], df[close_col], df[volume_col], 
                                    length=config["indicators"]["cmf"]["length"])
         
         # PSAR (Parabolic SAR)
         if config["indicators"].get("psar", {}).get("enabled", False):
             if 'PSAR' in df.columns:
                 # Use existing PSAR data
-                df['PSAR_NORM'] = (df['Close'] - df['PSAR']) / df['Close']
-                df['PSAR_DIR'] = np.where(df['Close'] > df['PSAR'], 1, -1)
+                df['PSAR_NORM'] = (df[close_col] - df['PSAR']) / df[close_col]
+                df['PSAR_DIR'] = np.where(df[close_col] > df['PSAR'], 1, -1)
             else:
                 af = config["indicators"]["psar"]["af"]
                 max_af = config["indicators"]["psar"]["max_af"]
-                psar = ta.psar(df['High'], df['Low'], af=af, max_af=max_af)
+                psar = ta.psar(df[high_col], df[low_col], af=af, max_af=max_af)
                 
                 # Check the actual column names in the result
                 logger.info(f"PSAR result columns: {psar.columns}")
@@ -492,9 +510,9 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 else:
                     df['PSAR'] = psar[psar_col]
                     
-                df['PSAR_NORM'] = (df['Close'] - df['PSAR']) / df['Close']
+                df['PSAR_NORM'] = (df[close_col] - df['PSAR']) / df[close_col]
                 # Create a direction indicator (1 if price above PSAR, -1 if below)
-                df['PSAR_DIR'] = np.where(df['Close'] > df['PSAR'], 1, -1)
+                df['PSAR_DIR'] = np.where(df[close_col] > df['PSAR'], 1, -1)
         
         # Volume indicator
         if config["indicators"].get("volume", {}).get("enabled", False):
@@ -504,10 +522,10 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             else:
                 # Calculate volume moving average
                 ma_length = config["indicators"]["volume"].get("ma_length", 20)
-                volume_ma = ta.sma(df['Volume'], length=ma_length)
+                volume_ma = ta.sma(df[volume_col], length=ma_length)
                 
                 # Normalize volume using moving average
-                df['VOLUME_NORM'] = (df['Volume'] / volume_ma) - 1
+                df['VOLUME_NORM'] = (df[volume_col] / volume_ma) - 1
         
         # Fill NaN values with appropriate defaults
         df = df.fillna(0)

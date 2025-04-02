@@ -15,13 +15,13 @@ data:
   symbol: "NQ=F"
   period: "60d"
   interval: "5m"
-  train_ratio: 0.8
-  validation_ratio: 0.1
+  train_ratio: 0.7
+  validation_ratio: 0.2
   market_hours_only: true  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
 
 indicators:
   supertrend:
-    enabled: true
+    enabled: false
     length: 10
     multiplier: 3
   rsi:
@@ -75,7 +75,7 @@ indicators:
     af: 0.02
     max_af: 0.2
   volume:
-    enabled: true
+    enabled: false
     ma_length: 20  
 
 environment:
@@ -94,22 +94,22 @@ model:
 # Risk management configuration for trade.py
 risk_management:
   # Enable/disable risk management features
-  enabled: false  # Master switch to enable/disable all risk management
+  enabled: true  # Master switch to enable/disable all risk management
   
   # Daily risk limit configuration
   daily_risk_limit:
-    enabled: true  # Enable/disable daily risk limit
+    enabled: false  # Enable/disable daily risk limit
     max_daily_loss: 1000.0  # Maximum dollar loss allowed per trading day
   
   # Stop loss configuration
   stop_loss:
     enabled: false
-    percentage: 10  # Stop loss as percentage of portfolio value
+    percentage: 2  # Stop loss as percentage of portfolio value
   
   # Take profit configuration
   take_profit:
-    enabled: false
-    percentage: 10  # Take profit as percentage of portfolio value
+    enabled: true
+    percentage: 20  # Take profit as percentage of portfolio value
   
   # Trailing stop loss configuration
   trailing_stop:
@@ -126,7 +126,7 @@ risk_management:
 walk_forward:
   enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
   window_size: 30  # Size of each walk-forward window in trading days (NYSE business days)
-  step_size: 7     # Number of trading days to step forward at each iteration (NYSE business days)
+  step_size: 14    # Number of trading days to step forward at each iteration (NYSE business days)
   parallel_processing:
     enabled: true   # Enable parallel processing of walk-forward windows
     n_processes: 0  # Number of processes to use (0 = auto-detect based on CPU cores)
@@ -134,7 +134,7 @@ walk_forward:
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: true  # Set to true to enable hyperparameter tuning during training
+  enabled: false  # Set to true to enable hyperparameter tuning during training
   n_trials: 30     # Number of trials for the optimization
   parallel_processing:
     enabled: true  # Whether to run trials in parallel
