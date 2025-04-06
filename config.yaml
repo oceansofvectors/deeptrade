@@ -125,8 +125,8 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
-  window_size: 30  # Size of each walk-forward window in trading days (NYSE business days)
-  step_size: 14    # Number of trading days to step forward at each iteration (NYSE business days)
+  window_size: 90  # Size of each walk-forward window in trading days (NYSE business days)
+  step_size: 30    # Number of trading days to step forward at each iteration (NYSE business days)
   parallel_processing:
     enabled: true   # Enable parallel processing of walk-forward windows
     n_processes: 0  # Number of processes to use (0 = auto-detect based on CPU cores)
