@@ -413,7 +413,8 @@ def trade_with_risk_management(
     transaction_cost: float = 0.0,
     verbose: int = 0,
     deterministic: bool = True,
-    close_at_end_of_day: bool = True
+    close_at_end_of_day: bool = True,
+    daily_risk_limit: Optional[float] = None
 ) -> Dict:
     """
     Trade with risk management features enabled.
@@ -431,6 +432,7 @@ def trade_with_risk_management(
         verbose: Verbosity level (0=minimal, 1=normal, 2=detailed)
         deterministic: Whether to use deterministic actions
         close_at_end_of_day: Whether to close positions at end of day
+        daily_risk_limit: Maximum dollar loss allowed per trading day (None to disable)
         
     Returns:
         Dict containing test results
@@ -445,7 +447,8 @@ def trade_with_risk_management(
         take_profit_pct=take_profit_pct if take_profit_pct and take_profit_pct > 0 else None,
         trailing_stop_pct=trailing_stop_pct if trailing_stop_pct and trailing_stop_pct > 0 else None,
         initial_balance=initial_balance,
-        transaction_cost=transaction_cost
+        transaction_cost=transaction_cost,
+        daily_risk_limit=daily_risk_limit if daily_risk_limit and daily_risk_limit > 0 else None
     )
     
     # Set position size and max risk per trade
@@ -528,6 +531,23 @@ def trade_with_risk_management(
             current_price = test_data['close'].iloc[i]
             current_high = test_data['high'].iloc[i]
             current_low = test_data['low'].iloc[i]
+        
+        # Check daily risk limit
+        daily_limit_exceeded, limit_reason = risk_manager.check_daily_risk_limit(current_date)
+        if daily_limit_exceeded:
+            risk_manager.daily_trading_enabled = False
+            # Close any open positions when daily risk limit is exceeded
+            if risk_manager.position != 0:
+                logger.warning(f"Closing position due to exceeded daily risk limit at {current_date_et}")
+                risk_manager.exit_position(current_price, current_date, "daily_risk_limit")
+                # Record exit
+                if risk_manager.position == 1:  # Was long, now exiting
+                    sell_dates.append(current_date)
+                    sell_prices.append(current_price)
+                else:  # Was short, now exiting
+                    buy_dates.append(current_date)
+                    buy_prices.append(current_price)
+                exit_reasons["daily_risk_limit"] += 1
         
         # Check if this is the last candle of the day
         is_last_candle = current_date.date() == last_trading_day and i == len(test_data) - 1
