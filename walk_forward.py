@@ -85,12 +85,18 @@ def load_tradingview_data(csv_filepath: str = "data/data/NQ_2024_unix.csv") -> p
         logger.info(f"Raw TradingView data columns: {df.columns.tolist()}")
         
         # Check if we have the required columns
-        required_cols = ['time', 'open', 'high', 'low', 'close']
+        required_cols = ['open', 'high', 'low', 'close']
+        time_cols = ['time', 'timestamp']  # Accept either 'time' or 'timestamp'
         available_cols = [col.lower() for col in df.columns]
         
         # Check if all required columns are present (case insensitive)
         if not all(col.lower() in available_cols for col in required_cols):
             logger.error(f"Missing required columns in TradingView data. Available columns: {df.columns.tolist()}")
+            return None
+            
+        # Check if at least one of the time columns is present
+        if not any(col.lower() in available_cols for col in time_cols):
+            logger.error(f"Missing time/timestamp column in TradingView data. Available columns: {df.columns.tolist()}")
             return None
         
         # Create mapping from available columns to required columns (case insensitive)
@@ -99,6 +105,17 @@ def load_tradingview_data(csv_filepath: str = "data/data/NQ_2024_unix.csv") -> p
             for avail_col in df.columns:
                 if avail_col.lower() == req_col:
                     col_mapping[avail_col] = req_col
+        
+        # Handle time column mapping
+        time_col_found = None
+        for time_col in time_cols:
+            for avail_col in df.columns:
+                if avail_col.lower() == time_col:
+                    time_col_found = avail_col
+                    col_mapping[avail_col] = 'time'  # Map to standard 'time' name
+                    break
+            if time_col_found:
+                break
         
         # Rename columns to lowercase standard format
         df = df.rename(columns=col_mapping)
