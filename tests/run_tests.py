@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test_risk_manager import TestRiskManager
 from test_trade_with_risk_management import TestTradeWithRiskManagement
 from test_money_integration import TestMoneyIntegration
+from test_model_trader_orders import TestModelTraderOrders
 
 if __name__ == "__main__":
     # Create a test loader
@@ -22,6 +23,7 @@ if __name__ == "__main__":
     test_suite.addTests(loader.loadTestsFromTestCase(TestRiskManager))
     test_suite.addTests(loader.loadTestsFromTestCase(TestTradeWithRiskManagement))
     test_suite.addTests(loader.loadTestsFromTestCase(TestMoneyIntegration))
+    test_suite.addTests(loader.loadTestsFromTestCase(TestModelTraderOrders))
     
     # Run the tests
     runner = unittest.TextTestRunner(verbosity=2)

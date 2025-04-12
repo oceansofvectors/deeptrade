@@ -1,10 +1,10 @@
 training:
-  total_timesteps: 10000
+  total_timesteps: 5000
   fee_rate: 0.0
   # New parameters for iterative training
   max_iterations: 200
   improvement_threshold: 0.02
-  additional_timesteps: 200
+  additional_timesteps: 100
   n_stagnant_loops: 20
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
@@ -134,7 +134,7 @@ walk_forward:
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: false  # Set to true to enable hyperparameter tuning during training
+  enabled: true  # Set to true to enable hyperparameter tuning during training
   n_trials: 30     # Number of trials for the optimization
   parallel_processing:
     enabled: true  # Whether to run trials in parallel
