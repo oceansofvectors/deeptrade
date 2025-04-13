@@ -265,6 +265,7 @@ def calculate_hit_rate_from_trade_results(results: Dict) -> Dict:
     profitable_trades = 0
     total_trades = results.get("trade_count", 0)
     hit_rate = 0.0
+    trades_with_profit = []  # Initialize this variable to avoid UnboundLocalError
     
     # Process trade history to count profitable trades
     if 'trade_history' in results and len(results['trade_history']) > 0:
@@ -290,7 +291,7 @@ def calculate_hit_rate_from_trade_results(results: Dict) -> Dict:
     # Update results dictionary with hit rate metrics
     results["hit_rate"] = hit_rate
     results["profitable_trades"] = profitable_trades
-    results["completed_trades"] = len(trades_with_profit) if 'trade_history' in results else 0
+    results["completed_trades"] = len(trades_with_profit)
     
     return results
 
@@ -1082,12 +1083,34 @@ def hyperparameter_tuning(
     max_risk_per_trade_pct = 1.0
     
     if risk_enabled:
-        stop_loss_pct = config.get("risk_management", {}).get("stop_loss", {}).get("percentage", 0)
-        take_profit_pct = config.get("risk_management", {}).get("take_profit", {}).get("percentage", 0)
-        trailing_stop_pct = config.get("risk_management", {}).get("trailing_stop", {}).get("percentage", 0)
+        # Get stop loss configuration
+        stop_loss_config = config.get("risk_management", {}).get("stop_loss", {})
+        if stop_loss_config.get("enabled", False):
+            stop_loss_pct = stop_loss_config.get("percentage", 0)
+        else:
+            stop_loss_pct = 0
+            
+        # Get take profit configuration
+        take_profit_config = config.get("risk_management", {}).get("take_profit", {})
+        if take_profit_config.get("enabled", False):
+            take_profit_pct = take_profit_config.get("percentage", 0)
+        else:
+            take_profit_pct = 0
+            
+        # Get trailing stop configuration - respect the 'enabled' flag
+        trailing_stop_config = config.get("risk_management", {}).get("trailing_stop", {})
+        if trailing_stop_config.get("enabled", False):
+            trailing_stop_pct = trailing_stop_config.get("percentage", 0)
+        else:
+            trailing_stop_pct = 0  # Set to 0 to disable if not enabled
+            
+        # Get position size configuration
         position_size = config["environment"].get("position_size", 1)
         max_risk_per_trade_pct = config.get("risk_management", {}).get("position_sizing", {}).get("max_risk_per_trade_percentage", 1.0)
-        logger.info(f"Risk management is enabled: SL={stop_loss_pct}%, TP={take_profit_pct}%, TS={trailing_stop_pct}%")
+        
+        logger.info(f"Risk management is enabled: SL={stop_loss_pct}% (enabled={stop_loss_config.get('enabled', False)}), " +
+                   f"TP={take_profit_pct}% (enabled={take_profit_config.get('enabled', False)}), " +
+                   f"TS={trailing_stop_pct}% (enabled={trailing_stop_config.get('enabled', False)})")
     else:
         logger.info("Risk management is disabled")
     

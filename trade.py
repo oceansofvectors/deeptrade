@@ -440,6 +440,16 @@ def trade_with_risk_management(
     # Load the model
     model = PPO.load(model_path)
     
+    # Log risk management parameters
+    if verbose > 0:
+        logging.info(f"Risk management parameters:")
+        logging.info(f"  Stop loss: {stop_loss_pct if stop_loss_pct and stop_loss_pct > 0 else 'Disabled'}")
+        logging.info(f"  Take profit: {take_profit_pct if take_profit_pct and take_profit_pct > 0 else 'Disabled'}")
+        logging.info(f"  Trailing stop: {trailing_stop_pct if trailing_stop_pct and trailing_stop_pct > 0 else 'Disabled'}")
+        logging.info(f"  Position size: {position_size}")
+        logging.info(f"  Max risk per trade: {max_risk_per_trade_pct}")
+        logging.info(f"  Daily risk limit: {daily_risk_limit if daily_risk_limit and daily_risk_limit > 0 else 'Disabled'}")
+    
     # Initialize risk manager with risk management parameters
     # Only enable features that have non-zero values
     risk_manager = RiskManager(

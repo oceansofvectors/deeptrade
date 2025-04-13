@@ -1,5 +1,5 @@
 training:
-  total_timesteps: 5000
+  total_timesteps: 10000
   fee_rate: 0.0
   # New parameters for iterative training
   max_iterations: 200
@@ -125,7 +125,7 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
-  window_size: 90  # Size of each walk-forward window in trading days (NYSE business days)
+  window_size: 120  # Size of each walk-forward window in trading days (NYSE business days)
   step_size: 30    # Number of trading days to step forward at each iteration (NYSE business days)
   parallel_processing:
     enabled: true   # Enable parallel processing of walk-forward windows
