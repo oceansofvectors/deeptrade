@@ -227,14 +227,63 @@ def main():
     train_ratio = config["data"].get("train_ratio", 0.7)
     validation_ratio = config["data"].get("validation_ratio", 0.15)
     
-    # Correct the path to hyperparameter tuning config - it's a top-level key in config.yaml
-    run_hyperparameter_tuning = config.get("hyperparameter_tuning", {}).get("enabled", True)
-    tuning_trials = config.get("hyperparameter_tuning", {}).get("n_trials", 30)
+    # Get enabled indicators from config
+    enabled_indicators = []
+    indicators_config = config.get("indicators", {})
     
-    # Debug the hyperparameter tuning configuration
-    logger.info(f"Hyperparameter tuning config: {config.get('hyperparameter_tuning', {})}")
-    logger.info(f"run_hyperparameter_tuning: {run_hyperparameter_tuning}, type: {type(run_hyperparameter_tuning)}")
-    logger.info(f"tuning_trials: {tuning_trials}")
+    # Check each indicator
+    if indicators_config.get("rsi", {}).get("enabled", False):
+        enabled_indicators.append("RSI")
+    if indicators_config.get("cci", {}).get("enabled", False):
+        enabled_indicators.append("CCI")
+    if indicators_config.get("macd", {}).get("enabled", False):
+        enabled_indicators.extend(["MACD", "MACD_SIGNAL", "MACD_HIST"])
+    if indicators_config.get("atr", {}).get("enabled", False):
+        enabled_indicators.append("ATR")
+    if indicators_config.get("supertrend", {}).get("enabled", False):
+        enabled_indicators.append("TREND_DIRECTION")
+    if indicators_config.get("adx", {}).get("enabled", False):
+        enabled_indicators.append("ADX")
+    if indicators_config.get("adx_pos", {}).get("enabled", False):
+        enabled_indicators.append("ADX_POS")
+    if indicators_config.get("adx_neg", {}).get("enabled", False):
+        enabled_indicators.append("ADX_NEG")
+    if indicators_config.get("stoch_k", {}).get("enabled", False):
+        enabled_indicators.append("STOCH_K")
+    if indicators_config.get("stoch_d", {}).get("enabled", False):
+        enabled_indicators.append("STOCH_D")
+    if indicators_config.get("roc", {}).get("enabled", False):
+        enabled_indicators.append("ROC")
+    if indicators_config.get("williams_r", {}).get("enabled", False):
+        enabled_indicators.append("WILLIAMS_R")
+    if indicators_config.get("sma", {}).get("enabled", False):
+        enabled_indicators.append("SMA_NORM")
+    if indicators_config.get("ema", {}).get("enabled", False):
+        enabled_indicators.append("EMA_NORM")
+    if indicators_config.get("disparity", {}).get("enabled", False):
+        enabled_indicators.append("DISPARITY")
+    if indicators_config.get("obv", {}).get("enabled", False):
+        enabled_indicators.append("OBV_NORM")
+    if indicators_config.get("cmf", {}).get("enabled", False):
+        enabled_indicators.append("CMF")
+    if indicators_config.get("psar", {}).get("enabled", False):
+        enabled_indicators.extend(["PSAR_NORM", "PSAR_DIR"])
+    if indicators_config.get("volume", {}).get("enabled", False):
+        enabled_indicators.append("VOLUME_MA")
+    
+    # Log the final list of enabled indicators
+    logger.info(f"Enabled indicators for training: {enabled_indicators}")
+
+    # DEBUGGING: Print the features that will be used in the observation vector
+    # This will help debug why the model expects 9 features
+    observation_features = ["close_norm"]  # First feature is always close_norm
+    observation_features.extend(enabled_indicators)  # Add all enabled indicators
+    observation_features.append("position")  # Last feature is always position
+    logger.info(f"OBSERVATION VECTOR will contain {len(observation_features)} features: {observation_features}")
+    
+    # Save enabled indicators to model folder
+    with open(os.path.join(model_folder, "enabled_indicators.json"), "w") as f:
+        json.dump(enabled_indicators, f, indent=4)
     
     # Get risk management parameters
     risk_params = get_risk_params()
@@ -247,9 +296,8 @@ def main():
     logger.info(f"Training parameters:")
     logger.info(f"- train_ratio: {train_ratio}")
     logger.info(f"- validation_ratio: {validation_ratio}")
-    logger.info(f"- hyperparameter_tuning: {run_hyperparameter_tuning}")
-    logger.info(f"- tuning_trials: {tuning_trials}")
     logger.info(f"- risk_management: {risk_params['enabled']}")
+    logger.info(f"- enabled_indicators: {enabled_indicators}")
     
     # Load data from the live CSV file
     data = load_live_data("data/live.csv")
@@ -288,40 +336,27 @@ def main():
     model_params = None
     
     # Perform hyperparameter tuning if enabled
-    if run_hyperparameter_tuning:
-        logger.info(f"Starting hyperparameter tuning with {tuning_trials} trials using {evaluation_metric} metric")
+    if config.get("hyperparameter_tuning", {}).get("enabled", True):
+        logger.info(f"Starting hyperparameter tuning with {config['hyperparameter_tuning']['n_trials']} trials using {evaluation_metric} metric")
         
         try:
-            # Import the hyperparameter_tuning function directly to check for issues
-            logger.info("Checking if hyperparameter_tuning function is available")
-            from walk_forward import hyperparameter_tuning as hp_tuning_func
-            logger.info(f"hyperparameter_tuning function imported successfully: {hp_tuning_func}")
-            
-            # Run hyperparameter tuning - pass risk parameters if risk management is enabled
+            # Run hyperparameter tuning
             tuning_kwargs = {
                 'train_data': train_data,
                 'validation_data': validation_data,
-                'n_trials': tuning_trials,
+                'n_trials': config['hyperparameter_tuning']['n_trials'],
                 'window_folder': model_folder,
                 'eval_metric': evaluation_metric
             }
             
-            # The hyperparameter_tuning function doesn't directly accept risk parameters
-            # We will save the risk parameters to be used by functions called within hyperparameter_tuning
-            logger.info(f"Risk parameters will be available via config.yaml: {risk_params}")
-            
-            logger.info(f"Calling hyperparameter_tuning with args: {tuning_kwargs}")
             best_params = hyperparameter_tuning(**tuning_kwargs)
-            
             logger.info(f"Hyperparameter tuning completed. Best parameters: {best_params}")
             
             # Use the best parameters for model training
             model_params = best_params.get('best_params', best_params)
             
-            # Save tuning results - extract just the serializable part
+            # Save tuning results
             with open(os.path.join(model_folder, "best_params.json"), "w") as f:
-                # If best_params is a dict with 'best_params' key, save just that part
-                # Otherwise, save the entire object (assuming it's serializable)
                 json_safe_params = best_params.get('best_params', best_params)
                 json.dump(json_safe_params, f, indent=4)
                 
@@ -336,18 +371,6 @@ def main():
     
     # Log the model parameters being used
     logger.info(f"Training model with parameters: {model_params if model_params else 'default parameters'}")
-    
-    # Configure environment parameters based on risk management settings
-    env_kwargs = {
-        'initial_balance': config["environment"]["initial_balance"],
-        'transaction_cost': config["environment"].get("transaction_cost", 0.0)
-    }
-    
-    # Add position size if set
-    if risk_params["enabled"] and risk_params["position_size"] is not None:
-        env_kwargs['position_size'] = risk_params["position_size"]
-    else:
-        env_kwargs['position_size'] = config["environment"].get("position_size", 1)
     
     # Train the model iteratively
     try:

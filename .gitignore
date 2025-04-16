@@ -171,3 +171,4 @@ logs/
 models 
 plots
 data
+trader_state.pkl

@@ -73,6 +73,18 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     
     check_env(train_env, skip_render_check=True)
     
+    # DEBUGGING: Print the observation space and actual features
+    logger.info(f"Observation space shape: {train_env.observation_space.shape}")
+    
+    # Check the observation vector from the reset
+    obs, _ = train_env.reset()
+    logger.info(f"Actual observation vector shape: {obs.shape}")
+    logger.info(f"First few values of observation: {obs[:5]}")
+    
+    # Check technical indicators in the environment
+    logger.info(f"Technical indicators used in environment: {train_env.technical_indicators}")
+    logger.info(f"Total observation components: close_norm + {len(train_env.technical_indicators)} indicators + position = {1 + len(train_env.technical_indicators) + 1}")
+    
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
     
@@ -260,6 +272,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     entry_price = 0
     entry_step = -1
     trade_history = []
+    last_action = None  # Track the last action to record action changes
     
     # Determine which case is used for price columns
     if 'Close' in test_data.columns:
@@ -290,14 +303,34 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         action, _ = model.predict(obs, deterministic=deterministic)
         action_history.append(action)
         
+        # Check if action has changed, which means a potential trade
+        if last_action is not None and action != last_action:
+            # Record the trade when action changes
+            trade_history.append({
+                "date": test_data.index[current_step],
+                "trade_type": "Buy" if action == 0 else "Sell" if action == 1 else "Hold",
+                "price": current_price,
+                "portfolio_value": float(money.format_money(env.net_worth, 2)),
+                "profitable": True if current_position == 0 else float(env.net_worth) > float(entry_price),
+                "position_from": entry_price if entry_price > 0 else 0,
+                "position_to": current_price
+            })
+            
+            if action != 2:  # If not a hold action, update entry info
+                entry_price = current_price
+                entry_step = current_step
+        
         # Take action in environment
         obs, reward, terminated, truncated, info = env.step(int(action))
         done = terminated or truncated
         
+        # Update last action
+        last_action = action
+        
         # Update portfolio value
         portfolio_history.append(float(money.format_money(env.net_worth, 2)))
         
-        # Update trade history
+        # Update trade history when position changes (original logic)
         if env.position != current_position:
             trade_count += 1
             if current_position == 0:

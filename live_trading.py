@@ -12,6 +12,7 @@ import json
 import threading
 import pickle
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 # Import stable_baselines3 for loading the trained model
 from stable_baselines3 import PPO
@@ -19,6 +20,9 @@ from stable_baselines3 import PPO
 # Import money module and config for risk management
 import money
 from config import config
+
+# Import process_technical_indicators and ensure_numeric from get_data
+from get_data import process_technical_indicators, ensure_numeric
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -30,59 +34,159 @@ model_trader = None
 
 # Heartbeat monitoring globals
 last_data_timestamp = datetime.now()
-heartbeat_interval = 30  # seconds
-is_data_flowing = True
+heartbeat_interval = 60  # Seconds between heartbeat checks
+is_data_flowing = False
 reconnection_attempts = 0
 max_reconnection_attempts = 5
-state_file = "trading_state.pkl"
+state_file = "trader_state.pkl"
 
-# Function to aggregate a list of 60 5-second bars into one 5-minute bar.
+# Globals for real-time bar handling
+bar_buckets = defaultdict(list)  # Organize bars by 5-minute intervals
+processed_intervals = set()  # Track which intervals we've already processed
+
+# Function to aggregate a list of 5-second bars into one 5-minute bar.
 def aggregate_bars(bars):
     """
-    Given a list of 60 real-time bars (5-sec each), compute a 5-minute bar.
+    Given a list of real-time bars (5-sec each), compute a 5-minute bar.
     """
-    open_price = bars[0].open_
-    high_price = max(bar.high for bar in bars)
-    low_price = min(bar.low for bar in bars)
-    close_price = bars[-1].close
-    volume = sum(bar.volume for bar in bars)
-    start_time = bars[0].time
-    end_time = bars[-1].time
-    return {
-        'start': start_time,
-        'end': end_time,
-        'open': open_price,
-        'high': high_price,
-        'low': low_price,
-        'close': close_price,
-        'volume': volume
-    }
+    if not bars:
+        return None
+    
+    # Handle IB bars which may have different attribute names
+    try:    
+        # Check if we have IB bar objects
+        if hasattr(bars[0], 'open_'):
+            open_price = bars[0].open_
+            high_price = max(bar.high for bar in bars)
+            low_price = min(bar.low for bar in bars)
+            close_price = bars[-1].close
+            volume = sum(bar.volume for bar in bars)
+            
+            # Handle different time formats
+            if isinstance(bars[0].time, datetime):
+                start_time = bars[0].time
+                end_time = bars[-1].time
+            else:
+                try:
+                    start_time = datetime.fromtimestamp(bars[0].time)
+                    end_time = datetime.fromtimestamp(bars[-1].time)
+                except (TypeError, ValueError):
+                    start_time = datetime.now() - timedelta(minutes=5)
+                    end_time = datetime.now()
+        else:
+            # Handle dictionary format
+            open_price = bars[0]['open']
+            high_price = max(bar['high'] for bar in bars)
+            low_price = min(bar['low'] for bar in bars)
+            close_price = bars[-1]['close']
+            volume = sum(bar['volume'] for bar in bars)
+            
+            # Get time values
+            start_time = bars[0].get('time', datetime.now() - timedelta(minutes=5))
+            end_time = bars[-1].get('time', datetime.now())
+        
+        # Create and return the aggregated bar
+        return {
+            'time': start_time,  # Use start time for indexing
+            'start': start_time,
+            'end': end_time,
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': close_price,
+            'volume': volume
+        }
+    except Exception as e:
+        logger.error(f"Error aggregating bars: {e}")
+        return None
+
+def get_interval_key(timestamp):
+    """
+    Convert a timestamp to its 5-minute interval key.
+    Example: 09:32:45 -> '09:30'
+    
+    Handles timezone-aware datetime objects by removing the timezone info.
+    """
+    # Handle timezone-aware datetimes by removing timezone info if present
+    if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+        timestamp = timestamp.replace(tzinfo=None)
+        
+    # Floor to nearest 5-minute interval
+    minute = (timestamp.minute // 5) * 5
+    interval_time = timestamp.replace(minute=minute, second=0, microsecond=0)
+    return interval_time.strftime('%Y-%m-%d %H:%M')
+
+def synchronize_bars():
+    """
+    Check if we have complete 5-minute bars to process.
+    Returns the latest complete bar if available, None otherwise.
+    """
+    global bar_buckets, processed_intervals, model_trader
+    
+    # Get current time and calculate the most recently completed 5-minute interval
+    now = datetime.now()
+    
+    # Go back 1 minute to ensure we're not trying to process a partial interval
+    one_minute_ago = now - timedelta(minutes=1)
+    last_complete_interval = one_minute_ago.replace(minute=(one_minute_ago.minute // 5) * 5, second=0, microsecond=0)
+    
+    # Format as a string key
+    interval_key = last_complete_interval.strftime('%Y-%m-%d %H:%M')
+    
+    # Check if we have bars for this interval and haven't processed it yet
+    if interval_key in bar_buckets and interval_key not in processed_intervals:
+        interval_bars = bar_buckets[interval_key]
+        
+        # Only process if we have a reasonable number of bars (at least 10)
+        if len(interval_bars) >= 10:
+            logger.info(f"Processing synchronized 5-minute bar for interval {interval_key} with {len(interval_bars)} 5-second bars")
+            
+            # Handle potential errors in bar aggregation
+            try:
+                five_min_bar = aggregate_bars(interval_bars)
+                processed_intervals.add(interval_key)
+            except Exception as e:
+                logger.error(f"Error aggregating bars for interval {interval_key}: {e}")
+                return None
+            
+            # Clean up old buckets to prevent memory growth
+            current_time = datetime.now()
+            for old_key in list(bar_buckets.keys()):
+                try:
+                    old_time = datetime.strptime(old_key, '%Y-%m-%d %H:%M')
+                    if (current_time - old_time).total_seconds() > 3600:  # Older than 1 hour
+                        del bar_buckets[old_key]
+                except Exception as e:
+                    logger.warning(f"Error cleaning up old bar bucket {old_key}: {e}")
+            
+            return five_min_bar
+    
+    return None
 
 class ModelTrader:
     def __init__(self, ib_instance, model_path="best_model", use_risk_management=True):
         """
-        Initialize the model trader.
+        Initialize the ModelTrader.
         
         Args:
-            ib_instance: The IB class instance
-            model_path: Path to the trained model
-            use_risk_management: Whether to use risk management (take profit, stop loss)
+            ib_instance: Interactive Brokers API instance
+            model_path: Path to the saved model
+            use_risk_management: Whether to use risk management
         """
         self.ib = ib_instance
         self.model_path = model_path
         self.model = None
         self.active_contract = None
-        self.current_position = 0  # 0=no position, 1=long, -1=short
-        self.active_order = None
-        self.active_orders = {}  # Dictionary to track all active orders
-        self.order_status = {}   # Track order status
+        self.current_position = 0  # -1 for short, 0 for flat, 1 for long
+        self.expected_position = 0
         self.use_risk_management = use_risk_management
-        
-        # Store bars for feature calculation
+        self.active_order = None
+        self.active_orders = {}
+        self.order_status = {}
         self.bar_history = []
-        self.min_bars_needed = 50  # Minimum number of bars needed for feature calculation
+        self.min_bars_needed = 100  # Minimum number of bars needed for indicator calculation
         
-        # Risk management settings
+        # Risk management settings from config.yaml
         self.risk_config = config.get("risk_management", {})
         self.stop_loss_pct = None
         self.take_profit_pct = None
@@ -90,7 +194,6 @@ class ModelTrader:
         self.position_size = 1
         
         # Position tracking for verification
-        self.expected_position = 0
         self.last_position_check = datetime.now()
         self.position_check_interval = 60  # seconds
         
@@ -98,57 +201,19 @@ class ModelTrader:
         if self.use_risk_management:
             self._initialize_risk_parameters()
         
-        # Trading indicators needed for model
-        self.technical_indicators = []
+        # Get enabled indicators using the improved method that checks multiple sources
+        self.enabled_indicators = self._get_enabled_indicators()
         
         logger.info(f"ModelTrader initialized with model path: {model_path}")
         logger.info(f"Risk management: {use_risk_management}")
+        logger.info(f"Enabled indicators: {self.enabled_indicators}")
         if use_risk_management:
             logger.info(f"Stop Loss: {self.stop_loss_pct}%, Take Profit: {self.take_profit_pct}%, Trailing Stop: {self.trailing_stop_pct}%")
     
     def _initialize_risk_parameters(self):
-        """Initialize risk management parameters from risk_params.json or config."""
-        # First try to load from risk_params.json (created by train_live_model.py)
-        try:
-            if os.path.exists("risk_params.json"):
-                logger.info("Loading risk parameters from risk_params.json")
-                with open("risk_params.json", "r") as f:
-                    risk_params = json.load(f)
-                
-                # Check if risk management is enabled globally
-                risk_enabled = risk_params.get("enabled", False)
-                if not risk_enabled:
-                    logger.info("Risk management is disabled in risk_params.json")
-                    return
-                
-                # Apply the risk parameters from the file
-                logger.info(f"Risk parameters from file: {risk_params}")
-                
-                # Set parameters only if they are enabled (not None) in the file
-                if risk_params.get("stop_loss") is not None:
-                    self.stop_loss_pct = risk_params["stop_loss"]
-                    logger.info(f"Using stop loss from file: {self.stop_loss_pct}%")
-                
-                if risk_params.get("take_profit") is not None:
-                    self.take_profit_pct = risk_params["take_profit"]
-                    logger.info(f"Using take profit from file: {self.take_profit_pct}%")
-                
-                if risk_params.get("trailing_stop") is not None:
-                    self.trailing_stop_pct = risk_params["trailing_stop"]
-                    logger.info(f"Using trailing stop from file: {self.trailing_stop_pct}%")
-                
-                if risk_params.get("position_size") is not None:
-                    self.position_size = risk_params["position_size"]
-                    logger.info(f"Using position size from file: {self.position_size}")
-                
-                return
-        except Exception as e:
-            logger.warning(f"Error loading risk_params.json: {e}. Falling back to config.yaml.")
-        
-        # Fall back to config.yaml if risk_params.json is not available or has an error
-        logger.info("Using risk parameters from config.yaml")
+        """Initialize risk management parameters from config.yaml."""
+        # Check if risk management is enabled globally
         risk_enabled = self.risk_config.get("enabled", False)
-        
         if not risk_enabled:
             logger.info("Risk management is disabled in config.yaml")
             return
@@ -186,16 +251,181 @@ class ModelTrader:
         else:
             logger.info(f"Position sizing is disabled in config, using default: {self.position_size}")
     
+    def _get_enabled_indicators(self):
+        """
+        Get list of enabled indicators from config.yaml only.
+        This ensures consistency with the currently active configuration.
+        """
+        enabled = []
+        
+        # Use config.yaml for indicator configuration
+        logger.info("Using indicators from config.yaml as requested")
+        indicators_config = config.get("indicators", {})
+        
+        # Add indicators in the EXACT SAME ORDER as in environment.py
+        # This is crucial for model compatibility
+        
+        # First check SuperTrend (trend_direction)
+        if indicators_config.get("supertrend", {}).get("enabled", False):
+            enabled.append("TREND_DIRECTION")
+            
+        # RSI
+        if indicators_config.get("rsi", {}).get("enabled", False):
+            enabled.append("RSI")
+            
+        # CCI
+        if indicators_config.get("cci", {}).get("enabled", False):
+            enabled.append("CCI")
+            
+        # ADX group
+        if indicators_config.get("adx", {}).get("enabled", False):
+            enabled.append("ADX")
+        if indicators_config.get("adx_pos", {}).get("enabled", False):
+            enabled.append("ADX_POS")
+        if indicators_config.get("adx_neg", {}).get("enabled", False):
+            enabled.append("ADX_NEG")
+            
+        # Stochastic
+        if indicators_config.get("stoch_k", {}).get("enabled", False):
+            enabled.append("STOCH_K")
+        if indicators_config.get("stoch_d", {}).get("enabled", False):
+            enabled.append("STOCH_D")
+            
+        # MACD group
+        if indicators_config.get("macd", {}).get("enabled", False):
+            enabled.extend(["MACD", "MACD_SIGNAL", "MACD_HIST"])
+            
+        # ROC
+        if indicators_config.get("roc", {}).get("enabled", False):
+            enabled.append("ROC")
+            
+        # Williams %R
+        if indicators_config.get("williams_r", {}).get("enabled", False):
+            enabled.append("WILLIAMS_R")
+            
+        # Moving averages
+        if indicators_config.get("sma", {}).get("enabled", False):
+            enabled.append("SMA_NORM")
+        if indicators_config.get("ema", {}).get("enabled", False):
+            enabled.append("EMA_NORM")
+            
+        # Disparity
+        if indicators_config.get("disparity", {}).get("enabled", False):
+            enabled.append("DISPARITY")
+            
+        # ATR
+        if indicators_config.get("atr", {}).get("enabled", False):
+            enabled.append("ATR")
+            
+        # Volume indicators
+        if indicators_config.get("obv", {}).get("enabled", False):
+            enabled.append("OBV_NORM")
+        if indicators_config.get("cmf", {}).get("enabled", False):
+            enabled.append("CMF")
+            
+        # PSAR
+        if indicators_config.get("psar", {}).get("enabled", False):
+            enabled.extend(["PSAR_NORM", "PSAR_DIR"])
+            
+        # Volume MA
+        if indicators_config.get("volume", {}).get("enabled", False):
+            enabled.append("VOLUME_MA")
+        
+        return enabled
+    
     def load_model(self):
         """Load the trained model from the specified path."""
         logger.info(f"Loading model from {self.model_path}")
+        
         try:
             self.model = PPO.load(self.model_path)
-            logger.info("Model loaded successfully")
+            logger.info(f"Model loaded successfully from {self.model_path}")
+            
+            # Diagnose expected model features
+            self.diagnose_model_features()
+            
             return True
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
+            logger.error(f"Failed to load model: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
+    
+    def diagnose_model_features(self):
+        """
+        Diagnose the model's expected feature input to help reconcile with our actual features.
+        """
+        if self.model is None:
+            logger.error("No model loaded to diagnose")
+            return
+        
+        try:
+            # Check observation space
+            if hasattr(self.model, 'observation_space'):
+                obs_shape = self.model.observation_space.shape
+                logger.info(f"Model observation space shape: {obs_shape}")
+                
+                # Try to extract feature information from the model's policy
+                if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'features_extractor'):
+                    logger.info(f"Model has a features extractor: {self.model.policy.features_extractor}")
+                    
+                # Check if environment is stored
+                if hasattr(self.model, 'env'):
+                    logger.info(f"Model has stored environment information")
+                
+                # Log expected number of features
+                expected_features = obs_shape[0]
+                logger.info(f"Model expects {expected_features} features")
+                
+                # Filter out trend_direction from indicators if it exists
+                filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'TREND_DIRECTION']
+                
+                # Log our enabled indicators to compare
+                logger.info(f"We have {len(filtered_indicators) + 2} features (close_norm + {len(filtered_indicators)} indicators + position)")
+                logger.info(f"Raw enabled indicators from config: {self.enabled_indicators}")
+                logger.info(f"Filtered indicators for observation: {filtered_indicators}")
+                
+                # Calculate and log the feature delta
+                feature_delta = expected_features - (len(filtered_indicators) + 2)
+                if feature_delta > 0:
+                    logger.error(f"MISSING {feature_delta} FEATURES compared to what model expects")
+                    # Try to determine what might be missing by comparing with common indicator sets
+                    possible_missing = []
+                    logger.info("Attempting to identify possible missing indicators:")
+                    
+                    # Check common indicator combinations from environment.py
+                    common_indicators = ["TREND_DIRECTION", "RSI", "CCI", "ADX", "ADX_POS", "ADX_NEG", 
+                                       "STOCH_K", "STOCH_D", "MACD", "MACD_SIGNAL", "MACD_HIST", 
+                                       "ROC", "WILLIAMS_R", "SMA_NORM", "EMA_NORM", "DISPARITY", 
+                                       "ATR", "OBV_NORM", "CMF", "PSAR_NORM", "PSAR_DIR", "VOLUME_MA"]
+                    
+                    for indicator in common_indicators:
+                        if indicator not in filtered_indicators and indicator.upper() != 'TREND_DIRECTION':
+                            possible_missing.append(indicator)
+                    
+                    logger.info(f"Possible missing indicators: {possible_missing[:feature_delta]}")
+                elif feature_delta < 0:
+                    logger.error(f"EXTRA {-feature_delta} FEATURES compared to what model expects")
+                else:
+                    logger.info("Feature count matches model's expectations")
+                
+                # Try to find and load any training metadata that might exist
+                metadata_paths = ["training_metadata.json", "model_metadata.json", "training_config.json"]
+                for path in metadata_paths:
+                    if os.path.exists(path):
+                        try:
+                            with open(path, 'r') as f:
+                                metadata = json.load(f)
+                                if 'indicators' in metadata:
+                                    logger.info(f"Found training indicators in {path}: {metadata['indicators']}")
+                                    break
+                        except Exception as e:
+                            logger.warning(f"Failed to load {path}: {e}")
+                
+        except Exception as e:
+            logger.error(f"Error diagnosing model features: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def set_active_contract(self, contract):
         """Set the active trading contract."""
@@ -241,12 +471,12 @@ class ModelTrader:
             logger.error(f"Error loading trading state: {e}")
             return False
     
-    def verify_position(self):
+    def verify_position(self, force=False):
         """Verify that the internal position matches the actual position at IB."""
         now = datetime.now()
         
-        # Only check positions periodically
-        if (now - self.last_position_check).total_seconds() < self.position_check_interval:
+        # Only check positions periodically unless forced
+        if not force and (now - self.last_position_check).total_seconds() < self.position_check_interval:
             return
             
         self.last_position_check = now
@@ -255,29 +485,62 @@ class ModelTrader:
             # Get current positions from IB
             positions = self.ib.positions()
             
-            # Find our contract in the positions
+            # Get detailed debug info about active contract and positions
+            logger.info(f"Active contract: {self.active_contract}")
+            logger.info(f"Active contract details: Symbol={self.active_contract.symbol}, Exchange={self.active_contract.exchange}, SecType={self.active_contract.secType}")
+            
+            # More detailed logging of all positions
+            position_details = []
+            for pos in positions:
+                contract_info = {
+                    'symbol': pos.contract.symbol,
+                    'exchange': pos.contract.exchange,
+                    'secType': pos.contract.secType,
+                    'position': pos.position,
+                    'avgCost': pos.avgCost
+                }
+                position_details.append(contract_info)
+                
+            logger.info(f"All IB positions: {position_details}")
+            
+            # Find our contract in the positions with more flexible matching
             actual_position = 0
             for position in positions:
-                if position.contract.symbol == self.active_contract.symbol and position.contract.exchange == self.active_contract.exchange:
+                # More detailed logging for each position being checked
+                logger.info(f"Checking position: Symbol={position.contract.symbol}, Exchange={position.contract.exchange}, SecType={position.contract.secType}")
+                
+                # Try more flexible matching
+                if (position.contract.symbol == self.active_contract.symbol and 
+                    position.contract.secType == self.active_contract.secType):
+                    logger.info(f"Found matching position: {position.position} contracts")
                     actual_position = position.position
                     break
             
+            # If we have an actual position but our internal state is wrong, update it
+            logger.info(f"Position verification: Internal={self.current_position}, Actual Quantity={actual_position}")
+            
+            # Update the directional flag based on the actual position
+            new_position_flag = 1 if actual_position > 0 else (-1 if actual_position < 0 else 0)
+            
             # Check if our internal state matches the actual position
-            if self.current_position != actual_position:
-                logger.warning(f"Position mismatch: Internal={self.current_position}, Actual={actual_position}")
+            if self.current_position != new_position_flag or self.expected_position != actual_position:
+                logger.warning(f"Position mismatch: Internal={self.current_position} (expected quantity: {self.expected_position}), Actual={actual_position}")
                 
                 # Reconcile by updating our internal state
-                logger.info(f"Reconciling position: updating internal position to {actual_position}")
-                self.current_position = actual_position
+                self.current_position = new_position_flag
                 self.expected_position = actual_position
+                
+                logger.info(f"Reconciling position: updated to direction={self.current_position}, quantity={actual_position}")
                 
                 # Save the reconciled state
                 self.save_state()
             else:
-                logger.info(f"Position verification successful: {self.current_position}")
+                logger.info(f"Position verification successful: Internal={self.current_position}, Actual={actual_position}")
                 
         except Exception as e:
             logger.error(f"Error verifying position: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def verify_order_execution(self, order_id):
         """Verify that an order has been executed."""
@@ -306,27 +569,42 @@ class ModelTrader:
             self.order_status[trade.order.orderId] = trade.orderStatus.status
             logger.info(f"New order status: ID={trade.order.orderId}, Status={trade.orderStatus.status}")
         elif self.order_status[trade.order.orderId] != trade.orderStatus.status:
+            prev_status = self.order_status[trade.order.orderId]
             self.order_status[trade.order.orderId] = trade.orderStatus.status
-            logger.info(f"Order status updated: ID={trade.order.orderId}, Status={trade.orderStatus.status}")
+            logger.info(f"Order status updated: ID={trade.order.orderId}, Status changed from {prev_status} to {trade.orderStatus.status}")
             
             # If the order is filled, update our position
             if trade.orderStatus.status == "Filled":
-                # Determine direction from the order
-                if trade.order.action == "BUY":
-                    position_change = trade.order.totalQuantity
-                else:  # SELL
-                    position_change = -trade.order.totalQuantity
-                    
-                # Update expected position
-                self.expected_position += position_change
-                logger.info(f"Order filled: Updating expected position to {self.expected_position}")
+                # Get the order details
+                order_id = trade.order.orderId
+                order_info = None
+                
+                if order_id in self.active_orders:
+                    order_info = self.active_orders[order_id]
+                    logger.info(f"Order info for filled order: {order_info}")
+                
+                # Determine if this was a special order type
+                order_type = order_info.get('type') if order_info else None
+                
+                # Force immediate position verification to get actual state from IB
+                # This is the most reliable way to know our position after fills
+                logger.info("Order filled - verifying actual position with IB")
+                self.verify_position(force=True)
                 
                 # Save state after position change
                 self.save_state()
+                
+                # Now that position is verified, log the current state
+                logger.info(f"After order fill: Position now {self.current_position} (quantity: {self.expected_position})")
+            
+            # Log when order is cancelled or failed
+            elif trade.orderStatus.status in ["Cancelled", "Inactive", "Error"]:
+                logger.warning(f"Order {trade.order.orderId} failed with status: {trade.orderStatus.status}")
     
     def preprocess_bar(self, bar):
         """
-        Preprocess a single bar into features expected by the model.
+        Preprocess a single bar into features expected by the model using the same
+        process_technical_indicators function used during training.
         
         Args:
             bar: A dictionary containing OHLCV data
@@ -334,139 +612,204 @@ class ModelTrader:
         Returns:
             np.ndarray: Observation array for the model
         """
-        # Add bar to history
+        # Add the new bar to history
         self.bar_history.append(bar)
+        
+        # Keep only the most recent bars
+        if len(self.bar_history) > 300:  # Keep more history for better indicator calculation
+            self.bar_history = self.bar_history[-300:]
         
         # If we don't have enough bars yet, return None
         if len(self.bar_history) < self.min_bars_needed:
             logger.info(f"Not enough bars yet. Have {len(self.bar_history)}/{self.min_bars_needed}")
             return None
         
-        # Keep only the most recent bars
-        if len(self.bar_history) > 100:
-            self.bar_history = self.bar_history[-100:]
-        
-        # Create a DataFrame from bar history
-        df = pd.DataFrame(self.bar_history)
-        
-        # Calculate normalized close price (between 0 and 1)
-        # Get min and max close price from the history
-        min_close = df['close'].min()
-        max_close = df['close'].max()
-        
-        # Handle case where min and max are the same
-        if max_close == min_close:
-            close_norm = 0.5
-        else:
-            close_norm = (bar['close'] - min_close) / (max_close - min_close)
-        
-        # Calculate technical indicators based on config
-
-        # 1. RSI (Relative Strength Index)
-        rsi = self._calculate_rsi(df, length=14)
-        rsi = rsi / 100.0  # Normalize to [0, 1]
-        
-        # 2. CCI (Commodity Channel Index)
-        cci = self._calculate_cci(df, length=20)
-        # Normalize CCI
-        max_abs_cci = max(abs(cci.max() if not np.isnan(cci.max()) else 1), 
-                          abs(cci.min() if not np.isnan(cci.min()) else 1))
-        if max_abs_cci > 0:
-            cci = cci / max_abs_cci
-        else:
-            cci = 0
+        try:
+            # Convert bar history to DataFrame with proper column names
+            df = pd.DataFrame(self.bar_history)
             
-        # 3. MACD (Moving Average Convergence Divergence)
-        macd, macd_signal, macd_hist = self._calculate_macd(df, fast=12, slow=26, signal=9)
-        # Normalize MACD values
-        max_val = max(abs(macd.max() if not np.isnan(macd.max()) else 1), 
-                      abs(macd.min() if not np.isnan(macd.min()) else 1),
-                      abs(macd_signal.max() if not np.isnan(macd_signal.max()) else 1), 
-                      abs(macd_signal.min() if not np.isnan(macd_signal.min()) else 1),
-                      abs(macd_hist.max() if not np.isnan(macd_hist.max()) else 1), 
-                      abs(macd_hist.min() if not np.isnan(macd_hist.min()) else 1))
-        if max_val > 0:
-            macd = macd / max_val
-            macd_signal = macd_signal / max_val
-            macd_hist = macd_hist / max_val
-        
-        # 4. ATR (Average True Range)
-        atr = self._calculate_atr(df, length=14)
-        # Normalize ATR by close price
-        atr = atr / df['close'].iloc[-1]
-        
-        # Create observation array based on environment.py structure
-        # Format: [close_norm, technical_indicators..., position]
-        # The most recent values from each indicator
-        obs = np.array([
-            close_norm,                  # Normalized close price
-            rsi.iloc[-1],                # RSI
-            cci.iloc[-1],                # CCI
-            macd.iloc[-1],               # MACD
-            macd_signal.iloc[-1],        # MACD Signal
-            macd_hist.iloc[-1],          # MACD Histogram
-            atr.iloc[-1],                # ATR
-            float(self.current_position)  # Current position
-        ], dtype=np.float32)
-        
-        # Clip observation values to [-1, 1] range except close_norm [0, 1]
-        # First element (close_norm) should be clipped to [0, 1]
-        obs[0] = np.clip(obs[0], 0, 1)
-        # Other elements should be clipped to [-1, 1]
-        obs[1:] = np.clip(obs[1:], -1, 1)
-        
-        return obs
-    
-    def _calculate_rsi(self, df, length=14):
-        """Calculate RSI indicator"""
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        
-        avg_gain = gain.rolling(window=length).mean()
-        avg_loss = loss.rolling(window=length).mean()
-        
-        rs = avg_gain / avg_loss.where(avg_loss != 0, 1)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.fillna(50)
-    
-    def _calculate_cci(self, df, length=20):
-        """Calculate CCI indicator"""
-        tp = (df['high'] + df['low'] + df['close']) / 3
-        tp_sma = tp.rolling(window=length).mean()
-        md = tp.rolling(window=length).apply(lambda x: np.abs(x - x.mean()).mean())
-        cci = (tp - tp_sma) / (0.015 * md)
-        return cci.fillna(0)
-    
-    def _calculate_macd(self, df, fast=12, slow=26, signal=9):
-        """Calculate MACD indicator"""
-        close = df['close']
-        exp1 = close.ewm(span=fast, adjust=False).mean()
-        exp2 = close.ewm(span=slow, adjust=False).mean()
-        macd = exp1 - exp2
-        signal_line = macd.ewm(span=signal, adjust=False).mean()
-        histogram = macd - signal_line
-        return macd.fillna(0), signal_line.fillna(0), histogram.fillna(0)
-    
-    def _calculate_atr(self, df, length=14):
-        """Calculate ATR indicator"""
-        high = df['high']
-        low = df['low']
-        close = df['close']
-        
-        # Get previous close
-        prev_close = close.shift(1)
-        
-        # Calculate True Range
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        # Calculate ATR
-        atr = tr.rolling(window=length).mean()
-        return atr.fillna(0)
+            # Convert time column to datetime if it's not already
+            if 'time' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['time']):
+                try:
+                    # Handle timezone-aware datetimes by explicitly using UTC=True
+                    df['time'] = pd.to_datetime(df['time'], utc=True)
+                except Exception as e:
+                    logger.warning(f"Error converting times with utc=True: {e}")
+                    try:
+                        # Try to remove timezone information as a fallback
+                        df['time'] = df['time'].apply(lambda x: x.replace(tzinfo=None) if hasattr(x, 'tzinfo') else x)
+                        df['time'] = pd.to_datetime(df['time'])
+                    except Exception as e2:
+                        logger.error(f"Failed to process timestamps: {e2}")
+                        # Create a simple datetime index as last resort
+                        logger.warning("Creating a synthetic time index as fallback")
+                        now = datetime.now()
+                        start_time = now - timedelta(minutes=len(df))
+                        synthetic_times = [start_time + timedelta(minutes=i) for i in range(len(df))]
+                        df['time'] = synthetic_times
+            
+            # Set time as index
+            if 'time' in df.columns:
+                df = df.set_index('time')
+                
+            # Check for duplicate indices and fix them
+            if df.index.duplicated().any():
+                logger.warning(f"Found {df.index.duplicated().sum()} duplicate timestamps in data")
+                # Make index unique by adding small time offsets to duplicates
+                df = df.loc[~df.index.duplicated(keep='first')]
+                logger.info(f"Removed duplicate timestamps. {len(df)} bars remaining.")
+            
+            # Ensure we have properly named columns for process_technical_indicators
+            rename_map = {
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume'
+            }
+            # Only rename columns that exist in the DataFrame and need renaming
+            cols_to_rename = {k: v for k, v in rename_map.items() if k in df.columns and v not in df.columns}
+            if cols_to_rename:
+                df = df.rename(columns=cols_to_rename)
+            
+            # Ensure all required columns are present and numeric
+            required_cols = ['Open', 'High', 'Low', 'Close']
+            if not all(col in df.columns for col in required_cols):
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                logger.error(f"Missing required columns: {missing_cols}")
+                return None
+            
+            # Ensure numeric data types for price columns
+            df = ensure_numeric(df, required_cols + (['Volume'] if 'Volume' in df.columns else []))
+            
+            # Process technical indicators - EXACT SAME FUNCTION used in training
+            processed_df = process_technical_indicators(df)
+            
+            # Debug: Print raw close price and normalized close to identify the issue
+            raw_close = df['Close'].iloc[-1] if 'Close' in df.columns else df['close'].iloc[-1]
+            logger.info(f"DEBUG - Raw close price: {raw_close}")
+            
+            # Fix for close_norm always being 0.0
+            # pct_change() only captures the change between consecutive bars, which can be 0
+            # Let's add a better normalization based on min-max scaling over recent bars
+            window = 100  # Use last 100 bars to determine min/max
+            window_data = df.iloc[-window:] if len(df) > window else df
+            if 'Close' in df.columns:
+                min_price = window_data['Close'].min()
+                max_price = window_data['Close'].max()
+                if max_price > min_price:  # Avoid division by zero
+                    normalized_close = (raw_close - min_price) / (max_price - min_price)
+                    logger.info(f"DEBUG - Min price: {min_price}, Max price: {max_price}")
+                    logger.info(f"DEBUG - Better normalized close: {normalized_close}")
+                    processed_df['close_norm'] = normalized_close
+            elif 'close' in df.columns:
+                min_price = window_data['close'].min()
+                max_price = window_data['close'].max()
+                if max_price > min_price:  # Avoid division by zero
+                    normalized_close = (raw_close - min_price) / (max_price - min_price)
+                    logger.info(f"DEBUG - Min price: {min_price}, Max price: {max_price}")
+                    logger.info(f"DEBUG - Better normalized close: {normalized_close}")
+                    processed_df['close_norm'] = normalized_close
+            
+            if 'close_norm' in processed_df.columns:
+                logger.info(f"DEBUG - close_norm value: {processed_df['close_norm'].iloc[-1]}")
+                logger.info(f"DEBUG - close_norm min/max: {processed_df['close_norm'].min()}/{processed_df['close_norm'].max()}")
+            elif 'Close_norm' in processed_df.columns:
+                logger.info(f"DEBUG - Close_norm value: {processed_df['Close_norm'].iloc[-1]}")
+                logger.info(f"DEBUG - Close_norm min/max: {processed_df['Close_norm'].min()}/{processed_df['Close_norm'].max()}")
+            elif 'CLOSE_NORM' in processed_df.columns:
+                logger.info(f"DEBUG - CLOSE_NORM value: {processed_df['CLOSE_NORM'].iloc[-1]}")
+                logger.info(f"DEBUG - CLOSE_NORM min/max: {processed_df['CLOSE_NORM'].min()}/{processed_df['CLOSE_NORM'].max()}")
+            else:
+                logger.info(f"DEBUG - No normalized close column found in {processed_df.columns.tolist()}")
+            
+            # Print all columns to help debug indicator issues
+            logger.debug(f"Available columns after processing: {processed_df.columns.tolist()}")
+            
+            # Get the last row - this is our current bar with all indicators
+            last_row = processed_df.iloc[-1]
+            
+            # Build observation vector EXACTLY as done in environment.py in _get_obs()
+            # Start with close_norm
+            if 'close_norm' in processed_df.columns:
+                close_norm = last_row['close_norm']
+            elif 'Close_norm' in processed_df.columns:  
+                close_norm = last_row['Close_norm']
+            elif 'CLOSE_NORM' in processed_df.columns:
+                close_norm = last_row['CLOSE_NORM']
+            else:
+                logger.error("No normalized close price column found")
+                return None
+            
+            # Start observation vector with close_norm
+            obs = [float(close_norm)]
+
+            # IMPORTANT: Filter out the trend_direction from the enabled indicators
+            # This ensures we're not counting it twice in the observation vector
+            filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'TREND_DIRECTION']
+            
+            # Log enabled indicators to help debug
+            logger.info(f"Using {len(filtered_indicators)} enabled indicators from config: {filtered_indicators}")
+            
+            # Add indicators in EXACT SAME ORDER as specified in self.enabled_indicators
+            # This matches how environment.py builds observations
+            missing_indicators = []
+            for indicator in filtered_indicators:
+                # Try different case variations
+                found = False
+                for col_variant in [indicator, indicator.lower(), indicator.upper()]:
+                    if col_variant in processed_df.columns:
+                        obs.append(float(last_row[col_variant]))
+                        found = True
+                        break
+                
+                if not found:
+                    missing_indicators.append(indicator)
+                    logger.warning(f"Indicator {indicator} not found in processed data")
+                    # Add a placeholder value of 0 to maintain vector size and order
+                    obs.append(0.0)
+            
+            if missing_indicators:
+                logger.error(f"Missing indicators: {missing_indicators}. This may cause model prediction errors.")
+            
+            # Add current position to observation (always the last feature)
+            # This uses the same values as in environment.py: 1 for long, -1 for short, 0 for flat
+            obs.append(float(self.current_position))
+            
+            # Convert to numpy array with proper dtype
+            obs = np.array(obs, dtype=np.float32)
+            
+            # Check if our observation matches the expected shape from the model
+            if self.model and hasattr(self.model, 'observation_space'):
+                expected_shape = self.model.observation_space.shape[0]
+                actual_shape = len(obs)
+                
+                # Log the shapes for debugging
+                logger.info(f"Model expects observation shape: {expected_shape}, observation has shape: {actual_shape}")
+                
+                if actual_shape != expected_shape:
+                    logger.error(f"CRITICAL ERROR: Observation shape mismatch: {actual_shape} vs expected {expected_shape}")
+                    logger.error(f"This means the enabled indicators in config.yaml DON'T match what was used in training")
+                    logger.error(f"Current observation: {obs}")
+                    logger.error(f"Enabled indicators: {self.enabled_indicators}")
+                    logger.error(f"Filtered indicators: {filtered_indicators}")
+                    return None
+            
+            # Ensure observation values are within appropriate ranges
+            obs = np.clip(obs, -1.0, 1.0)  # Most indicators should be in [-1, 1]
+            
+            # But close_norm should be in [0, 1]
+            if len(obs) > 0:
+                obs[0] = np.clip(obs[0], 0.0, 1.0)
+            
+            logger.debug(f"Final observation: {obs}")
+            return obs
+            
+        except Exception as e:
+            logger.error(f"Error processing bar: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
     
     def get_prediction(self, observation):
         """
@@ -481,6 +824,24 @@ class ModelTrader:
         if self.model is None:
             logger.error("Model not loaded. Cannot make prediction.")
             return 2  # Default to hold if model not loaded
+        
+        # Print feature vector for debugging
+        logger.info(f"Feature vector for prediction: {observation}")
+        
+        # Print feature vector with names for better interpretation
+        feature_names = ["close_norm"]
+        # Filter out trend_direction from indicators list
+        filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'TREND_DIRECTION']
+        feature_names.extend(filtered_indicators)
+        feature_names.append("position")
+        
+        # Create a dictionary mapping feature names to values
+        feature_dict = {}
+        for i, name in enumerate(feature_names):
+            if i < len(observation):
+                feature_dict[name] = observation[i]
+        
+        logger.info(f"Named features: {feature_dict}")
         
         action, _ = self.model.predict(observation, deterministic=True)
         return int(action)
@@ -497,48 +858,113 @@ class ModelTrader:
             logger.error("No active contract set. Cannot execute trade.")
             return
         
-        # Verify position before trading
-        self.verify_position()
+        # Get current actual position from IB before making decisions
+        self.verify_position(force=True)
+        actual_position_quantity = self.expected_position  # This should be updated by verify_position
+        
+        # Check for any pending orders in IB - use trades instead of just orders
+        open_trades = self.ib.openTrades()
+        # Filter trades for our contract
+        contract_orders = []
+        for trade in open_trades:
+            if (trade.contract and trade.contract.symbol == self.active_contract.symbol and
+                trade.isActive()):
+                contract_orders.append(trade)
+                
+        if contract_orders:
+            logger.warning(f"Found {len(contract_orders)} pending orders for {self.active_contract.symbol}. Waiting for these to complete:")
+            for trade in contract_orders:
+                logger.warning(f"Pending order: {trade.order.action} {trade.order.totalQuantity} @ {trade.order.orderType}")
+            logger.warning("Skipping new order submission until pending orders complete")
+            return
         
         current_price = bar['close']
-        logger.info(f"Current price: {current_price}, Action: {action}, Current position: {self.current_position}")
+        logger.info(f"Current price: {current_price}, Action: {action}, Current position: {self.current_position}, Quantity: {actual_position_quantity}")
         
         # Cancel any existing orders
         if self.active_order:
+            logger.info(f"Cancelling existing order: {self.active_order}")
             self.ib.cancelOrder(self.active_order)
             self.active_order = None
         
         # Long signal
-        if action == 0 and self.current_position != 1:
-            # Exit any existing short position
+        if action == 0:
+            # If we're currently short, we need to exit that position first
             if self.current_position == -1:
+                logger.info("Exiting short position before entering long")
                 self._exit_position()
+                # Wait for position to be verified as closed before proceeding
+                self.verify_position(force=True)
+                if self.current_position != 0:
+                    logger.warning("Position still not closed, waiting for exit order to fill")
+                    return
             
-            # Enter long position
-            self._enter_position(1, current_price)
+            # Now we can enter the long position
+            if actual_position_quantity == self.position_size:
+                logger.info(f"Already have target long position of {self.position_size} contracts. Maintaining position.")
+                return
+            elif actual_position_quantity == 0:
+                # Enter full long position
+                logger.info(f"Entering full long position of {self.position_size} contracts")
+                self._enter_position(1, current_price)
+            elif 0 < actual_position_quantity < self.position_size:
+                # Increase position
+                additional_quantity = self.position_size - actual_position_quantity
+                logger.info(f"Increasing long position by {additional_quantity} contracts")
+                self._enter_position(1, current_price, additional_quantity)
+            elif actual_position_quantity > self.position_size:
+                # Reduce position
+                excess = actual_position_quantity - self.position_size
+                logger.info(f"Reducing long position by {excess} contracts")
+                self._reduce_position(excess, is_long=True)
         
         # Short signal
-        elif action == 1 and self.current_position != -1:
-            # Exit any existing long position
+        elif action == 1:
+            # If we're currently long, we need to exit that position first
             if self.current_position == 1:
+                logger.info("Exiting long position before entering short")
                 self._exit_position()
+                # Wait for position to be verified as closed before proceeding
+                self.verify_position(force=True)
+                if self.current_position != 0:
+                    logger.warning("Position still not closed, waiting for exit order to fill")
+                    return
             
-            # Enter short position
-            self._enter_position(-1, current_price)
+            # Now we can enter the short position
+            if actual_position_quantity == -self.position_size:
+                logger.info(f"Already have target short position of {self.position_size} contracts. Maintaining position.")
+                return
+            elif actual_position_quantity == 0:
+                # Enter full short position
+                logger.info(f"Entering full short position of {self.position_size} contracts")
+                self._enter_position(-1, current_price)
+            elif -self.position_size < actual_position_quantity < 0:
+                # Increase position
+                additional_quantity = self.position_size + actual_position_quantity  # actual_pos is negative
+                logger.info(f"Increasing short position by {additional_quantity} contracts")
+                self._enter_position(-1, current_price, additional_quantity)
+            elif actual_position_quantity < -self.position_size:
+                # Reduce position
+                excess = -actual_position_quantity - self.position_size  # Convert to positive
+                logger.info(f"Reducing short position by {excess} contracts")
+                self._reduce_position(excess, is_long=False)
         
         # Hold signal - do nothing
         elif action == 2:
             logger.info("Hold signal - maintaining current position")
-    
-    def _enter_position(self, direction, price):
+        
+    def _enter_position(self, direction, price, quantity=None):
         """
         Enter a new position with optional stop loss and take profit.
         
         Args:
             direction: 1 for long, -1 for short
             price: Current price for order execution
+            quantity: Number of contracts to trade, defaults to self.position_size
         """
-        quantity = self.position_size
+        if quantity is None:
+            quantity = self.position_size
+            
         action_text = "BUY" if direction == 1 else "SELL"
         logger.info(f"Entering {action_text} position with {quantity} contracts at price {price}")
         
@@ -573,6 +999,38 @@ class ModelTrader:
         
         # Update current position
         self.current_position = direction
+        
+    def _reduce_position(self, quantity, is_long=True):
+        """
+        Reduce an existing position by a specific quantity.
+        
+        Args:
+            quantity: Number of contracts to reduce by
+            is_long: Whether the current position is long (True) or short (False)
+        """
+        # To reduce a position, we do the opposite action
+        action_text = "SELL" if is_long else "BUY"
+        
+        logger.info(f"Reducing position with {action_text} {quantity} contracts")
+        
+        # Create market order to reduce position
+        order = MarketOrder(action_text, quantity)
+        trade = self.ib.placeOrder(self.active_contract, order)
+        
+        # Track the order
+        order_id = order.orderId if hasattr(order, 'orderId') else None
+        if order_id:
+            self.active_orders[order_id] = {
+                'action': action_text,
+                'quantity': quantity,
+                'price': 0,  # We don't know the price for market orders
+                'time': datetime.now(),
+                'type': 'reduce'
+            }
+            self.order_status[order_id] = "Submitted"
+            
+        # Register for order status updates
+        trade.statusEvent += self.update_order_status
     
     def _exit_position(self):
         """Exit the current position."""
@@ -589,8 +1047,24 @@ class ModelTrader:
         order = MarketOrder(action_text, quantity)
         trade = self.ib.placeOrder(self.active_contract, order)
         
-        # Update current position
-        self.current_position = 0
+        # Track the order
+        order_id = order.orderId if hasattr(order, 'orderId') else None
+        if order_id:
+            self.active_orders[order_id] = {
+                'action': action_text,
+                'quantity': quantity,
+                'price': 0,  # We don't know the price for market orders
+                'time': datetime.now(),
+                'type': 'exit'
+            }
+            self.order_status[order_id] = "Submitted"
+            
+            # Register for order status updates
+            trade.statusEvent += self.update_order_status
+        
+        # Note: Don't update current_position here as it will be updated when the order is filled
+        # Just track that we're in the process of exiting
+        logger.info("Position exit order submitted - waiting for confirmation")
     
     def _create_bracket_order(self, direction, price, quantity):
         """
@@ -607,6 +1081,9 @@ class ModelTrader:
         # Calculate take profit and stop loss prices
         point_value = 20.0  # $20 per point for NQ futures
         
+        # Set minimum tick size for the contract - NQ futures use 0.25 point increments
+        min_tick_size = 0.25
+        
         # For bracket orders, we need price levels rather than percentages
         if self.take_profit_pct is not None:
             # Convert take profit percentage to points
@@ -617,6 +1094,9 @@ class ModelTrader:
                 take_profit_price = price + tp_points
             else:  # Short position
                 take_profit_price = price - tp_points
+            
+            # Round to the correct tick size
+            take_profit_price = round(take_profit_price / min_tick_size) * min_tick_size
             
             logger.info(f"Take profit set at {take_profit_price} ({self.take_profit_pct}% = {tp_points} points)")
         else:
@@ -632,6 +1112,9 @@ class ModelTrader:
                 stop_loss_price = price - sl_points
             else:  # Short position
                 stop_loss_price = price + sl_points
+            
+            # Round to the correct tick size
+            stop_loss_price = round(stop_loss_price / min_tick_size) * min_tick_size
             
             logger.info(f"Stop loss set at {stop_loss_price} ({self.stop_loss_pct}% = {sl_points} points)")
         else:
@@ -650,7 +1133,7 @@ class ModelTrader:
         parent_order.action = action_text
         parent_order.orderType = "MKT"
         parent_order.totalQuantity = quantity
-        parent_order.transmit = False
+        parent_order.transmit = True  # Set to True to automatically transmit
         
         # Create take profit order
         if take_profit_price is not None:
@@ -658,9 +1141,9 @@ class ModelTrader:
             take_profit_order.action = opposite_action
             take_profit_order.orderType = "LMT"
             take_profit_order.totalQuantity = quantity
-            take_profit_order.lmtPrice = round(take_profit_price, 2)
+            take_profit_order.lmtPrice = take_profit_price  # Already rounded to correct tick size
             take_profit_order.parentId = parent_order.orderId
-            take_profit_order.transmit = stop_loss_price is None  # Only transmit if no stop loss
+            take_profit_order.transmit = True  # Set to True to automatically transmit
         else:
             take_profit_order = None
         
@@ -670,7 +1153,7 @@ class ModelTrader:
             stop_loss_order.action = opposite_action
             stop_loss_order.orderType = "STP"
             stop_loss_order.totalQuantity = quantity
-            stop_loss_order.auxPrice = round(stop_loss_price, 2)
+            stop_loss_order.auxPrice = stop_loss_price  # Already rounded to correct tick size
             stop_loss_order.parentId = parent_order.orderId
             stop_loss_order.transmit = True  # Always transmit the last order
         else:
@@ -688,12 +1171,80 @@ class ModelTrader:
         
         self.active_order = parent_order
 
+    def fetch_historical_bars(self, days_back=5):
+        """
+        Fetch historical bars for the current contract.
+        
+        Args:
+            days_back: Number of days to look back for historical data
+            
+        Returns:
+            bool: Whether fetching was successful
+        """
+        if self.active_contract is None:
+            logger.error("No active contract. Cannot fetch historical data.")
+            return False
+        
+        logger.info(f"Fetching historical data for {self.active_contract.symbol} going back {days_back} days")
+        
+        # Calculate the lookback period - increased for more reliable indicator calculation
+        end_datetime = datetime.now()
+        start_datetime = end_datetime - timedelta(days=days_back)
+        
+        # Request data with 5-minute bars (consistent with training)
+        try:
+            bars = self.ib.reqHistoricalData(
+                self.active_contract,
+                endDateTime='',  # '' for latest data
+                durationStr=f'{days_back} D',
+                barSizeSetting='5 mins',  # Match the interval used in training
+                whatToShow='TRADES',
+                useRTH=True,  # Only regular trading hours
+                formatDate=1   # Use integer format for dates
+            )
+            
+            if not bars:
+                logger.error("No historical bars returned")
+                return False
+            
+            logger.info(f"Received {len(bars)} historical bars")
+            
+            # Clear existing bar history
+            self.bar_history = []
+            
+            # Convert IB bars to standard format
+            for bar in bars:
+                standard_bar = {
+                    'time': bar.date,
+                    'open': float(bar.open),
+                    'high': float(bar.high),
+                    'low': float(bar.low),
+                    'close': float(bar.close),
+                    'volume': float(bar.volume)
+                }
+                
+                # Add to bar history
+                self.bar_history.append(standard_bar)
+            
+            logger.info(f"Processed {len(self.bar_history)} historical bars")
+            
+            # Ensure we have enough bars for indicator calculation
+            if len(self.bar_history) < self.min_bars_needed:
+                logger.warning(f"Only got {len(self.bar_history)} bars, which is less than the minimum needed ({self.min_bars_needed})")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            return False
+
 def onBar(bars, hasNewBar):
     """
     Callback function triggered on each new real-time bar.
     'bars' is a list of bars, and 'hasNewBar' is a boolean indicating if there's a new bar.
     """
-    global bar_buffer, model_trader, last_data_timestamp, is_data_flowing
+    global bar_buffer, bar_buckets, model_trader, last_data_timestamp, is_data_flowing
     
     # Update heartbeat timestamp
     last_data_timestamp = datetime.now()
@@ -705,37 +1256,137 @@ def onBar(bars, hasNewBar):
     # Get the latest bar from the list
     latest_bar = bars[-1]
     
-    # Print information about the new 5-sec bar.
-    print(f"5-sec Bar: Open={latest_bar.open_} High={latest_bar.high} Low={latest_bar.low} Close={latest_bar.close} Volume={latest_bar.volume}")
+    # Print immediate feedback for each new bar
+    try:
+        logger.info(f"5-sec Bar received: Time={latest_bar.time} Close={latest_bar.close} Volume={latest_bar.volume}")
+    except Exception as e:
+        logger.warning(f"Error displaying bar info: {e}")
     
     # Only append if it's a new bar
     if hasNewBar:
-        bar_buffer.append(latest_bar)
-        
-        # When 60 bars are accumulated, aggregate them into one 5-minute bar.
-        if len(bar_buffer) == 60:
-            five_min_bar = aggregate_bars(bar_buffer)
-            print("Aggregated 5-Minute Bar:")
-            print(five_min_bar)
+        try:
+            # Keep legacy buffer for backward compatibility
+            bar_buffer.append(latest_bar)
+            if len(bar_buffer) > 300:  # Prevent excessive memory usage
+                bar_buffer = bar_buffer[-300:]
             
-            # Use the model trader to make a prediction and execute a trade
-            if model_trader is not None:
-                # Preprocess the bar for model input
-                observation = model_trader.preprocess_bar(five_min_bar)
+            # Add the bar to its appropriate 5-minute bucket
+            # Handle the case where latest_bar.time is already a datetime object
+            try:
+                if isinstance(latest_bar.time, datetime):
+                    bar_time = latest_bar.time
+                else:
+                    # If it's a timestamp or string, convert accordingly
+                    try:
+                        bar_time = datetime.fromtimestamp(latest_bar.time)
+                    except (TypeError, ValueError):
+                        # If conversion fails, use current time as fallback
+                        logger.warning(f"Failed to parse bar time: {latest_bar.time}, using current time")
+                        bar_time = datetime.now()
                 
-                # If we have enough data to make a prediction
-                if observation is not None:
-                    # Get model prediction
-                    action = model_trader.get_prediction(observation)
-                    print(f"Model prediction: {action} (0=long, 1=short, 2=hold)")
-                    
-                    # Execute trade based on prediction
-                    model_trader.execute_trade(action, five_min_bar)
+                interval_key = get_interval_key(bar_time)
+                bar_buckets[interval_key].append(latest_bar)
+                logger.info(f"Bar added to interval {interval_key} (now contains {len(bar_buckets[interval_key])} bars)")
+            except Exception as e:
+                logger.error(f"Error processing bar time: {e}")
+                # Use current time as a fallback for interval
+                interval_key = get_interval_key(datetime.now())
+                bar_buckets[interval_key].append(latest_bar)
+                logger.warning(f"Using current time for interval {interval_key} due to error")
             
-            # Reset the buffer for the next aggregation.
-            bar_buffer = []
-        else:
-            print(f"Bar buffer: {len(bar_buffer)}/60 bars collected")
+            # Attempt to synchronize and process complete bars
+            five_min_bar = None
+            try:
+                five_min_bar = synchronize_bars()
+            except Exception as e:
+                logger.error(f"Error in synchronize_bars: {e}")
+            
+            # Process the synchronized bar if available
+            if five_min_bar is not None:
+                logger.info("Processing synchronized 5-minute bar:")
+                logger.info(f"Time: {five_min_bar.get('time', 'Unknown')} | Open: {five_min_bar['open']} | High: {five_min_bar['high']} | Low: {five_min_bar['low']} | Close: {five_min_bar['close']} | Volume: {five_min_bar['volume']}")
+                
+                # Use the model trader to make a prediction and execute a trade
+                if model_trader is not None:
+                    try:
+                        # Force position verification before making trading decisions
+                        model_trader.verify_position(force=True)
+                        
+                        # Preprocess the bar for model input
+                        observation = model_trader.preprocess_bar(five_min_bar)
+                        
+                        # If we have enough data to make a prediction
+                        if observation is not None:
+                            # Get model prediction
+                            action = model_trader.get_prediction(observation)
+                            logger.info(f"Model prediction: {action} (0=long, 1=short, 2=hold)")
+                            
+                            # Execute trade based on prediction
+                            model_trader.execute_trade(action, five_min_bar)
+                            
+                            # Verify position after trade execution
+                            logger.info("Verifying position after trade execution...")
+                            model_trader.verify_position(force=True)
+                    except Exception as e:
+                        logger.error(f"Error in model prediction or trading: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+            
+            # For immediate feedback, also process every N bars regardless of time boundaries
+            # This ensures we see activity right away while still maintaining synchronized trading
+            legacy_processing_frequency = 12  # Process every 12 bars (approximately 1 minute)
+            if len(bar_buffer) % legacy_processing_frequency == 0:
+                logger.info(f"Interim bar processing: {len(bar_buffer)} bars collected")
+                
+                # Only create interim bars if we haven't already processed a synchronized bar in this cycle
+                if five_min_bar is None and len(bar_buffer) >= legacy_processing_frequency:
+                    try:
+                        # Use the last N bars for interim processing
+                        interim_bars = bar_buffer[-legacy_processing_frequency:]
+                        five_min_bar_interim = aggregate_bars(interim_bars)
+                        
+                        if five_min_bar_interim and model_trader is not None:
+                            logger.info(f"Created interim bar for immediate feedback - Close: {five_min_bar_interim['close']}")
+                    except Exception as e:
+                        logger.error(f"Error creating interim bar: {e}")
+            
+            # Legacy approach (keep for fallback in case synchronization fails)
+            # When 60 bars are accumulated, aggregate them into one 5-minute bar
+            if len(bar_buffer) == 60:
+                try:
+                    logger.info("Using legacy approach to create 5-minute bar (60 bars accumulated)")
+                    five_min_bar_legacy = aggregate_bars(bar_buffer)
+                    
+                    # Only use this if we haven't already processed a synchronized bar
+                    if five_min_bar is None and model_trader is not None:
+                        # Force position verification before making trading decisions
+                        model_trader.verify_position(force=True)
+                        
+                        # Preprocess the bar for model input
+                        observation = model_trader.preprocess_bar(five_min_bar_legacy)
+                        
+                        # If we have enough data to make a prediction
+                        if observation is not None:
+                            # Get model prediction
+                            action = model_trader.get_prediction(observation)
+                            logger.info(f"Model prediction (legacy): {action} (0=long, 1=short, 2=hold)")
+                            
+                            # Execute trade based on prediction
+                            model_trader.execute_trade(action, five_min_bar_legacy)
+                            
+                            # Verify position after trade execution
+                            logger.info("Verifying position after trade execution...")
+                            model_trader.verify_position(force=True)
+                    
+                    # Reset the buffer for the next aggregation
+                    bar_buffer = []
+                except Exception as e:
+                    logger.error(f"Error in legacy bar processing: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Unexpected error in onBar: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
 def heartbeat_monitor():
     """Monitor for data flow and connection health."""
@@ -747,6 +1398,29 @@ def heartbeat_monitor():
         # Check time since last data
         now = datetime.now()
         time_since_last_data = (now - last_data_timestamp).total_seconds()
+        
+        # Try to synchronize bars every 5 seconds
+        # This ensures we catch any completed 5-minute intervals even if data flow is sparse
+        if is_data_flowing and model_trader:
+            five_min_bar = synchronize_bars()
+            if five_min_bar is not None:
+                # We have a valid synchronized bar to process
+                logger.info("Heartbeat monitor found a synchronized bar to process")
+                
+                # Force position verification before making trading decisions
+                model_trader.verify_position(force=True)
+                
+                # Preprocess the bar for model input
+                observation = model_trader.preprocess_bar(five_min_bar)
+                
+                # If we have enough data to make a prediction
+                if observation is not None:
+                    # Get model prediction
+                    action = model_trader.get_prediction(observation)
+                    logger.info(f"Model prediction (heartbeat): {action} (0=long, 1=short, 2=hold)")
+                    
+                    # Execute trade based on prediction
+                    model_trader.execute_trade(action, five_min_bar)
         
         # Log heartbeat status periodically
         if time_since_last_data > heartbeat_interval:
@@ -880,11 +1554,22 @@ if __name__ == '__main__':
         ib.disconnect()
         sys.exit(1)
     
-    # Load previous state if exists
-    model_trader.load_state()
-    
     # Set the active contract
     model_trader.set_active_contract(active_contract)
+    
+    # Load previous state if exists
+    state_loaded = model_trader.load_state()
+    
+    # Check if we have enough bar history. If not, fetch historical data
+    if len(model_trader.bar_history) < model_trader.min_bars_needed:
+        print(f"Insufficient bar history ({len(model_trader.bar_history)}/{model_trader.min_bars_needed}). Fetching historical data...")
+        historical_data_loaded = model_trader.fetch_historical_bars(days_back=5)
+        if historical_data_loaded:
+            print(f"Successfully loaded historical data. Bar history now contains {len(model_trader.bar_history)} bars.")
+        else:
+            print("Failed to load sufficient historical data. The system will wait for enough real-time bars before trading.")
+    else:
+        print(f"Loaded {len(model_trader.bar_history)} bars from saved state")
     
     # Start the heartbeat monitoring thread
     heartbeat_thread = threading.Thread(target=heartbeat_monitor, daemon=True)
@@ -896,7 +1581,7 @@ if __name__ == '__main__':
         bars = ib.reqRealTimeBars(active_contract, barSize=5, whatToShow='TRADES', useRTH=False)
         
         # Register to receive order status updates for all orders
-        ib.connectHandler += lambda: ib.reqAllOpenOrders()
+        ib.connectedEvent += lambda: ib.reqAllOpenOrders()
         
         # Attach the onBar event handler to the updateEvent of the bars list.
         bars.updateEvent += onBar
@@ -935,9 +1620,11 @@ if __name__ == '__main__':
         print("Keyboard interrupt detected, saving state and shutting down...")
         if model_trader:
             model_trader.save_state()
+            print(f"State saved with {len(model_trader.bar_history)} historical bars")
         ib.disconnect()
     except Exception as e:
         print(f"Error in main loop: {e}")
         if model_trader:
             model_trader.save_state()
+            print(f"State saved with {len(model_trader.bar_history)} historical bars")
         ib.disconnect()

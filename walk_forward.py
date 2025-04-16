@@ -471,10 +471,10 @@ def export_consolidated_trade_history(all_window_results: List[Dict], session_fo
         session_folder: Folder to save the consolidated trade history
     """
     # Check if we have trade histories to consolidate
-    windows_with_history = [res for res in all_window_results if 'trade_history' in res and res['trade_history']]
+    windows_with_history = [res for res in all_window_results if 'trade_history' in res and res['trade_history'] and len(res['trade_history']) > 0]
     
     if not windows_with_history:
-        logger.warning("No trade histories found in any window. Skipping consolidated export.")
+        logger.warning("No non-empty trade histories found in any window. Skipping consolidated export.")
         return
     
     # Create empty list to store all trades
@@ -484,7 +484,7 @@ def export_consolidated_trade_history(all_window_results: List[Dict], session_fo
     for res in all_window_results:
         window_num = res.get("window", 0)
         
-        if 'trade_history' in res and res['trade_history']:
+        if 'trade_history' in res and res['trade_history'] and len(res['trade_history']) > 0:
             # Add window number to each trade
             for trade in res['trade_history']:
                 trade_copy = trade.copy()
@@ -492,6 +492,9 @@ def export_consolidated_trade_history(all_window_results: List[Dict], session_fo
                 trade_copy['test_start'] = res.get('test_start', '')
                 trade_copy['test_end'] = res.get('test_end', '')
                 all_trades.append(trade_copy)
+        elif 'trade_count' in res and res['trade_count'] > 0:
+            # Log warning for windows with trades but no trade history
+            logger.warning(f"Window {window_num} has {res['trade_count']} trades but empty trade history")
     
     if not all_trades:
         logger.warning("No trades found in any window. Skipping consolidated export.")
@@ -684,10 +687,13 @@ def process_single_window(
     if "trade_history" in test_results:
         window_result["has_trade_history"] = True
         
-        # Save trade history
-        trade_history_path = f'{window_folder}/trade_history.csv'
-        save_trade_history(test_results["trade_history"], trade_history_path)
-        window_logger.info(f"Trade history saved to {trade_history_path}")
+        # Only save trade history if there are actual trades in the history
+        if test_results["trade_history"] and len(test_results["trade_history"]) > 0:
+            trade_history_path = f'{window_folder}/trade_history.csv'
+            save_trade_history(test_results["trade_history"], trade_history_path)
+            window_logger.info(f"Trade history saved to {trade_history_path}")
+        else:
+            window_logger.warning(f"Empty trade history even though trade_count is {test_results['trade_count']}. Not saving empty CSV.")
     else:
         window_result["has_trade_history"] = False
     

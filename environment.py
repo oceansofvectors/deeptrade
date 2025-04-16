@@ -4,12 +4,13 @@ import numpy as np
 import pandas as pd
 from decimal import Decimal
 import money  # Import the new money module
+import logging
 
 class TradingEnv(gym.Env):
     """
-    Custom Gymnasium environment for BTC trading with multiple technical indicators.
+    Custom Gymnasium environment for trading with multiple technical indicators.
 
-    Observation Space: [close_norm, trend_direction, technical_indicators..., position]
+    Observation Space: [close_norm, technical_indicators..., position]
     Action Space:
         0: Long (Buy)
         1: Short (Sell)
@@ -18,7 +19,7 @@ class TradingEnv(gym.Env):
 
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1):
+    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None):
         """
         Initialize the trading environment.
 
@@ -32,6 +33,7 @@ class TradingEnv(gym.Env):
             transaction_cost (float): Cost per trade as a fraction of the trade value (e.g., 0.0005 = 0.05%).
                                      Default is 0.0 (no transaction costs).
             position_size (int): Number of contracts to trade (default: 1).
+            enabled_indicators (list): List of enabled indicators to use in the observation space.
         """
         super(TradingEnv, self).__init__()
         self.data = data.reset_index(drop=True)
@@ -43,49 +45,57 @@ class TradingEnv(gym.Env):
         # Define the technical indicators to include in the observation space
         self.technical_indicators = []
         
-        # Add available indicators to the list
-        if 'trend_direction' in self.data.columns:
-            self.technical_indicators.append('trend_direction')
-        if 'RSI' in self.data.columns:
-            self.technical_indicators.append('RSI')
-        if 'CCI' in self.data.columns:
-            self.technical_indicators.append('CCI')
-        if 'ADX' in self.data.columns:
-            self.technical_indicators.append('ADX')
-        if 'ADX_POS' in self.data.columns:
-            self.technical_indicators.append('ADX_POS')
-        if 'ADX_NEG' in self.data.columns:
-            self.technical_indicators.append('ADX_NEG')
-        if 'STOCH_K' in self.data.columns:
-            self.technical_indicators.append('STOCH_K')
-        if 'STOCH_D' in self.data.columns:
-            self.technical_indicators.append('STOCH_D')
-        if 'MACD' in self.data.columns:
-            self.technical_indicators.append('MACD')
-        if 'MACD_SIGNAL' in self.data.columns:
-            self.technical_indicators.append('MACD_SIGNAL')
-        if 'MACD_HIST' in self.data.columns:
-            self.technical_indicators.append('MACD_HIST')
-        if 'ROC' in self.data.columns:
-            self.technical_indicators.append('ROC')
-        if 'WILLIAMS_R' in self.data.columns:
-            self.technical_indicators.append('WILLIAMS_R')
-        if 'SMA_NORM' in self.data.columns:
-            self.technical_indicators.append('SMA_NORM')
-        if 'EMA_NORM' in self.data.columns:
-            self.technical_indicators.append('EMA_NORM')
-        if 'DISPARITY' in self.data.columns:
-            self.technical_indicators.append('DISPARITY')
-        if 'ATR' in self.data.columns:
-            self.technical_indicators.append('ATR')
-        if 'OBV_NORM' in self.data.columns:
-            self.technical_indicators.append('OBV_NORM')
-        if 'CMF' in self.data.columns:
-            self.technical_indicators.append('CMF')
-        if 'PSAR_NORM' in self.data.columns:
-            self.technical_indicators.append('PSAR_NORM')
-        if 'PSAR_DIR' in self.data.columns:
-            self.technical_indicators.append('PSAR_DIR')
+        # If enabled_indicators is provided, use those
+        if enabled_indicators is not None:
+            self.technical_indicators = enabled_indicators
+        else:
+            # Otherwise, check for available indicators in the data
+            # NOTE: trend_direction should only be added if explicitly enabled
+            # Do NOT automatically add trend_direction even if it exists in the data
+            if 'trend_direction' in self.data.columns and enabled_indicators is not None and 'TREND_DIRECTION' in enabled_indicators:
+                self.technical_indicators.append('trend_direction')
+            if 'RSI' in self.data.columns:
+                self.technical_indicators.append('RSI')
+            if 'CCI' in self.data.columns:
+                self.technical_indicators.append('CCI')
+            if 'ADX' in self.data.columns:
+                self.technical_indicators.append('ADX')
+            if 'ADX_POS' in self.data.columns:
+                self.technical_indicators.append('ADX_POS')
+            if 'ADX_NEG' in self.data.columns:
+                self.technical_indicators.append('ADX_NEG')
+            if 'STOCH_K' in self.data.columns:
+                self.technical_indicators.append('STOCH_K')
+            if 'STOCH_D' in self.data.columns:
+                self.technical_indicators.append('STOCH_D')
+            if 'MACD' in self.data.columns:
+                self.technical_indicators.append('MACD')
+            if 'MACD_SIGNAL' in self.data.columns:
+                self.technical_indicators.append('MACD_SIGNAL')
+            if 'MACD_HIST' in self.data.columns:
+                self.technical_indicators.append('MACD_HIST')
+            if 'ROC' in self.data.columns:
+                self.technical_indicators.append('ROC')
+            if 'WILLIAMS_R' in self.data.columns:
+                self.technical_indicators.append('WILLIAMS_R')
+            if 'SMA_NORM' in self.data.columns:
+                self.technical_indicators.append('SMA_NORM')
+            if 'EMA_NORM' in self.data.columns:
+                self.technical_indicators.append('EMA_NORM')
+            if 'DISPARITY' in self.data.columns:
+                self.technical_indicators.append('DISPARITY')
+            if 'ATR' in self.data.columns:
+                self.technical_indicators.append('ATR')
+            if 'OBV_NORM' in self.data.columns:
+                self.technical_indicators.append('OBV_NORM')
+            if 'CMF' in self.data.columns:
+                self.technical_indicators.append('CMF')
+            if 'PSAR_NORM' in self.data.columns:
+                self.technical_indicators.append('PSAR_NORM')
+            if 'PSAR_DIR' in self.data.columns:
+                self.technical_indicators.append('PSAR_DIR')
+            if 'VOLUME_MA' in self.data.columns:
+                self.technical_indicators.append('VOLUME_MA')
             
         # Calculate observation space size: close_norm + all technical indicators + position
         obs_size = 1 + len(self.technical_indicators) + 1
@@ -169,6 +179,14 @@ class TradingEnv(gym.Env):
         
         # Add position
         position = float(self.position)
+        
+        # DEBUGGING: Print details about observation vector construction
+        logger = logging.getLogger(__name__)
+        
+        observation_elements = ["close_norm"]
+        observation_elements.extend(self.technical_indicators)
+        observation_elements.append("position")
+        #logger.info(f"OBSERVATION FEATURES ({len(observation_elements)}): {observation_elements}")
         
         # Combine all features
         obs = np.array([close_norm] + indicators + [position], dtype=np.float32)

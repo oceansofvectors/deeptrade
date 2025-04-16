@@ -197,10 +197,25 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             volume_col = 'volume'
         
         # Calculate normalized close - create lowercase version for consistency
-        df['close_norm'] = df[close_col].pct_change().fillna(0)
+        # Improved min-max normalization over a rolling window
+        window = 100  # Use last 100 bars for min-max scaling
+        # For each point, calculate min/max over the previous window periods
+        rolling_min = df[close_col].rolling(window=window, min_periods=1).min()
+        rolling_max = df[close_col].rolling(window=window, min_periods=1).max()
+        
+        # Avoid division by zero and ensure values are in [0, 1]
+        df['close_norm'] = np.where(
+            rolling_max > rolling_min,
+            (df[close_col] - rolling_min) / (rolling_max - rolling_min),
+            0.5  # Default to middle value when there's no range
+        )
+        # Ensure NaN values are filled
+        df['close_norm'] = df['close_norm'].fillna(0.5)
         
         # Add trend direction based on price movement
-        df['trend_direction'] = np.sign(df['close_norm']).fillna(0).astype(int)
+        # Since close_norm no longer represents price change, we need to calculate it separately
+        price_change = df[close_col].pct_change().fillna(0)
+        df['trend_direction'] = np.sign(price_change).fillna(0).astype(int)
         
         # Check if 'Up Trend' column exists in the CSV
         if 'Up Trend' in df.columns and 'Down Trend' in df.columns:
@@ -530,8 +545,11 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         # Fill NaN values with appropriate defaults
         df = df.fillna(0)
         
-        # Create an initial 'position' column (copy of trend_direction)
-        df['position'] = df['trend_direction']
+        # Fill any remaining NaN values in trend_direction and position
+        df['trend_direction'] = df['trend_direction'].fillna(0)
+        
+        # Create an initial 'position' column (should start with no position)
+        df['position'] = 0  # Initialize with no position
         
         # Create a list of all columns that will be used by the model
         model_columns = ['Close', 'close_norm', 'trend_direction', 'position']
@@ -566,10 +584,6 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 elif indicator in ['PSAR_NORM']:
                     # PSAR normalized is typically small
                     df[indicator] = df[indicator].fillna(0.0)
-        
-        # Fill any remaining NaN values in trend_direction and position
-        df['trend_direction'] = df['trend_direction'].fillna(0)
-        df['position'] = df['position'].fillna(0)
         
         # Two-stage normalization for technical indicators using only training data statistics
         logger.info("Performing two-stage normalization for technical indicators using only training data statistics")
