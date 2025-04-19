@@ -3,6 +3,7 @@ import datetime
 import sys
 import pandas as pd
 import numpy as np
+import pytz
 from decimal import Decimal
 import time
 import logging
@@ -218,27 +219,49 @@ class ModelTrader:
             logger.info("Risk management is disabled in config.yaml")
             return
         
+        # Get portfolio value
+        portfolio_value = config.get("environment", {}).get("initial_balance", 10000.0)
+        point_value = 20.0  # $20 per point for NQ futures
+        
         # Stop loss configuration
         stop_loss_config = self.risk_config.get("stop_loss", {})
         if stop_loss_config.get("enabled", False):
             self.stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            max_loss_dollars = portfolio_value * (self.stop_loss_pct / 100)
+            max_loss_points = max_loss_dollars / point_value
+            
             logger.info(f"Stop loss enabled from config: {self.stop_loss_pct}%")
+            logger.info(f"This equals ${max_loss_dollars:.2f} of the ${portfolio_value:.2f} portfolio")
+            logger.info(f"For NQ futures, this represents {max_loss_points:.1f} points")
         else:
             logger.info("Stop loss is disabled in config")
+            self.stop_loss_pct = None
         
         # Take profit configuration
         take_profit_config = self.risk_config.get("take_profit", {})
         if take_profit_config.get("enabled", False):
             self.take_profit_pct = take_profit_config.get("percentage", 2.0)
+            target_profit_dollars = portfolio_value * (self.take_profit_pct / 100)
+            target_points = target_profit_dollars / point_value
+            
             logger.info(f"Take profit enabled from config: {self.take_profit_pct}%")
+            logger.info(f"This equals ${target_profit_dollars:.2f} of the ${portfolio_value:.2f} portfolio")
+            logger.info(f"For NQ futures, this represents {target_points:.1f} points")
+            logger.info(f"Example: If entry at 18000, take profit would be at {18000 + target_points:.1f} for a long position")
         else:
             logger.info("Take profit is disabled in config")
+            self.take_profit_pct = None
         
         # Trailing stop configuration
         trailing_stop_config = self.risk_config.get("trailing_stop", {})
         if trailing_stop_config.get("enabled", False):
             self.trailing_stop_pct = trailing_stop_config.get("percentage", 0.5)
+            trailing_dollars = portfolio_value * (self.trailing_stop_pct / 100)
+            trailing_points = trailing_dollars / point_value
+            
             logger.info(f"Trailing stop enabled from config: {self.trailing_stop_pct}%")
+            logger.info(f"This equals ${trailing_dollars:.2f} of the ${portfolio_value:.2f} portfolio")
+            logger.info(f"For NQ futures, this represents {trailing_points:.1f} points")
         else:
             logger.info("Trailing stop is disabled in config")
             self.trailing_stop_pct = None
@@ -252,86 +275,90 @@ class ModelTrader:
             logger.info(f"Position sizing is disabled in config, using default: {self.position_size}")
     
     def _get_enabled_indicators(self):
-        """
-        Get list of enabled indicators from config.yaml only.
-        This ensures consistency with the currently active configuration.
-        """
-        enabled = []
+        """Get list of enabled indicators from config"""
+        enabled_indicators = []
         
-        # Use config.yaml for indicator configuration
-        logger.info("Using indicators from config.yaml as requested")
-        indicators_config = config.get("indicators", {})
-        
-        # Add indicators in the EXACT SAME ORDER as in environment.py
-        # This is crucial for model compatibility
-        
-        # First check SuperTrend (trend_direction)
-        if indicators_config.get("supertrend", {}).get("enabled", False):
-            enabled.append("TREND_DIRECTION")
+        # Check configuration
+        try:
+            indicators_config = config.get("indicators", {})
             
-        # RSI
-        if indicators_config.get("rsi", {}).get("enabled", False):
-            enabled.append("RSI")
+            # Check each indicator
+            if indicators_config.get("rsi", {}).get("enabled", False):
+                enabled_indicators.append("RSI")
+            if indicators_config.get("cci", {}).get("enabled", False):
+                enabled_indicators.append("CCI")
+            if indicators_config.get("macd", {}).get("enabled", False):
+                enabled_indicators.extend(["MACD", "MACD_SIGNAL", "MACD_HIST"])
+            if indicators_config.get("atr", {}).get("enabled", False):
+                enabled_indicators.append("ATR")
+            if indicators_config.get("supertrend", {}).get("enabled", False):
+                enabled_indicators.append("SUPERTREND")
+            if indicators_config.get("adx", {}).get("enabled", False):
+                enabled_indicators.append("ADX")
+            if indicators_config.get("adx_pos", {}).get("enabled", False):
+                enabled_indicators.append("ADX_POS")
+            if indicators_config.get("adx_neg", {}).get("enabled", False):
+                enabled_indicators.append("ADX_NEG")
+            if indicators_config.get("stoch_k", {}).get("enabled", False):
+                enabled_indicators.append("STOCH_K")
+            if indicators_config.get("stoch_d", {}).get("enabled", False):
+                enabled_indicators.append("STOCH_D")
+            if indicators_config.get("roc", {}).get("enabled", False):
+                enabled_indicators.append("ROC")
+            if indicators_config.get("williams_r", {}).get("enabled", False):
+                enabled_indicators.append("WILLIAMS_R")
+            if indicators_config.get("sma", {}).get("enabled", False):
+                enabled_indicators.append("SMA_NORM")
+            if indicators_config.get("ema", {}).get("enabled", False):
+                enabled_indicators.append("EMA_NORM")
+            if indicators_config.get("disparity", {}).get("enabled", False):
+                enabled_indicators.append("DISPARITY")
+            if indicators_config.get("obv", {}).get("enabled", False):
+                enabled_indicators.append("OBV_NORM")
+            if indicators_config.get("cmf", {}).get("enabled", False):
+                enabled_indicators.append("CMF")
+            if indicators_config.get("psar", {}).get("enabled", False):
+                enabled_indicators.extend(["PSAR_NORM", "PSAR_DIR"])
+            if indicators_config.get("volume", {}).get("enabled", False):
+                enabled_indicators.append("VOLUME_NORM")
+            if indicators_config.get("vwap", {}).get("enabled", False):
+                enabled_indicators.append("VWAP_NORM")
             
-        # CCI
-        if indicators_config.get("cci", {}).get("enabled", False):
-            enabled.append("CCI")
+            # Always include day of week cyclical indicators
+            enabled_indicators.extend(["DOW_SIN", "DOW_COS"])
             
-        # ADX group
-        if indicators_config.get("adx", {}).get("enabled", False):
-            enabled.append("ADX")
-        if indicators_config.get("adx_pos", {}).get("enabled", False):
-            enabled.append("ADX_POS")
-        if indicators_config.get("adx_neg", {}).get("enabled", False):
-            enabled.append("ADX_NEG")
+            # Include minutes since market open indicators if enabled
+            if indicators_config.get("minutes_since_open", {}).get("enabled", False):
+                enabled_indicators.extend(["MSO_SIN", "MSO_COS"])
             
-        # Stochastic
-        if indicators_config.get("stoch_k", {}).get("enabled", False):
-            enabled.append("STOCH_K")
-        if indicators_config.get("stoch_d", {}).get("enabled", False):
-            enabled.append("STOCH_D")
+            # Try to load from enabled_indicators.json if it exists
+            indicators_file = os.path.join(os.path.dirname(self.model_path), "enabled_indicators.json")
+            if os.path.exists(indicators_file):
+                logger.info(f"Loading indicators from {indicators_file}")
+                try:
+                    with open(indicators_file, "r") as f:
+                        file_indicators = json.load(f)
+                        
+                    # If the file indicators don't contain DOW features, add them
+                    if "DOW_SIN" not in file_indicators and "DOW_COS" not in file_indicators:
+                        file_indicators.extend(["DOW_SIN", "DOW_COS"])
+                        logger.info("Added day of week indicators to loaded indicators")
+                    
+                    # Check if the minutes since open indicators should be included
+                    if indicators_config.get("minutes_since_open", {}).get("enabled", False):
+                        if "MSO_SIN" not in file_indicators and "MSO_COS" not in file_indicators:
+                            file_indicators.extend(["MSO_SIN", "MSO_COS"])
+                            logger.info("Added minutes since market open indicators to loaded indicators")
+                        
+                    # Use the indicators from file instead
+                    return file_indicators
+                except Exception as e:
+                    logger.error(f"Error loading indicators from file: {e}")
             
-        # MACD group
-        if indicators_config.get("macd", {}).get("enabled", False):
-            enabled.extend(["MACD", "MACD_SIGNAL", "MACD_HIST"])
-            
-        # ROC
-        if indicators_config.get("roc", {}).get("enabled", False):
-            enabled.append("ROC")
-            
-        # Williams %R
-        if indicators_config.get("williams_r", {}).get("enabled", False):
-            enabled.append("WILLIAMS_R")
-            
-        # Moving averages
-        if indicators_config.get("sma", {}).get("enabled", False):
-            enabled.append("SMA_NORM")
-        if indicators_config.get("ema", {}).get("enabled", False):
-            enabled.append("EMA_NORM")
-            
-        # Disparity
-        if indicators_config.get("disparity", {}).get("enabled", False):
-            enabled.append("DISPARITY")
-            
-        # ATR
-        if indicators_config.get("atr", {}).get("enabled", False):
-            enabled.append("ATR")
-            
-        # Volume indicators
-        if indicators_config.get("obv", {}).get("enabled", False):
-            enabled.append("OBV_NORM")
-        if indicators_config.get("cmf", {}).get("enabled", False):
-            enabled.append("CMF")
-            
-        # PSAR
-        if indicators_config.get("psar", {}).get("enabled", False):
-            enabled.extend(["PSAR_NORM", "PSAR_DIR"])
-            
-        # Volume MA
-        if indicators_config.get("volume", {}).get("enabled", False):
-            enabled.append("VOLUME_MA")
-        
-        return enabled
+            return enabled_indicators
+        except Exception as e:
+            logger.error(f"Error getting enabled indicators: {e}")
+            return ["RSI", "CCI", "DOW_SIN", "DOW_COS"]  # Default minimum set
     
     def load_model(self):
         """Load the trained model from the specified path."""
@@ -377,8 +404,8 @@ class ModelTrader:
                 expected_features = obs_shape[0]
                 logger.info(f"Model expects {expected_features} features")
                 
-                # Filter out trend_direction from indicators if it exists
-                filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'TREND_DIRECTION']
+                # Filter out supertrend from indicators if it exists
+                filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'SUPERTREND']
                 
                 # Log our enabled indicators to compare
                 logger.info(f"We have {len(filtered_indicators) + 2} features (close_norm + {len(filtered_indicators)} indicators + position)")
@@ -394,13 +421,13 @@ class ModelTrader:
                     logger.info("Attempting to identify possible missing indicators:")
                     
                     # Check common indicator combinations from environment.py
-                    common_indicators = ["TREND_DIRECTION", "RSI", "CCI", "ADX", "ADX_POS", "ADX_NEG", 
+                    common_indicators = ["SUPERTREND", "RSI", "CCI", "ADX", "ADX_POS", "ADX_NEG", 
                                        "STOCH_K", "STOCH_D", "MACD", "MACD_SIGNAL", "MACD_HIST", 
                                        "ROC", "WILLIAMS_R", "SMA_NORM", "EMA_NORM", "DISPARITY", 
                                        "ATR", "OBV_NORM", "CMF", "PSAR_NORM", "PSAR_DIR", "VOLUME_MA"]
                     
                     for indicator in common_indicators:
-                        if indicator not in filtered_indicators and indicator.upper() != 'TREND_DIRECTION':
+                        if indicator not in filtered_indicators and indicator.upper() != 'SUPERTREND':
                             possible_missing.append(indicator)
                     
                     logger.info(f"Possible missing indicators: {possible_missing[:feature_delta]}")
@@ -565,29 +592,47 @@ class ModelTrader:
     
     def update_order_status(self, trade):
         """Update the status of an order based on trade updates."""
-        if trade.order.orderId not in self.order_status:
-            self.order_status[trade.order.orderId] = trade.orderStatus.status
-            logger.info(f"New order status: ID={trade.order.orderId}, Status={trade.orderStatus.status}")
-        elif self.order_status[trade.order.orderId] != trade.orderStatus.status:
-            prev_status = self.order_status[trade.order.orderId]
-            self.order_status[trade.order.orderId] = trade.orderStatus.status
-            logger.info(f"Order status updated: ID={trade.order.orderId}, Status changed from {prev_status} to {trade.orderStatus.status}")
+        order_id = trade.order.orderId
+        status = trade.orderStatus.status
+        
+        # Track the order status change
+        if order_id not in self.order_status:
+            self.order_status[order_id] = status
+            logger.info(f"New order status: ID={order_id}, Status={status}")
+        elif self.order_status[order_id] != status:
+            prev_status = self.order_status[order_id]
+            self.order_status[order_id] = status
+            logger.info(f"Order status updated: ID={order_id}, Status changed from {prev_status} to {status}")
             
             # If the order is filled, update our position
-            if trade.orderStatus.status == "Filled":
+            if status == "Filled":
                 # Get the order details
-                order_id = trade.order.orderId
-                order_info = None
+                order_info = self.active_orders.get(order_id)
+                logger.info(f"Order filled: ID={order_id}, Info={order_info}")
                 
-                if order_id in self.active_orders:
-                    order_info = self.active_orders[order_id]
-                    logger.info(f"Order info for filled order: {order_info}")
-                
-                # Determine if this was a special order type
-                order_type = order_info.get('type') if order_info else None
+                if order_info:
+                    order_type = order_info.get('type')
+                    logger.info(f"Filled order type: {order_type}")
+                    
+                    # Handle take profit or stop loss fills
+                    if order_type in ['take_profit', 'stop_loss']:
+                        parent_id = order_info.get('parent_id')
+                        logger.info(f"Child order filled - parent ID: {parent_id}")
+                        
+                        if parent_id and parent_id in self.active_orders:
+                            # Get all child orders
+                            children = self.active_orders[parent_id].get('children', [])
+                            
+                            # Cancel any other child orders
+                            for child_id in children:
+                                if child_id != order_id and child_id in self.order_status and self.order_status[child_id] not in ["Filled", "Cancelled", "Inactive"]:
+                                    logger.info(f"Cancelling other child order: {child_id}")
+                                    try:
+                                        self.ib.cancelOrder(self.ib.order(child_id))
+                                    except Exception as e:
+                                        logger.error(f"Error cancelling child order {child_id}: {e}")
                 
                 # Force immediate position verification to get actual state from IB
-                # This is the most reliable way to know our position after fills
                 logger.info("Order filled - verifying actual position with IB")
                 self.verify_position(force=True)
                 
@@ -598,8 +643,8 @@ class ModelTrader:
                 logger.info(f"After order fill: Position now {self.current_position} (quantity: {self.expected_position})")
             
             # Log when order is cancelled or failed
-            elif trade.orderStatus.status in ["Cancelled", "Inactive", "Error"]:
-                logger.warning(f"Order {trade.order.orderId} failed with status: {trade.orderStatus.status}")
+            elif status in ["Cancelled", "Inactive", "Error"]:
+                logger.warning(f"Order {order_id} failed with status: {status}")
     
     def preprocess_bar(self, bar):
         """
@@ -649,84 +694,70 @@ class ModelTrader:
                         df['time'] = synthetic_times
             
             # Set time as index
-            if 'time' in df.columns:
-                df = df.set_index('time')
-                
-            # Check for duplicate indices and fix them
-            if df.index.duplicated().any():
-                logger.warning(f"Found {df.index.duplicated().sum()} duplicate timestamps in data")
-                # Make index unique by adding small time offsets to duplicates
-                df = df.loc[~df.index.duplicated(keep='first')]
-                logger.info(f"Removed duplicate timestamps. {len(df)} bars remaining.")
+            df = df.set_index('time')
             
-            # Ensure we have properly named columns for process_technical_indicators
-            rename_map = {
+            # Rename OHLCV columns to match the format expected by process_technical_indicators
+            df = df.rename(columns={
                 'open': 'Open',
                 'high': 'High',
                 'low': 'Low',
                 'close': 'Close',
                 'volume': 'Volume'
-            }
-            # Only rename columns that exist in the DataFrame and need renaming
-            cols_to_rename = {k: v for k, v in rename_map.items() if k in df.columns and v not in df.columns}
-            if cols_to_rename:
-                df = df.rename(columns=cols_to_rename)
+            })
             
-            # Ensure all required columns are present and numeric
-            required_cols = ['Open', 'High', 'Low', 'Close']
-            if not all(col in df.columns for col in required_cols):
-                missing_cols = [col for col in required_cols if col not in df.columns]
-                logger.error(f"Missing required columns: {missing_cols}")
-                return None
+            # Calculate close_norm if not already present
+            if 'close_norm' not in df.columns and 'Close_norm' not in df.columns and 'CLOSE_NORM' not in df.columns:
+                df['close_norm'] = df['Close'].pct_change().fillna(0)
             
-            # Ensure numeric data types for price columns
-            df = ensure_numeric(df, required_cols + (['Volume'] if 'Volume' in df.columns else []))
-            
-            # Process technical indicators - EXACT SAME FUNCTION used in training
+            # Apply technical indicators processing
             processed_df = process_technical_indicators(df)
             
-            # Debug: Print raw close price and normalized close to identify the issue
-            raw_close = df['Close'].iloc[-1] if 'Close' in df.columns else df['close'].iloc[-1]
-            logger.info(f"DEBUG - Raw close price: {raw_close}")
+            # Add day of week features if missing
+            if 'DOW_SIN' not in processed_df.columns or 'DOW_COS' not in processed_df.columns:
+                logger.info("Adding missing day of week features")
+                # Calculate day of week (0=Monday, 6=Sunday)
+                processed_df['DOW'] = processed_df.index.dayofweek
+                
+                # Convert to sine and cosine representation
+                processed_df['DOW_SIN'] = np.sin(2 * np.pi * processed_df['DOW'] / 7)
+                processed_df['DOW_COS'] = np.cos(2 * np.pi * processed_df['DOW'] / 7)
+                logger.info(f"Added missing day of week features: DOW={processed_df['DOW'].iloc[-1]}, " +
+                           f"DOW_SIN={processed_df['DOW_SIN'].iloc[-1]:.4f}, DOW_COS={processed_df['DOW_COS'].iloc[-1]:.4f}")
             
-            # Fix for close_norm always being 0.0
-            # pct_change() only captures the change between consecutive bars, which can be 0
-            # Let's add a better normalization based on min-max scaling over recent bars
-            window = 100  # Use last 100 bars to determine min/max
-            window_data = df.iloc[-window:] if len(df) > window else df
-            if 'Close' in df.columns:
-                min_price = window_data['Close'].min()
-                max_price = window_data['Close'].max()
-                if max_price > min_price:  # Avoid division by zero
-                    normalized_close = (raw_close - min_price) / (max_price - min_price)
-                    logger.info(f"DEBUG - Min price: {min_price}, Max price: {max_price}")
-                    logger.info(f"DEBUG - Better normalized close: {normalized_close}")
-                    processed_df['close_norm'] = normalized_close
-            elif 'close' in df.columns:
-                min_price = window_data['close'].min()
-                max_price = window_data['close'].max()
-                if max_price > min_price:  # Avoid division by zero
-                    normalized_close = (raw_close - min_price) / (max_price - min_price)
-                    logger.info(f"DEBUG - Min price: {min_price}, Max price: {max_price}")
-                    logger.info(f"DEBUG - Better normalized close: {normalized_close}")
-                    processed_df['close_norm'] = normalized_close
+            # Add minutes since market open features if missing and enabled
+            if ('MSO_SIN' not in processed_df.columns or 'MSO_COS' not in processed_df.columns) and \
+               config["indicators"].get("minutes_since_open", {}).get("enabled", False):
+                logger.info("Adding minutes since market open features")
+                
+                # Convert to Eastern Time (market time)
+                eastern = pytz.timezone('US/Eastern')
+                
+                # Create a column with the Eastern time
+                processed_df['time_et'] = processed_df.index.tz_localize(pytz.UTC).tz_convert(eastern)
+                
+                # Cash market opens at 9:30 AM ET
+                processed_df['minutes_since_open'] = (processed_df['time_et'].dt.hour - 9) * 60 + processed_df['time_et'].dt.minute - 30
+                
+                # Handle times before market open (negative values)
+                processed_df.loc[processed_df['minutes_since_open'] < 0, 'minutes_since_open'] = 0
+                
+                # Handle times after market close (> 390 minutes)
+                processed_df.loc[processed_df['minutes_since_open'] > 390, 'minutes_since_open'] = 390
+                
+                # Normalize to [0, 1] range (390 minutes = 6.5 hours of trading day)
+                processed_df['minutes_since_open_norm'] = processed_df['minutes_since_open'] / 390.0
+                
+                # Convert to sine and cosine representation (circular encoding)
+                processed_df['MSO_SIN'] = np.sin(2 * np.pi * processed_df['minutes_since_open_norm'])
+                processed_df['MSO_COS'] = np.cos(2 * np.pi * processed_df['minutes_since_open_norm'])
+                
+                logger.info(f"Added minutes since open features: Minutes={processed_df['minutes_since_open'].iloc[-1]}, " +
+                           f"MSO_SIN={processed_df['MSO_SIN'].iloc[-1]:.4f}, MSO_COS={processed_df['MSO_COS'].iloc[-1]:.4f}")
+                
+                # Clean up temporary columns
+                processed_df = processed_df.drop(['time_et', 'minutes_since_open', 'minutes_since_open_norm'], axis=1)
             
-            if 'close_norm' in processed_df.columns:
-                logger.info(f"DEBUG - close_norm value: {processed_df['close_norm'].iloc[-1]}")
-                logger.info(f"DEBUG - close_norm min/max: {processed_df['close_norm'].min()}/{processed_df['close_norm'].max()}")
-            elif 'Close_norm' in processed_df.columns:
-                logger.info(f"DEBUG - Close_norm value: {processed_df['Close_norm'].iloc[-1]}")
-                logger.info(f"DEBUG - Close_norm min/max: {processed_df['Close_norm'].min()}/{processed_df['Close_norm'].max()}")
-            elif 'CLOSE_NORM' in processed_df.columns:
-                logger.info(f"DEBUG - CLOSE_NORM value: {processed_df['CLOSE_NORM'].iloc[-1]}")
-                logger.info(f"DEBUG - CLOSE_NORM min/max: {processed_df['CLOSE_NORM'].min()}/{processed_df['CLOSE_NORM'].max()}")
-            else:
-                logger.info(f"DEBUG - No normalized close column found in {processed_df.columns.tolist()}")
-            
-            # Print all columns to help debug indicator issues
-            logger.debug(f"Available columns after processing: {processed_df.columns.tolist()}")
-            
-            # Get the last row - this is our current bar with all indicators
+            # Use the last row of processed dataframe to build observation vector
             last_row = processed_df.iloc[-1]
             
             # Build observation vector EXACTLY as done in environment.py in _get_obs()
@@ -744,9 +775,9 @@ class ModelTrader:
             # Start observation vector with close_norm
             obs = [float(close_norm)]
 
-            # IMPORTANT: Filter out the trend_direction from the enabled indicators
-            # This ensures we're not counting it twice in the observation vector
-            filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'TREND_DIRECTION']
+            # IMPORTANT: Filter out the supertrend from the enabled indicators
+            # because it is handled separately in the preprocessing
+            filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'SUPERTREND']
             
             # Log enabled indicators to help debug
             logger.info(f"Using {len(filtered_indicators)} enabled indicators from config: {filtered_indicators}")
@@ -830,8 +861,8 @@ class ModelTrader:
         
         # Print feature vector with names for better interpretation
         feature_names = ["close_norm"]
-        # Filter out trend_direction from indicators list
-        filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'TREND_DIRECTION']
+        # Filter out supertrend from indicators list
+        filtered_indicators = [ind for ind in self.enabled_indicators if ind.upper() != 'SUPERTREND']
         feature_names.extend(filtered_indicators)
         feature_names.append("position")
         
@@ -862,30 +893,41 @@ class ModelTrader:
         self.verify_position(force=True)
         actual_position_quantity = self.expected_position  # This should be updated by verify_position
         
-        # Check for any pending orders in IB - use trades instead of just orders
-        open_trades = self.ib.openTrades()
-        # Filter trades for our contract
-        contract_orders = []
-        for trade in open_trades:
-            if (trade.contract and trade.contract.symbol == self.active_contract.symbol and
-                trade.isActive()):
-                contract_orders.append(trade)
-                
-        if contract_orders:
-            logger.warning(f"Found {len(contract_orders)} pending orders for {self.active_contract.symbol}. Waiting for these to complete:")
-            for trade in contract_orders:
-                logger.warning(f"Pending order: {trade.order.action} {trade.order.totalQuantity} @ {trade.order.orderType}")
-            logger.warning("Skipping new order submission until pending orders complete")
-            return
-        
         current_price = bar['close']
         logger.info(f"Current price: {current_price}, Action: {action}, Current position: {self.current_position}, Quantity: {actual_position_quantity}")
         
-        # Cancel any existing orders
-        if self.active_order:
-            logger.info(f"Cancelling existing order: {self.active_order}")
-            self.ib.cancelOrder(self.active_order)
-            self.active_order = None
+        # Check if we're already in the position the model wants
+        same_direction = (action == 0 and self.current_position == 1) or (action == 1 and self.current_position == -1)
+        
+        # If the model wants the same position we already have, keep existing orders and position
+        if same_direction:
+            if (action == 0 and actual_position_quantity == self.position_size) or (action == 1 and actual_position_quantity == -self.position_size):
+                logger.info(f"Already have the target {'long' if action == 0 else 'short'} position with correct size. Keeping position and existing orders.")
+                return
+        
+        # If we're changing direction or don't have an active position, cancel existing orders
+        if not same_direction:
+            # Cancel ALL existing orders for this contract when we have a new signal
+            open_trades = self.ib.openTrades()
+            canceled_orders = 0
+            
+            for trade in open_trades:
+                if (trade.contract and trade.contract.symbol == self.active_contract.symbol and
+                    trade.isActive()):
+                    logger.info(f"Cancelling order: {trade.order.orderId} ({trade.order.action} {trade.order.totalQuantity} @ {trade.order.orderType})")
+                    self.ib.cancelOrder(trade.order)
+                    canceled_orders += 1
+                    
+            if canceled_orders > 0:
+                logger.info(f"Canceled {canceled_orders} existing orders for {self.active_contract.symbol}")
+                # Wait briefly for cancellations to be processed
+                self.ib.sleep(0.5)
+            
+            # Cancel any existing tracked order
+            if self.active_order:
+                logger.info(f"Cancelling tracked order: {self.active_order}")
+                self.ib.cancelOrder(self.active_order)
+                self.active_order = None
         
         # Long signal
         if action == 0:
@@ -952,7 +994,7 @@ class ModelTrader:
         # Hold signal - do nothing
         elif action == 2:
             logger.info("Hold signal - maintaining current position")
-        
+    
     def _enter_position(self, direction, price, quantity=None):
         """
         Enter a new position with optional stop loss and take profit.
@@ -1079,52 +1121,69 @@ class ModelTrader:
         opposite_action = "SELL" if direction == 1 else "BUY"
         
         # Calculate take profit and stop loss prices
+        # NQ futures contract value = $20 per point
         point_value = 20.0  # $20 per point for NQ futures
+        
+        # Portfolio value from config (default to $10,000 if not specified)
+        portfolio_value = config.get("environment", {}).get("initial_balance", 10000.0)
         
         # Set minimum tick size for the contract - NQ futures use 0.25 point increments
         min_tick_size = 0.25
         
-        # For bracket orders, we need price levels rather than percentages
+        # For bracket orders, we need price levels based on dollar profit targets
         if self.take_profit_pct is not None:
-            # Convert take profit percentage to points
-            tp_points = (price * (self.take_profit_pct / 100)) / point_value
+            # Calculate how much we want to make in dollars
+            target_profit_dollars = portfolio_value * (self.take_profit_pct / 100)
+            
+            # Convert dollar profit to points
+            target_points = target_profit_dollars / point_value
             
             # Calculate take profit price
             if direction == 1:  # Long position
-                take_profit_price = price + tp_points
+                take_profit_price = price + target_points
             else:  # Short position
-                take_profit_price = price - tp_points
+                take_profit_price = price - target_points
             
             # Round to the correct tick size
             take_profit_price = round(take_profit_price / min_tick_size) * min_tick_size
             
-            logger.info(f"Take profit set at {take_profit_price} ({self.take_profit_pct}% = {tp_points} points)")
+            logger.info(f"Take profit set at {take_profit_price}")
+            logger.info(f"Target profit: ${target_profit_dollars:.2f} ({self.take_profit_pct}% of ${portfolio_value:.2f})")
+            logger.info(f"This equals {target_points} points for NQ futures")
         else:
             take_profit_price = None
             logger.info("Take profit is disabled")
         
         if self.stop_loss_pct is not None:
-            # Convert stop loss percentage to points
-            sl_points = (price * (self.stop_loss_pct / 100)) / point_value
+            # Calculate how much we're willing to lose in dollars
+            max_loss_dollars = portfolio_value * (self.stop_loss_pct / 100)
+            
+            # Convert dollar loss to points
+            loss_points = max_loss_dollars / point_value
             
             # Calculate stop loss price
             if direction == 1:  # Long position
-                stop_loss_price = price - sl_points
+                stop_loss_price = price - loss_points
             else:  # Short position
-                stop_loss_price = price + sl_points
+                stop_loss_price = price + loss_points
             
             # Round to the correct tick size
             stop_loss_price = round(stop_loss_price / min_tick_size) * min_tick_size
             
-            logger.info(f"Stop loss set at {stop_loss_price} ({self.stop_loss_pct}% = {sl_points} points)")
+            logger.info(f"Stop loss set at {stop_loss_price}")
+            logger.info(f"Max loss: ${max_loss_dollars:.2f} ({self.stop_loss_pct}% of ${portfolio_value:.2f})")
+            logger.info(f"This equals {loss_points} points for NQ futures")
         else:
             stop_loss_price = None
             logger.info("Stop loss is disabled")
             
         # Check if trailing stop is enabled
         if self.trailing_stop_pct is not None:
-            ts_points = (price * (self.trailing_stop_pct / 100)) / point_value
-            logger.info(f"Trailing stop is enabled: {self.trailing_stop_pct}% = {ts_points} points")
+            # Calculate trailing stop in dollars
+            trailing_stop_dollars = portfolio_value * (self.trailing_stop_pct / 100)
+            trailing_points = trailing_stop_dollars / point_value
+            logger.info(f"Trailing stop is enabled: ${trailing_stop_dollars:.2f} ({self.trailing_stop_pct}% of portfolio)")
+            logger.info(f"This equals {trailing_points} points for NQ futures")
         else:
             logger.info("Trailing stop is disabled")
         
@@ -1133,7 +1192,14 @@ class ModelTrader:
         parent_order.action = action_text
         parent_order.orderType = "MKT"
         parent_order.totalQuantity = quantity
-        parent_order.transmit = True  # Set to True to automatically transmit
+        parent_order.transmit = False  # Set to False until we've created child orders
+        
+        # Place the parent order to get an orderId
+        parent_trade = self.ib.placeOrder(self.active_contract, parent_order)
+        parent_id = parent_order.orderId
+        
+        # Creating a bracket order requires placing multiple orders
+        bracket_orders = [parent_order]
         
         # Create take profit order
         if take_profit_price is not None:
@@ -1141,11 +1207,21 @@ class ModelTrader:
             take_profit_order.action = opposite_action
             take_profit_order.orderType = "LMT"
             take_profit_order.totalQuantity = quantity
-            take_profit_order.lmtPrice = take_profit_price  # Already rounded to correct tick size
-            take_profit_order.parentId = parent_order.orderId
-            take_profit_order.transmit = True  # Set to True to automatically transmit
-        else:
-            take_profit_order = None
+            take_profit_order.lmtPrice = take_profit_price
+            take_profit_order.parentId = parent_id
+            take_profit_order.transmit = stop_loss_price is None  # Transmit if this is the last order
+            
+            bracket_orders.append(take_profit_order)
+            
+            # Track this order in our active_orders
+            self.active_orders[take_profit_order.orderId] = {
+                'action': opposite_action,
+                'quantity': quantity,
+                'price': take_profit_price,
+                'time': datetime.now(),
+                'type': 'take_profit',
+                'parent_id': parent_id
+            }
         
         # Create stop loss order
         if stop_loss_price is not None:
@@ -1153,23 +1229,43 @@ class ModelTrader:
             stop_loss_order.action = opposite_action
             stop_loss_order.orderType = "STP"
             stop_loss_order.totalQuantity = quantity
-            stop_loss_order.auxPrice = stop_loss_price  # Already rounded to correct tick size
-            stop_loss_order.parentId = parent_order.orderId
+            stop_loss_order.auxPrice = stop_loss_price
+            stop_loss_order.parentId = parent_id
             stop_loss_order.transmit = True  # Always transmit the last order
-        else:
-            stop_loss_order = None
-        
-        # Place the bracket order
-        bracket_orders = [parent_order]
-        if take_profit_order is not None:
-            bracket_orders.append(take_profit_order)
-        if stop_loss_order is not None:
+            
             bracket_orders.append(stop_loss_order)
+            
+            # Track this order in our active_orders
+            self.active_orders[stop_loss_order.orderId] = {
+                'action': opposite_action,
+                'quantity': quantity,
+                'price': stop_loss_price,
+                'time': datetime.now(),
+                'type': 'stop_loss',
+                'parent_id': parent_id
+            }
         
-        for order in bracket_orders:
+        # If no child orders, we need to transmit the parent
+        if take_profit_price is None and stop_loss_price is None:
+            parent_order.transmit = True
+            self.ib.placeOrder(self.active_contract, parent_order)
+        
+        # Place all child orders
+        for order in bracket_orders[1:]:  # Skip parent which was already placed
             trade = self.ib.placeOrder(self.active_contract, order)
+            trade.statusEvent += self.update_order_status
         
+        # Track the parent order
         self.active_order = parent_order
+        self.active_orders[parent_id] = {
+            'action': action_text,
+            'quantity': quantity,
+            'price': 0,  # Market order
+            'time': datetime.now(),
+            'type': 'parent',
+            'children': [order.orderId for order in bracket_orders[1:]]
+        }
+        self.order_status[parent_id] = "Submitted"
 
     def fetch_historical_bars(self, days_back=5):
         """

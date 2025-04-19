@@ -241,7 +241,7 @@ def main():
     if indicators_config.get("atr", {}).get("enabled", False):
         enabled_indicators.append("ATR")
     if indicators_config.get("supertrend", {}).get("enabled", False):
-        enabled_indicators.append("TREND_DIRECTION")
+        enabled_indicators.append("SUPERTREND")
     if indicators_config.get("adx", {}).get("enabled", False):
         enabled_indicators.append("ADX")
     if indicators_config.get("adx_pos", {}).get("enabled", False):
@@ -270,6 +270,18 @@ def main():
         enabled_indicators.extend(["PSAR_NORM", "PSAR_DIR"])
     if indicators_config.get("volume", {}).get("enabled", False):
         enabled_indicators.append("VOLUME_MA")
+    if indicators_config.get("vwap", {}).get("enabled", False):
+        enabled_indicators.append("VWAP_NORM")
+    
+    # Always include day of week indicators
+    enabled_indicators.extend(["DOW_SIN", "DOW_COS"])
+    
+    # Include minutes since open indicators if enabled
+    if indicators_config.get("minutes_since_open", {}).get("enabled", False):
+        logger.info("Minutes since open indicator is enabled, adding MSO_SIN and MSO_COS")
+        enabled_indicators.extend(["MSO_SIN", "MSO_COS"])
+    else:
+        logger.info("Minutes since open indicator is disabled in config")
     
     # Log the final list of enabled indicators
     logger.info(f"Enabled indicators for training: {enabled_indicators}")

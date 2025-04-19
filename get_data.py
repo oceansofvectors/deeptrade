@@ -11,12 +11,43 @@ import pandas_ta as ta
 import logging
 import os
 from datetime import datetime, timedelta
+import pytz
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # NEW: import YAML configuration
 from config import config
+
+# Helper function to calculate ATR for Supertrend
+def calculate_atr(df, length=14):
+    """
+    Calculate Average True Range (ATR)
+    
+    Args:
+        df: DataFrame with High, Low, Close columns
+        length: Period for ATR calculation
+        
+    Returns:
+        Series containing ATR values
+    """
+    # Get high/low/close columns, handling both upper and lowercase names
+    high_col = 'High' if 'High' in df.columns else 'high'
+    low_col = 'Low' if 'Low' in df.columns else 'low'
+    close_col = 'Close' if 'Close' in df.columns else 'close'
+    
+    high = df[high_col]
+    low = df[low_col]
+    close = df[close_col].shift(1)
+    
+    tr1 = high - low
+    tr2 = abs(high - close)
+    tr3 = abs(low - close)
+    
+    true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
+    atr = true_range.rolling(window=length).mean()
+    
+    return atr
 
 # Helper function to ensure numeric values
 def ensure_numeric(df, columns):
@@ -159,7 +190,8 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         DataFrame with computed technical indicators
     """
     try:
-        logger.info("Processing technical indicators")
+        logger.info("========== Starting technical indicator processing ==========")
+        logger.info(f"Input data shape: {df.shape}")
         
         # Check if we have the required columns - allow for both uppercase and lowercase
         required_caps = ['Open', 'High', 'Low', 'Close']
@@ -454,21 +486,33 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         if config["indicators"].get("atr", {}).get("enabled", False):
             if 'ATR' in df.columns:
                 # Use existing ATR data, normalize if needed
+                # Keep the raw value for debugging
+                df['ATR_RAW'] = df['ATR'].copy()
+                # Standard normalization relative to price
                 df['ATR'] = df['ATR'] / df[close_col]
+                logger.info(f"ATR normalization: min={df['ATR'].min():.4f}, max={df['ATR'].max():.4f}, mean={df['ATR'].mean():.4f}")
             else:
                 atr_length = config["indicators"]["atr"]["length"]
                 atr = ta.atr(df[high_col], df[low_col], df[close_col], length=atr_length)
                 
                 # Check if atr is a Series or DataFrame
                 if isinstance(atr, pd.Series):
+                    df['ATR_RAW'] = atr.copy()  # Keep raw value
+                    # Standard normalization relative to price
                     df['ATR'] = atr / df[close_col]
                 else:
                     # If it's a DataFrame, get the first column
                     logger.info(f"ATR result columns: {atr.columns}")
                     if f'ATR_{atr_length}' in atr.columns:
+                        df['ATR_RAW'] = atr[f'ATR_{atr_length}'].copy()  # Keep raw value
+                        # Standard normalization
                         df['ATR'] = atr[f'ATR_{atr_length}'] / df[close_col]
                     else:
+                        df['ATR_RAW'] = atr.iloc[:, 0].copy()  # Keep raw value
+                        # Standard normalization
                         df['ATR'] = atr.iloc[:, 0] / df[close_col]
+                
+                logger.info(f"ATR normalization: min={df['ATR'].min():.4f}, max={df['ATR'].max():.4f}, mean={df['ATR'].mean():.4f}")
         
         # OBV (On-Balance Volume)
         if config["indicators"].get("obv", {}).get("enabled", False):
@@ -542,29 +586,205 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 # Normalize volume using moving average
                 df['VOLUME_NORM'] = (df[volume_col] / volume_ma) - 1
         
+        # VWAP (Volume Weighted Average Price)
+        if config["indicators"].get("vwap", {}).get("enabled", False):
+            if 'VWAP' in df.columns:
+                # Use existing VWAP data
+                df['VWAP_NORM'] = (df[close_col] - df['VWAP']) / df[close_col]
+            else:
+                # Create anchor points (daily reset) by detecting date changes
+                df['date'] = df.index.date
+                date_change = df['date'] != df['date'].shift(1)
+                
+                # Initialize VWAP calculation
+                df['TP'] = (df[high_col] + df[low_col] + df[close_col]) / 3  # Typical Price
+                df['TPV'] = df['TP'] * df[volume_col]  # Typical Price * Volume
+                
+                # Cumulative sum of TPV and Volume, reset on date change
+                df['cum_tpv'] = df.groupby(df['date'].astype(str))['TPV'].cumsum()
+                df['cum_vol'] = df.groupby(df['date'].astype(str))[volume_col].cumsum()
+                
+                # VWAP calculation
+                df['VWAP'] = df['cum_tpv'] / df['cum_vol']
+                
+                # Normalize VWAP relative to close price
+                df['VWAP_NORM'] = (df[close_col] - df['VWAP']) / df[close_col]
+                
+                # Clean up temporary columns
+                df = df.drop(['date', 'TP', 'TPV', 'cum_tpv', 'cum_vol'], axis=1)
+        
+        # Calculate Supertrend indicator
+        if 'supertrend' in config["indicators"] and config["indicators"]["supertrend"]["enabled"]:
+            logger.info("========== Calculating Supertrend indicator ==========")
+            logger.info(f"Supertrend parameters: length={config['indicators']['supertrend']['length']}, multiplier={config['indicators']['supertrend']['multiplier']}")
+            
+            length = config["indicators"]["supertrend"]["length"]
+            multiplier = config["indicators"]["supertrend"]["multiplier"]
+            
+            # Determine column names (handle both upper and lowercase)
+            high_col = 'High' if 'High' in df.columns else 'high'
+            low_col = 'Low' if 'Low' in df.columns else 'low'
+            close_col = 'Close' if 'Close' in df.columns else 'close'
+            logger.info(f"Using price columns: high={high_col}, low={low_col}, close={close_col}")
+            
+            # Calculate ATR
+            logger.info(f"Calculating ATR with length={length}")
+            atr = calculate_atr(df, length)
+            logger.info(f"ATR stats: min={atr.min():.4f}, max={atr.max():.4f}, mean={atr.mean():.4f}")
+            
+            # Calculate upper and lower bands
+            logger.info("Calculating Supertrend bands")
+            df['Up1'] = ((df[high_col] + df[low_col]) / 2) + (multiplier * atr)
+            df['Dn1'] = ((df[high_col] + df[low_col]) / 2) - (multiplier * atr)
+            
+            # Initialize Up and Dn columns with first values from Up1 and Dn1
+            logger.info("Initializing Supertrend variables")
+            df['Up'] = np.nan
+            df['Dn'] = np.nan
+            df['Up Trend'] = 0  # Initialize with numeric values, not boolean
+            
+            # First values - use loc to avoid SettingWithCopyWarning
+            if len(df) > 0:
+                logger.info("Setting initial Supertrend values")
+                df.loc[df.index[0], 'Up'] = df['Up1'].iloc[0]
+                df.loc[df.index[0], 'Dn'] = df['Dn1'].iloc[0]
+                df.loc[df.index[0], 'Up Trend'] = 1  # Use 1 instead of True
+            
+            # Calculate Supertrend using vectorized operations where possible
+            logger.info(f"Calculating Supertrend values for {len(df)} data points")
+            progress_intervals = max(1, len(df) // 10)  # Log progress at 10% intervals
+            
+            for i in range(1, len(df)):
+                if i % progress_intervals == 0:
+                    logger.info(f"Supertrend calculation progress: {i}/{len(df)} ({i/len(df)*100:.1f}%)")
+                
+                # Update upper band
+                if (df['Up1'].iloc[i] < df['Up'].iloc[i-1]) or (df[close_col].iloc[i-1] > df['Up'].iloc[i-1]):
+                    df.loc[df.index[i], 'Up'] = df['Up1'].iloc[i]
+                else:
+                    df.loc[df.index[i], 'Up'] = df['Up'].iloc[i-1]
+                
+                # Update lower band
+                if (df['Dn1'].iloc[i] > df['Dn'].iloc[i-1]) or (df[close_col].iloc[i-1] < df['Dn'].iloc[i-1]):
+                    df.loc[df.index[i], 'Dn'] = df['Dn1'].iloc[i]
+                else:
+                    df.loc[df.index[i], 'Dn'] = df['Dn'].iloc[i-1]
+                
+                # Update trend direction - use 1 and -1 instead of True/False
+                if df[close_col].iloc[i] > df['Up'].iloc[i-1]:
+                    df.loc[df.index[i], 'Up Trend'] = 1  # Uptrend
+                elif df[close_col].iloc[i] < df['Dn'].iloc[i-1]:
+                    df.loc[df.index[i], 'Up Trend'] = -1  # Downtrend
+                else:
+                    df.loc[df.index[i], 'Up Trend'] = df['Up Trend'].iloc[i-1]
+            
+            # Convert trend directly to supertrend values
+            logger.info("Finalizing Supertrend indicator")
+            df['supertrend'] = df['Up Trend']
+            
+            # Fill any NaN values
+            df['supertrend'] = df['supertrend'].fillna(0)
+            
+            # Log the distribution of supertrend values
+            trend_counts = df['supertrend'].value_counts()
+            logger.info(f"Supertrend value distribution: {trend_counts.to_dict()}")
+            
+            # Clean up intermediate columns if desired
+            df = df.drop(['Up1', 'Dn1', 'Up', 'Dn', 'Up Trend'], axis=1, errors='ignore')
+            
+            logger.info(f"Supertrend calculation complete with length={length}, multiplier={multiplier}")
+        
         # Fill NaN values with appropriate defaults
         df = df.fillna(0)
         
-        # Fill any remaining NaN values in trend_direction and position
-        df['trend_direction'] = df['trend_direction'].fillna(0)
+        # Fill any remaining NaN values in supertrend and position if they exist
+        if 'supertrend' in df.columns:
+            df['supertrend'] = df['supertrend'].fillna(0)
+        
+        # Add day of week indicator (needed for pattern detection)
+        if config["indicators"].get("day_of_week", {}).get("enabled", True):
+            # Get the day of week (0 = Monday, 6 = Sunday)
+            df['DOW'] = df.index.dayofweek
+            
+            # Convert to sine and cosine representation (circular encoding)
+            df['DOW_SIN'] = np.sin(2 * np.pi * df['DOW'] / 7)
+            df['DOW_COS'] = np.cos(2 * np.pi * df['DOW'] / 7)
+            
+        # Add minutes since cash open indicator (9:30 AM ET)
+        if config["indicators"].get("minutes_since_open", {}).get("enabled", False):
+            # Calculate minutes since 9:30 AM ET for each timestamp
+            # First convert to Eastern Time
+            eastern = pytz.timezone('US/Eastern')
+            
+            # Create a new column with the Eastern time
+            # Handle both timezone-aware and timezone-naive datetime indexes
+            try:
+                # Check if index is already timezone-aware
+                if df.index.tzinfo is not None:
+                    # Already has timezone, just convert to Eastern
+                    df['time_et'] = df.index.tz_convert(eastern)
+                else:
+                    # No timezone info, assume UTC and convert
+                    df['time_et'] = df.index.tz_localize(pytz.UTC).tz_convert(eastern)
+            except Exception as e:
+                logger.warning(f"Error converting timezone: {e}. Attempting alternative method.")
+                # Alternative approach: convert to string and parse with timezone
+                try:
+                    df['time_et'] = pd.to_datetime(df.index.strftime('%Y-%m-%d %H:%M:%S'), utc=True).tz_convert(eastern)
+                except Exception as e2:
+                    logger.error(f"Failed to handle timezone conversion: {e2}")
+                    # Last resort - use index without timezone adjustment
+                    df['time_et'] = pd.to_datetime(df.index)
+            
+            # Cash market opens at 9:30 AM ET
+            df['minutes_since_open'] = (df['time_et'].dt.hour - 9) * 60 + df['time_et'].dt.minute - 30
+            
+            # Handle times before market open (negative values)
+            df.loc[df['minutes_since_open'] < 0, 'minutes_since_open'] = 0
+            
+            # Handle times after market close (> 390 minutes)
+            df.loc[df['minutes_since_open'] > 390, 'minutes_since_open'] = 390
+            
+            # Normalize to [0, 1] range (390 minutes = 6.5 hours of trading day)
+            df['minutes_since_open_norm'] = df['minutes_since_open'] / 390.0
+            
+            # Convert to sine and cosine representation (circular encoding)
+            df['MSO_SIN'] = np.sin(2 * np.pi * df['minutes_since_open_norm'])
+            df['MSO_COS'] = np.cos(2 * np.pi * df['minutes_since_open_norm'])
+            
+            # Clean up temporary columns
+            df = df.drop(['time_et', 'minutes_since_open', 'minutes_since_open_norm'], axis=1)
         
         # Create an initial 'position' column (should start with no position)
         df['position'] = 0  # Initialize with no position
         
-        # Create a list of all columns that will be used by the model
-        model_columns = ['Close', 'close_norm', 'trend_direction', 'position']
+        # Initial list of model columns for observation space
+        model_columns = ['Close', 'close_norm', 'DOW_SIN', 'DOW_COS']
+        
+        # Add minutes since open indicators if present
+        if 'MSO_SIN' in df.columns and 'MSO_COS' in df.columns:
+            model_columns.extend(['MSO_SIN', 'MSO_COS'])
+            
+        # Add position for the environment
+        model_columns.append('position')
+        
+        # List of indicators that need normalization
+        indicators_to_normalize = []
+        
+        # Add supertrend if it exists
+        if 'supertrend' in df.columns:
+            model_columns.append('supertrend')
         
         # Add all technical indicators that were enabled and calculated
-        indicators_to_normalize = []
         for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D', 
                          'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R', 
                          'SMA_NORM', 'EMA_NORM', 'DISPARITY', 'ATR', 'OBV_NORM', 
-                         'CMF', 'PSAR_NORM', 'PSAR_DIR', 'VOLUME_NORM']:
+                         'CMF', 'PSAR_NORM', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM']:
             if indicator in df.columns:
                 model_columns.append(indicator)
                 
                 # Skip indicators that are already guaranteed to be within bounds
-                if indicator not in ['trend_direction', 'RSI', 'PSAR_DIR']:
+                if indicator not in ['supertrend', 'RSI', 'PSAR_DIR']:
                     indicators_to_normalize.append(indicator)
                 
                 # Fill NaN values in indicators with appropriate defaults
@@ -572,7 +792,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                     # These indicators are typically in the range [0, 1]
                     df[indicator] = df[indicator].fillna(0.5)
                 elif indicator in ['CCI', 'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R', 
-                                  'SMA_NORM', 'EMA_NORM', 'DISPARITY', 'CMF', 'VOLUME_NORM']:
+                                  'SMA_NORM', 'EMA_NORM', 'DISPARITY', 'CMF', 'VOLUME_NORM', 'VWAP_NORM']:
                     # These indicators are typically centered around 0
                     df[indicator] = df[indicator].fillna(0.0)
                 elif indicator in ['ADX', 'ADX_POS', 'ADX_NEG', 'ATR', 'OBV_NORM']:
@@ -638,9 +858,13 @@ def get_data(symbol: str = "NQ=F",
         tuple: (train_df, validation_df, test_df) - DataFrames containing processed data.
     """
     try:
+        logger.info("==================== STARTING DATA PROCESSING ====================")
+        logger.info(f"Parameters: symbol={symbol}, period={period}, interval={interval}")
+        logger.info(f"Data split: train={train_ratio}, validation={validation_ratio}, test={1-train_ratio-validation_ratio}")
+        
         # Option 1: Download data directly from Yahoo Finance
         if use_yfinance:
-            logger.info(f"Downloading data directly from Yahoo Finance: {symbol}")
+            logger.info(f"Step 1: Downloading data directly from Yahoo Finance: {symbol}")
             df = download_data(symbol, period, interval)
             
             # Debug: print DataFrame structure
@@ -657,7 +881,7 @@ def get_data(symbol: str = "NQ=F",
         
         # Option 2: Load from local CSV if download is disabled
         elif os.path.exists('data/nq.csv'):
-            logger.info("Loading data from local CSV file: data/nq.csv")
+            logger.info("Step 1: Loading data from local CSV file: data/nq.csv")
             # Read the CSV file, explicitly convert numeric columns
             df = pd.read_csv('data/nq.csv')
         else:
@@ -735,11 +959,13 @@ def get_data(symbol: str = "NQ=F",
         print(df.head())
         
         # Process technical indicators
+        logger.info("Step 4: Processing technical indicators")
         df = process_technical_indicators(df, train_ratio)
+        logger.info(f"Technical indicators processed. Available columns: {df.columns.tolist()}")
 
         # After all processing, check if we should filter to market hours only
         if config["data"].get("market_hours_only", False):
-            logger.info("Filtering data to include only NYSE market hours")
+            logger.info("Step 5: Filtering data to include only NYSE market hours")
             try:
                 # Try to import again in case it wasn't available earlier
                 from walk_forward import filter_market_hours
@@ -748,6 +974,7 @@ def get_data(symbol: str = "NQ=F",
                 logger.warning("Could not import filter_market_hours from walk_forward module. Using unfiltered data.")
         
         # Split data into training, validation, and testing sets
+        logger.info("Step 6: Splitting data into train/validation/test sets")
         if train_ratio <= 0:
             # If train_ratio is 0 or negative, return all data as train data and empty validation/test sets
             train_df = df.copy()
@@ -767,9 +994,12 @@ def get_data(symbol: str = "NQ=F",
             logger.info("Data loaded and processed. Train data: %d rows, Validation data: %d rows, Test data: %d rows", 
                        len(train_df), len(validation_df), len(test_df))
                        
+        logger.info("==================== DATA PROCESSING COMPLETE ====================")
         return train_df, validation_df, test_df
     except Exception as e:
         logger.error(f"Error loading data: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None, None, None
 
 if __name__ == "__main__":

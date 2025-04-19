@@ -3,7 +3,7 @@ training:
   fee_rate: 0.0
   # New parameters for iterative training
   max_iterations: 200
-  improvement_threshold: 0.02
+  improvement_threshold: 0.50
   additional_timesteps: 100
   n_stagnant_loops: 20
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
@@ -22,7 +22,7 @@ data:
 indicators:
   supertrend:
     enabled: false
-    length: 10
+    length: 14
     multiplier: 3
   rsi:
     enabled: true
@@ -76,7 +76,13 @@ indicators:
     max_af: 0.2
   volume:
     enabled: false
-    ma_length: 20  
+    ma_length: 20
+  vwap:
+    enabled: false
+  day_of_week:
+    enabled: false
+  minutes_since_open:
+    enabled: true
 
 environment:
   initial_balance: 10000.0
@@ -104,7 +110,7 @@ risk_management:
   # Stop loss configuration
   stop_loss:
     enabled: false
-    percentage: 2  # Stop loss as percentage of portfolio value
+    percentage: 10  # Stop loss as percentage of portfolio value
   
   # Take profit configuration
   take_profit:
@@ -134,7 +140,7 @@ walk_forward:
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: true  # Set to true to enable hyperparameter tuning during training
+  enabled: false  # Set to true to enable hyperparameter tuning during training
   n_trials: 30     # Number of trials for the optimization
   parallel_processing:
     enabled: true  # Whether to run trials in parallel

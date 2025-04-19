@@ -27,7 +27,7 @@ class TradingEnv(gym.Env):
             data (pd.DataFrame): DataFrame containing price and indicator data with columns:
                 - close: Actual closing prices
                 - close_norm: Normalized closing prices (between 0 and 1)
-                - trend_direction: Supertrend indicator direction
+                - supertrend: Supertrend indicator direction
                 - Various technical indicators (RSI, CCI, ADX, etc.)
             initial_balance (float): Starting portfolio balance.
             transaction_cost (float): Cost per trade as a fraction of the trade value (e.g., 0.0005 = 0.05%).
@@ -49,11 +49,8 @@ class TradingEnv(gym.Env):
         if enabled_indicators is not None:
             self.technical_indicators = enabled_indicators
         else:
-            # Otherwise, check for available indicators in the data
-            # NOTE: trend_direction should only be added if explicitly enabled
-            # Do NOT automatically add trend_direction even if it exists in the data
-            if 'trend_direction' in self.data.columns and enabled_indicators is not None and 'TREND_DIRECTION' in enabled_indicators:
-                self.technical_indicators.append('trend_direction')
+            if 'supertrend' in self.data.columns and enabled_indicators is not None and 'SUPERTREND' in enabled_indicators:
+                self.technical_indicators.append('supertrend')
             if 'RSI' in self.data.columns:
                 self.technical_indicators.append('RSI')
             if 'CCI' in self.data.columns:
@@ -96,6 +93,16 @@ class TradingEnv(gym.Env):
                 self.technical_indicators.append('PSAR_DIR')
             if 'VOLUME_MA' in self.data.columns:
                 self.technical_indicators.append('VOLUME_MA')
+            if 'VWAP_NORM' in self.data.columns:
+                self.technical_indicators.append('VWAP_NORM')
+            if 'DOW_SIN' in self.data.columns:
+                self.technical_indicators.append('DOW_SIN')
+            if 'DOW_COS' in self.data.columns:
+                self.technical_indicators.append('DOW_COS')
+            if 'MSO_SIN' in self.data.columns:
+                self.technical_indicators.append('MSO_SIN')
+            if 'MSO_COS' in self.data.columns:
+                self.technical_indicators.append('MSO_COS')
             
         # Calculate observation space size: close_norm + all technical indicators + position
         obs_size = 1 + len(self.technical_indicators) + 1
@@ -168,25 +175,46 @@ class TradingEnv(gym.Env):
         indicators = []
         for indicator in self.technical_indicators:
             # For each indicator, try to find it in any capitalization format
-            if indicator in self.data.columns:
-                indicators.append(self.data.loc[self.current_step, indicator])
-            elif indicator.lower() in self.data.columns:
-                indicators.append(self.data.loc[self.current_step, indicator.lower()])
-            elif indicator.upper() in self.data.columns:
-                indicators.append(self.data.loc[self.current_step, indicator.upper()])
-            elif indicator.capitalize() in self.data.columns:
-                indicators.append(self.data.loc[self.current_step, indicator.capitalize()])
+            indicator_value = None
+            
+            # Try different capitalization formats
+            possible_names = [
+                indicator,
+                indicator.lower(),
+                indicator.upper(),
+                indicator.capitalize()
+            ]
+            
+            for name in possible_names:
+                if name in self.data.columns:
+                    indicator_value = self.data.loc[self.current_step, name]
+                    break
+            
+            # Special handling for supertrend indicator
+            if indicator.lower() == 'supertrend' and indicator_value is None:
+                # Try additional variations specific to supertrend
+                for name in ['trend_direction', 'TREND_DIRECTION', 'Trend_Direction']:
+                    if name in self.data.columns:
+                        indicator_value = self.data.loc[self.current_step, name]
+                        break
+            
+            # If we found a value, add it, otherwise use a default
+            if indicator_value is not None:
+                indicators.append(indicator_value)
+            else:
+                logger.warning(f"Could not find indicator {indicator} in data columns: {self.data.columns}")
+                indicators.append(0.0)  # Default value if indicator not found
         
         # Add position
         position = float(self.position)
         
         # DEBUGGING: Print details about observation vector construction
         logger = logging.getLogger(__name__)
+    
         
         observation_elements = ["close_norm"]
         observation_elements.extend(self.technical_indicators)
         observation_elements.append("position")
-        #logger.info(f"OBSERVATION FEATURES ({len(observation_elements)}): {observation_elements}")
         
         # Combine all features
         obs = np.array([close_norm] + indicators + [position], dtype=np.float32)
