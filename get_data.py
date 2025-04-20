@@ -806,27 +806,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                     df[indicator] = df[indicator].fillna(0.0)
         
         # Two-stage normalization for technical indicators using only training data statistics
-        logger.info("Performing two-stage normalization for technical indicators using only training data statistics")
-        
-        # Calculate split index for normalization
-        split_idx = int(len(df) * train_ratio) if train_ratio > 0 else len(df)
-        
-        for indicator in indicators_to_normalize:
-            # Get min and max values from training data only
-            train_indicator_min = df.iloc[:split_idx][indicator].min()
-            train_indicator_max = df.iloc[:split_idx][indicator].max()
-            
-            # Check if values need normalization
-            if train_indicator_min < -1.0 or train_indicator_max > 1.0 or (indicator in ['CCI', 'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC']):
-                # Normalize to [-1, 1] range using training data statistics
-                if train_indicator_min != train_indicator_max:  # Avoid division by zero
-                    df[indicator] = 2.0 * (df[indicator] - train_indicator_min) / (train_indicator_max - train_indicator_min) - 1.0
-                else:
-                    df[indicator] = 0.0  # If all values are the same, set to 0
-                
-                # Clip to ensure within bounds
-                df[indicator] = np.clip(df[indicator], -1.0, 1.0)
-                logger.info(f"Normalized {indicator} using training data statistics (min: {train_indicator_min}, max: {train_indicator_max})")
+        logger.info("Calculating technical indicators completed. Normalization will be performed per window to avoid data leakage.")
         
         return df
     except Exception as e:

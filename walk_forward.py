@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import json
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 from typing import List, Dict, Tuple
 import matplotlib.pyplot as plt
@@ -14,6 +14,8 @@ from decimal import Decimal
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
+import pickle
+from sklearn.preprocessing import MinMaxScaler
 
 from environment import TradingEnv
 from get_data import get_data
@@ -514,6 +516,77 @@ def export_consolidated_trade_history(all_window_results: List[Dict], session_fo
     logger.info(f"Exported consolidated trade history from {len(windows_with_history)} windows "
                f"with {len(all_trades)} trades to {export_path}")
 
+def scale_window(train_data: pd.DataFrame, 
+                val_data: pd.DataFrame, 
+                test_data: pd.DataFrame, 
+                cols_to_scale: List[str], 
+                feature_range: Tuple[float, float] = (-1, 1),
+                window_folder: str = None) -> Tuple[MinMaxScaler, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Scale technical indicators in each window to prevent data leakage.
+    
+    Args:
+        train_data: Training dataset
+        val_data: Validation dataset
+        test_data: Test dataset
+        cols_to_scale: List of columns to scale
+        feature_range: Target range for scaled features, default (-1, 1)
+        window_folder: Optional folder to save the scaler
+        
+    Returns:
+        Tuple containing the scaler and the transformed datasets
+    """
+    logger = logging.getLogger(__name__)
+    
+    # Make copies to avoid modifying the original data
+    train = train_data.copy()
+    val = val_data.copy()
+    test = test_data.copy()
+    
+    # Filter columns that actually exist in the data
+    cols_to_scale = [col for col in cols_to_scale if col in train.columns]
+    
+    if not cols_to_scale:
+        logger.warning("No columns to scale found in the data")
+        return None, train, val, test
+    
+    logger.info(f"Scaling {len(cols_to_scale)} indicator columns using data from {len(train)} training rows")
+    logger.info(f"Columns to scale: {cols_to_scale}")
+    
+    # Create and fit the scaler on training data only
+    scaler = MinMaxScaler(feature_range=feature_range)
+    
+    # Fit on training data
+    scaler.fit(train[cols_to_scale])
+    
+    # Transform training, validation, and test data
+    train[cols_to_scale] = scaler.transform(train[cols_to_scale])
+    val[cols_to_scale] = scaler.transform(val[cols_to_scale])
+    test[cols_to_scale] = scaler.transform(test[cols_to_scale])
+    
+    # Check if any test values fall outside the feature range
+    # This is evidence that the scaler never saw these rows (validation)
+    min_vals = test[cols_to_scale].min()
+    max_vals = test[cols_to_scale].max()
+    
+    out_of_range = False
+    for col in cols_to_scale:
+        if min_vals[col] < feature_range[0] or max_vals[col] > feature_range[1]:
+            out_of_range = True
+            logger.info(f"Column {col} has test values outside of range {feature_range}: min={min_vals[col]}, max={max_vals[col]}")
+    
+    if not out_of_range:
+        logger.warning("No test values found outside of the feature range. This might indicate transformation issues.")
+    
+    # Save the scaler if a window folder is provided
+    if window_folder:
+        scaler_path = os.path.join(window_folder, "indicator_scaler.pkl")
+        with open(scaler_path, "wb") as f:
+            pickle.dump(scaler, f)
+        logger.info(f"Indicator scaler saved to {scaler_path}")
+    
+    return scaler, train, val, test
+
 def process_single_window(
     window_idx: int,
     num_windows: int,
@@ -547,7 +620,30 @@ def process_single_window(
     }
     save_json(window_periods, f"{window_folder}/window_periods.json")
     
-    # Train the model
+    # Scale technical indicator columns within this window to prevent data leakage
+    window_logger.info(f"Window {window_idx}: Scaling technical indicators to prevent data leakage")
+    
+    # Define columns that need scaling (all technical indicators except special ones)
+    cols_to_scale = []
+    skip_columns = ['close_norm', 'position', 'trend_direction', 'supertrend', 'time', 'timestamp', 
+                   'date', 'DOW', 'PSAR_DIR', 'RSI', 'Up Trend', 'Down Trend', 'open', 'high', 'low', 'close', 
+                   'Open', 'High', 'Low', 'Close', 'Volume', 'volume']
+    
+    for col in train_data.columns:
+        if col not in skip_columns and pd.api.types.is_numeric_dtype(train_data[col]):
+            cols_to_scale.append(col)
+    
+    # Scale the data
+    scaler, train_data, validation_data, test_data = scale_window(
+        train_data=train_data,
+        val_data=validation_data,
+        test_data=test_data,
+        cols_to_scale=cols_to_scale,
+        feature_range=(-1, 1),
+        window_folder=window_folder
+    )
+    
+    # Training the model with the scaled data
     model, training_stats = train_walk_forward_model(
         train_data=train_data,
         validation_data=validation_data,
