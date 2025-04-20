@@ -37,11 +37,6 @@ Below are the areas I would tackle first, roughly in the order I expect them to 
 * Swap the default MLP for **Temporal Convolution (TCN) or a small GRU head** – 5‑minute series have strong short‑term autocorrelation that an MLP can’t capture.  SB3’s `RecurrentPPO` will drop‑in here.  
 * Use **learning‑rate decay** (cosine or linear) over each walk‑forward window; right now LR is fixed at ≈3 e‑3 citeturn0file0 which is high for PPO on noisy returns – start at 1 e‑3 and decay to 1 e‑4.  
 
----
-
-### 6  Walk‑forward & hyper‑parameter search hygiene  
-* In `walk_forward.py` you reuse the **same Optuna study across windows** – parameters found on early data bleed into later windows and bias the back‑test.  Create a fresh study per window or, better, **freeze hyper‑params after the first two windows** and only retrain weights thereafter citeturn1file3.  
-* Restrict Optuna’s search space: sampling `gamma` in (0.9, 0.9999) and `gae_lambda` in (0.9, 0.999) every trial is unnecessary churn citeturn1file7.  Fix them at (0.995, 0.95) – well‑tested defaults for intraday PPO – and focus the budget on `n_steps` and `ent_coef`.
 
 ---
 

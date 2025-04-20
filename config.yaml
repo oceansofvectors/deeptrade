@@ -149,11 +149,11 @@ hyperparameter_tuning:
   parameters:
     learning_rate: 
       min: 0.00001
-      max: 0.01
+      max: 0.001
       log: true
     n_steps:
-      min: 128
-      max: 2048
+      min: 5000
+      max: 10000
       log: true
     ent_coef:
       min: 0.00001
@@ -163,9 +163,6 @@ hyperparameter_tuning:
       min: 8
       max: 128
       log: true
-    gamma:
-      min: 0.9
-      max: 0.9999
-    gae_lambda:
-      min: 0.9
-      max: 0.999
+    # Fixed values for gamma and gae_lambda
+    gamma: 0.995  # Fixed value instead of search range
+    gae_lambda: 0.95  # Fixed value instead of search range

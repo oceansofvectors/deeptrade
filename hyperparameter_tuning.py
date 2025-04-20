@@ -75,19 +75,9 @@ def objective_func(
         log=batch_size_cfg.get("log", True)
     )
     
-    gamma_cfg = hp_config.get("gamma", {})
-    gamma = trial.suggest_float(
-        "gamma", 
-        gamma_cfg.get("min", 0.9), 
-        gamma_cfg.get("max", 0.9999)
-    )
-    
-    gae_lambda_cfg = hp_config.get("gae_lambda", {})
-    gae_lambda = trial.suggest_float(
-        "gae_lambda", 
-        gae_lambda_cfg.get("min", 0.9), 
-        gae_lambda_cfg.get("max", 0.999)
-    )
+    # Use fixed values for gamma and gae_lambda from config
+    gamma = hp_config.get("gamma", 0.995)  # Use fixed value instead of suggesting
+    gae_lambda = hp_config.get("gae_lambda", 0.95)  # Use fixed value instead of suggesting
     
     # Create environment
     train_env = TradingEnv(
