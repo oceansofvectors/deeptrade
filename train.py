@@ -15,6 +15,8 @@ from get_data import get_data
 from config import config
 import money  # Import the new money module
 
+from utils.seeding import set_global_seed
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,26 @@ def train_agent(train_data, total_timesteps: int):
         position_size=config["environment"].get("position_size", 1)
     )
     check_env(env, skip_render_check=True)
-    model = PPO("MlpPolicy", env, verbose=1)
+    
+    # Check for learning rate decay in config
+    use_lr_decay = config["model"].get("use_lr_decay", False)
+    if use_lr_decay:
+        # Set up learning rate parameters
+        initial_lr = config["model"].get("learning_rate", 0.0003)
+        final_lr = config["model"].get("final_learning_rate", 1e-5)
+        
+        # Create linear learning rate schedule
+        from stable_baselines3.common.utils import get_linear_fn
+        learning_rate = get_linear_fn(initial_lr, final_lr, total_timesteps)
+        logger.info(f"Using learning rate decay from {initial_lr} to {final_lr} over {total_timesteps} timesteps")
+    else:
+        # Use constant learning rate
+        learning_rate = config["model"].get("learning_rate", 0.0003)
+        logger.info(f"Using constant learning rate: {learning_rate}")
+    
+    # Initialize model with configured learning rate
+    model = PPO("MlpPolicy", env, verbose=1, learning_rate=learning_rate)
+    
     logger.info("Starting training for %d timesteps", total_timesteps)
     model.learn(total_timesteps=total_timesteps)
     logger.info("Training completed")
@@ -99,13 +120,35 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             "gae_lambda": config["model"].get("gae_lambda", 0.95),
         }
     
+    # Get learning rate decay parameters from config or use defaults
+    use_lr_decay = config["model"].get("use_lr_decay", False)
+    if use_lr_decay:
+        # Set up learning rate parameters
+        initial_lr = model_params.get("learning_rate", 0.0003)
+        final_lr = config["model"].get("final_learning_rate", 1e-5)
+        # Total timesteps for decay is initial + additional * max iterations
+        total_decay_timesteps = initial_timesteps + (additional_timesteps * max_iterations)
+        
+        # Create linear learning rate schedule
+        from stable_baselines3.common.utils import get_linear_fn
+        learning_rate = get_linear_fn(
+            initial_lr, 
+            final_lr, 
+            total_decay_timesteps
+        )
+        logger.info(f"Using learning rate decay from {initial_lr} to {final_lr} over {total_decay_timesteps} timesteps")
+    else:
+        # Use constant learning rate
+        learning_rate = model_params.get("learning_rate", 0.0003)
+        logger.info(f"Using constant learning rate: {learning_rate}")
+    
     # Initialize the PPO model with the specified parameters
     model = PPO(
         "MlpPolicy", 
         train_env, 
         verbose=verbose_level,
         ent_coef=model_params.get("ent_coef", 0.01),
-        learning_rate=model_params.get("learning_rate", 0.0003),
+        learning_rate=learning_rate,
         n_steps=model_params.get("n_steps", 2048),
         batch_size=model_params.get("batch_size", 64),
         gamma=model_params.get("gamma", 0.99),
@@ -588,6 +631,15 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     logger.info(f"- n_stagnant_loops: {n_stagnant_loops}")
     logger.info(f"- improvement_threshold: {improvement_threshold}")
     
+    # Get learning rate decay configuration
+    use_lr_decay = config["model"].get("use_lr_decay", False)
+    if use_lr_decay:
+        initial_lr = config["model"].get("learning_rate", 0.0003)
+        final_lr = config["model"].get("final_learning_rate", 1e-5)
+        logger.info(f"- learning rate decay: enabled (from {initial_lr} to {final_lr})")
+    else:
+        logger.info(f"- learning rate decay: disabled")
+    
     # Get the evaluation metric from config
     evaluation_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
     logger.info(f"Using {evaluation_metric} as the evaluation metric for model selection")
@@ -681,6 +733,22 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     return model, training_stats
 
 def main():
+    set_global_seed(config["seed"])
+    
+    # Ensure learning rate decay parameters exist in config
+    if "model" not in config:
+        config["model"] = {}
+    
+    # Set default learning rate decay parameters if not present
+    if "use_lr_decay" not in config["model"]:
+        config["model"]["use_lr_decay"] = True  # Enable by default
+    
+    if "learning_rate" not in config["model"]:
+        config["model"]["learning_rate"] = 0.0003  # Default initial learning rate
+    
+    if "final_learning_rate" not in config["model"]:
+        config["model"]["final_learning_rate"] = 1e-5  # Default final learning rate
+    
     # Load data using settings from YAML with three-way split and direct Yahoo Finance download
     train_data, validation_data, test_data = get_data(
         symbol=config["data"]["symbol"],

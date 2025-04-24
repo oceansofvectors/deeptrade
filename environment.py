@@ -1,10 +1,13 @@
 import gymnasium as gym
 from gymnasium import spaces
+from gymnasium.utils import seeding
 import numpy as np
 import pandas as pd
 from decimal import Decimal
 import money  # Import the new money module
 import logging
+from config import config
+from stable_baselines3.common.env_util import make_vec_env
 
 class TradingEnv(gym.Env):
     """
@@ -49,7 +52,7 @@ class TradingEnv(gym.Env):
         if enabled_indicators is not None:
             self.technical_indicators = enabled_indicators
         else:
-            if 'supertrend' in self.data.columns and enabled_indicators is not None and 'SUPERTREND' in enabled_indicators:
+            if 'supertrend' in self.data.columns:
                 self.technical_indicators.append('supertrend')
             if 'RSI' in self.data.columns:
                 self.technical_indicators.append('RSI')
@@ -132,7 +135,12 @@ class TradingEnv(gym.Env):
         # Position sizing
         self.position_size = position_size
 
-    def reset(self, seed=None, options=None):
+    def seed(self, seed=None):
+        """Set random seed for reproducibility."""
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def reset(self, *, seed=None, options=None):
         """
         Reset the environment state and portfolio to start a new episode.
 
@@ -145,8 +153,7 @@ class TradingEnv(gym.Env):
         """
         # Set random seed if provided
         if seed is not None:
-            import numpy as np
-            np.random.seed(seed)
+            self.seed(seed)
             
         self.current_step = self.initial_index
         self.position = 0  # Will be immediately set by first action

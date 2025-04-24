@@ -254,7 +254,8 @@ def parallel_hyperparameter_tuning(
     
     # Create Optuna study
     study_name = f"parallel_hyperparam_tuning_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
-    study = optuna.create_study(direction="maximize", study_name=study_name)
+    sampler = optuna.samplers.TPESampler(seed=config["seed"])
+    study = optuna.create_study(direction="maximize", sampler=sampler, study_name=study_name)
     
     # Create a partial function with fixed arguments
     from functools import partial

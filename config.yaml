@@ -1,8 +1,10 @@
+seed: 42 #Global RNG seed
+
 training:
-  total_timesteps: 10000
+  total_timesteps: 120000
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 200
+  max_iterations: 100
   improvement_threshold: 0.50
   additional_timesteps: 100
   n_stagnant_loops: 20
@@ -12,18 +14,18 @@ training:
     metric: "return"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
 
 data:
-  symbol: "NQ=F"
-  period: "60d"
-  interval: "5m"
-  train_ratio: 0.7
+  train_ratio: 0.6
   validation_ratio: 0.2
+  test_ratio: 0.2
   market_hours_only: true  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
 
 indicators:
   supertrend:
-    enabled: false
-    length: 14
-    multiplier: 3
+    enabled: true
+    length: 20
+    multiplier: 4
+    smooth_periods: 3
+    lookback_periods: 2
   rsi:
     enabled: true
     length: 14
@@ -31,17 +33,17 @@ indicators:
     enabled: true
     length: 20
   adx:
-    enabled: false
+    enabled: true
     length: 14
   adx_pos:
-    enabled: false
+    enabled: true
   adx_neg:
-    enabled: false
+    enabled: true
   stoch_k:
-    enabled: false
+    enabled: true
     length: 14
   stoch_d:
-    enabled: false
+    enabled: true
     length: 3
   macd:
     enabled: true
@@ -49,38 +51,38 @@ indicators:
     slow: 26
     signal: 9
   roc:
-    enabled: false
+    enabled: true
     length: 10
   williams_r:
-    enabled: false
+    enabled: true
     length: 14
   sma:
-    enabled: false
+    enabled: true
     length: 20
   ema:
-    enabled: false
+    enabled: true
     length: 20
   disparity:
-    enabled: false
+    enabled: true
   atr:
     enabled: true
     length: 14
   obv:
-    enabled: false
+    enabled: true
   cmf:
-    enabled: false
+    enabled: true
     length: 20
   psar:
-    enabled: false
+    enabled: true
     af: 0.02
     max_af: 0.2
   volume:
-    enabled: false
+    enabled: true
     ma_length: 20
   vwap:
-    enabled: false
+    enabled: true
   day_of_week:
-    enabled: false
+    enabled: true
   minutes_since_open:
     enabled: true
 
@@ -96,6 +98,7 @@ model:
   batch_size: 17
   gamma: 0.9420950542553452
   gae_lambda: 0.9234921190880474
+  use_lr_decay: true
 
 # Risk management configuration for trade.py
 risk_management:
@@ -152,8 +155,8 @@ hyperparameter_tuning:
       max: 0.001
       log: true
     n_steps:
-      min: 5000
-      max: 10000
+      min: 500
+      max: 2000
       log: true
     ent_coef:
       min: 0.00001

@@ -10,11 +10,14 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from stable_baselines3 import PPO
+from utils.seeding import set_global_seed
+from typing import List, Dict, Tuple, Optional, Union
 
 # Import custom modules
 from config import config
 from get_data import process_technical_indicators, ensure_numeric
 import money  # Import for formatting functions
+from normalization import scale_window, get_standardized_column_names  # Add normalization module
 
 # Import hyperparameter tuning and evaluation functions
 try:
@@ -56,85 +59,63 @@ def load_live_data(csv_filepath="data/live.csv") -> pd.DataFrame:
         logger.info(f"Raw data columns: {df.columns.tolist()}")
         logger.info(f"Data shape: {df.shape}")
         
-        # Check if we have the required columns
-        required_cols = ['open', 'high', 'low', 'close']
-        time_cols = ['time', 'timestamp', 'datetime']  # Accept multiple possible time column names
+        # Check for required columns
+        required_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
         
-        # Convert column names to lowercase for case-insensitive matching
-        available_cols = [col.lower() for col in df.columns]
-        
-        # Check if all required columns are present (case insensitive)
-        missing_price_cols = [col for col in required_cols if col not in available_cols]
-        if missing_price_cols:
-            logger.error(f"Missing required price columns: {missing_price_cols}")
-            return None
-            
-        # Check if at least one of the time columns is present
-        time_col_found = next((col for col in df.columns if col.lower() in time_cols), None)
-        if not time_col_found:
-            logger.error(f"Missing time column in data. Available columns: {df.columns.tolist()}")
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            logger.error(f"Missing required columns: {missing_cols}")
             return None
         
-        # Create a standardized DataFrame with consistent column names
-        standard_df = pd.DataFrame()
-        
-        # Map columns (case-insensitive) to standard format
-        column_map = {}
-        for std_col in required_cols + time_cols:
-            for avail_col in df.columns:
-                if avail_col.lower() == std_col:
-                    column_map[avail_col] = std_col.lower()
-        
-        # Create the mapping for the standardized DataFrame
-        for old_name, new_name in column_map.items():
-            standard_df[new_name] = df[old_name]
-        
-        # Ensure we have our time column with a consistent name
-        time_col_name = next(col for col in standard_df.columns if col in time_cols)
-        if time_col_name != 'time':
-            standard_df['time'] = standard_df[time_col_name]
-        
-        # Convert time column to datetime
+        # Convert timestamp to datetime and set as index
         try:
-            # Try different approaches to convert time to datetime depending on its format
-            if pd.api.types.is_numeric_dtype(standard_df['time']):
-                # If time is already numeric (timestamp), convert to datetime
-                logger.info("Converting numeric timestamp to datetime")
-                standard_df['time'] = pd.to_datetime(standard_df['time'], unit='s')
-            else:
-                # If time is string or already datetime
-                logger.info("Converting string or datetime to datetime")
-                standard_df['time'] = pd.to_datetime(standard_df['time'])
+            # Check the format of the timestamp
+            sample_timestamp = df['timestamp'].iloc[0]
+            logger.info(f"Sample timestamp: {sample_timestamp}")
             
-            # Set time as index
-            standard_df = standard_df.set_index('time')
-            logger.info("Successfully converted time column to datetime index")
+            # Try to determine if it's a numeric timestamp or string format
+            if isinstance(sample_timestamp, (int, float)) or str(sample_timestamp).isdigit():
+                # If it's numeric, convert with unit='s'
+                logger.info("Converting numeric timestamp to datetime")
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+            else:
+                # If it's a string in ISO format, convert directly
+                logger.info("Converting ISO format timestamp to datetime")
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            df = df.set_index('timestamp')
+            logger.info("Successfully converted timestamp column to datetime index")
         except Exception as e:
-            logger.error(f"Error converting time column: {e}")
+            logger.error(f"Error converting timestamp column: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
         
-        # Ensure price columns are numeric
-        price_cols = ['open', 'high', 'low', 'close']
-        if 'volume' in standard_df.columns:
-            price_cols.append('volume')
-        
-        # Ensure data types are correct
-        standard_df = ensure_numeric(standard_df, price_cols)
-        
-        # Rename columns to match what technical indicator calculation expects
-        rename_map = {
-            'open': 'Open',
-            'high': 'High', 
-            'low': 'Low',
-            'close': 'Close',
-            'volume': 'Volume'
-        }
-        standard_df = standard_df.rename(columns=rename_map)
+        # Ensure all data columns are numeric
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        # Check for NaN values
+        if df[numeric_cols].isna().any().any():
+            logger.warning(f"Dataset contains NaN values after conversion to numeric")
+            df = df.dropna(subset=numeric_cols)
+            logger.info(f"Dropped rows with NaN values. New shape: {df.shape}")
         
         # Process technical indicators
-        processed_df = process_technical_indicators(standard_df)
+        logger.info("Processing technical indicators")
+        processed_df = process_technical_indicators(df)
+        
+        if processed_df is None:
+            logger.error("Technical indicator processing failed")
+            return None
+            
+        # Calculate close_norm manually if it wasn't created
+        if 'close_norm' not in processed_df.columns:
+            logger.info("Manually calculating close_norm")
+            # Calculate close_norm as the percentage change from the first close price
+            first_close = processed_df['close'].iloc[0]
+            processed_df['close_norm'] = processed_df['close'] / first_close - 1.0
         
         # Apply market hours filter if configured
         if config["data"].get("market_hours_only", False):
@@ -154,6 +135,66 @@ def load_live_data(csv_filepath="data/live.csv") -> pd.DataFrame:
         import traceback
         logger.error(traceback.format_exc())
         return None
+
+def normalize_window_data(data: pd.DataFrame, window_folder: str) -> pd.DataFrame:
+    """
+    Normalize the window data using the normalization module.
+    
+    Args:
+        data: DataFrame with technical indicators
+        window_folder: Folder to save normalizers
+        
+    Returns:
+        Normalized DataFrame
+    """
+    logger.info("Normalizing data for training")
+    
+    # Split data for normalization (we'll use the same data for training/validation/test)
+    train_ratio = config["data"].get("train_ratio", 0.7)
+    validation_ratio = config["data"].get("validation_ratio", 0.15)
+    
+    train_split_idx = int(len(data) * train_ratio)
+    validation_split_idx = train_split_idx + int(len(data) * validation_ratio)
+    
+    train_data = data.iloc[:train_split_idx].copy()
+    validation_data = data.iloc[train_split_idx:validation_split_idx].copy()
+    test_data = data.iloc[validation_split_idx:].copy()
+    
+    # Get columns to normalize
+    skip_columns = [
+        'close_norm', 'position', 'trend_direction', 'supertrend', 
+        'time', 'timestamp', 'date', 'DOW', 
+        'Up Trend', 'Down Trend', 'open', 'high', 'low', 'close', 
+        'Open', 'High', 'Low', 'Close', 'Volume', 'volume'
+    ]
+    cols_to_scale = get_standardized_column_names(data, skip_columns)
+    
+    logger.info(f"Normalizing {len(cols_to_scale)} columns: {cols_to_scale}")
+    
+    # Use feature range from config
+    feature_range = config.get("normalization", {}).get("feature_range", (-1, 1))
+    
+    # Normalize the data
+    scaler, normalized_train, normalized_val, normalized_test = scale_window(
+        train_data=train_data,
+        val_data=validation_data,
+        test_data=test_data,
+        cols_to_scale=cols_to_scale,
+        feature_range=feature_range,
+        window_folder=window_folder,
+        use_sigmoid=config.get("normalization", {}).get("use_sigmoid", True),
+        sigmoid_k=config.get("normalization", {}).get("sigmoid_k", 2.0)
+    )
+    
+    # Combine the normalized datasets back into one
+    normalized_data = pd.concat([normalized_train, normalized_val, normalized_test])
+    
+    # Sort by index to ensure chronological order
+    normalized_data = normalized_data.sort_index()
+    
+    logger.info(f"Data normalized. Shape: {normalized_data.shape}")
+    
+    return normalized_data
 
 def get_risk_params():
     """
@@ -215,8 +256,10 @@ def get_risk_params():
     return risk_params
 
 def main():
+    set_global_seed(config['seed'])
     # Create output directories
     os.makedirs('models', exist_ok=True)
+    os.makedirs('data', exist_ok=True)
     
     # Current timestamp for model folder
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -288,8 +331,7 @@ def main():
 
     # DEBUGGING: Print the features that will be used in the observation vector
     # This will help debug why the model expects 9 features
-    observation_features = ["close_norm"]  # First feature is always close_norm
-    observation_features.extend(enabled_indicators)  # Add all enabled indicators
+    observation_features = enabled_indicators.copy()  # Use only enabled indicators for observation
     observation_features.append("position")  # Last feature is always position
     logger.info(f"OBSERVATION VECTOR will contain {len(observation_features)} features: {observation_features}")
     
@@ -320,13 +362,39 @@ def main():
     
     logger.info(f"Loaded dataset with {len(data)} records")
     
-    # Split data into training, validation, and test sets
-    train_split_idx = int(len(data) * train_ratio)
-    validation_split_idx = train_split_idx + int(len(data) * validation_ratio)
+    # Normalize the data using the normalization module
+    normalized_data = normalize_window_data(data, model_folder)
     
-    train_data = data.iloc[:train_split_idx].copy()
-    validation_data = data.iloc[train_split_idx:validation_split_idx].copy()
-    test_data = data.iloc[validation_split_idx:].copy()
+    # Save the normalized data to CSV
+    normalized_csv_path = f"data/normalized_data_{timestamp}.csv"
+    normalized_data.to_csv(normalized_csv_path)
+    logger.info(f"Saved normalized data to {normalized_csv_path}")
+    
+    # Also save a copy with a fixed name for easy access
+    normalized_data.to_csv("data/normalized_data_latest.csv")
+    logger.info("Saved normalized data to data/normalized_data_latest.csv")
+    
+    # Check if all required columns for training are available
+    required_columns = ['close_norm'] + enabled_indicators
+    missing_columns = [col for col in required_columns if col not in normalized_data.columns]
+    
+    if missing_columns:
+        logger.error(f"Missing required columns for training: {missing_columns}")
+        logger.error("Available columns: {}".format(normalized_data.columns.tolist()))
+        
+        # For missing indicators, create dummy columns with zeros
+        logger.warning("Creating dummy columns with zeros for missing indicators")
+        for col in missing_columns:
+            if col != 'close_norm':  # close_norm should be handled separately
+                normalized_data[col] = 0.0
+    
+    # Split data into training, validation, and test sets
+    train_split_idx = int(len(normalized_data) * train_ratio)
+    validation_split_idx = train_split_idx + int(len(normalized_data) * validation_ratio)
+    
+    train_data = normalized_data.iloc[:train_split_idx].copy()
+    validation_data = normalized_data.iloc[train_split_idx:validation_split_idx].copy()
+    test_data = normalized_data.iloc[validation_split_idx:].copy()
     
     logger.info(f"Data split into:")
     logger.info(f"- Training: {len(train_data)} records")
