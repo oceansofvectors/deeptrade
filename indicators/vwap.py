@@ -36,11 +36,19 @@ def calculate_vwap(df, target_col='VWAP'):
         else:
             # For non-datetime index or other index types, convert to datetime first
             try:
-                df_calc['date'] = pd.to_datetime(df.index).strftime('%Y-%m-%d')
+                # Add utc=True to handle timezone-aware datetimes
+                df_calc['date'] = pd.to_datetime(df.index, utc=True).strftime('%Y-%m-%d')
             except:
-                # Fallback to a simple incremental counter for each day
-                df_calc['date'] = pd.to_datetime(df.index).normalize()
-                df_calc['date'] = df_calc['date'].dt.strftime('%Y-%m-%d')
+                # Fallback - first convert to datetime with timezone handling
+                try:
+                    # Try first with UTC conversion
+                    temp_dates = pd.to_datetime(df.index, utc=True)
+                    df_calc['date'] = temp_dates.normalize().strftime('%Y-%m-%d')
+                except:
+                    # If that fails, try a more robust approach
+                    logger.warning("Using fallback date extraction for VWAP calculation")
+                    # Create a simple date string from index position as last resort
+                    df_calc['date'] = [str(i).split()[0] for i in df.index]
         
         # Detect date changes
         date_change = df_calc['date'] != df_calc['date'].shift(1)

@@ -190,6 +190,11 @@ def normalize_data(data: pd.DataFrame,
     
     # Make a copy to avoid modifying the original data
     normalized_data = data.copy()
+
+    # Remove any existing normalized indicator columns to force recreation
+    for col in ['SMA_NORM', 'EMA_NORM', 'VOLUME_MA', 'VWAP_NORM', 'PSAR_NORM', 'OBV_NORM']:
+        if col in normalized_data.columns:
+            normalized_data.drop(columns=col, inplace=True)
     
     # Filter columns that actually exist in the data
     cols_to_scale = [col for col in cols_to_scale if col in normalized_data.columns]
@@ -241,6 +246,113 @@ def normalize_data(data: pd.DataFrame,
                 # Apply sigmoid transform
                 normalized_data[col] = 2 / (1 + np.exp(-k * ((normalized_data[col] - mean) / std))) - 1
     
+    # Create normalized versions of specific indicators that the model expects
+    
+    # SMA_NORM from SMA_20 or SMA
+    if 'SMA_20' in normalized_data.columns and 'SMA_NORM' not in normalized_data.columns:
+        logger.info("Creating SMA_NORM from SMA_20")
+        if 'SMA_20' in cols_to_scale:
+            # SMA_20 was already normalized, so just rename it
+            normalized_data['SMA_NORM'] = normalized_data['SMA_20']
+        else:
+            # Normalize SMA_20 separately
+            sma_mean = normalized_data['SMA_20'].mean()
+            sma_std = max(normalized_data['SMA_20'].std(), 1e-6)
+            normalized_data['SMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['SMA_20'] - sma_mean) / sma_std))) - 1
+    elif 'SMA' in normalized_data.columns and 'SMA_NORM' not in normalized_data.columns:
+        logger.info("Creating SMA_NORM from SMA")
+        if 'SMA' in cols_to_scale:
+            # SMA was already normalized, so just rename it
+            normalized_data['SMA_NORM'] = normalized_data['SMA']
+        else:
+            # Normalize SMA separately
+            close_mean = normalized_data['close'].mean() if 'close' in normalized_data.columns else normalized_data['SMA'].mean()
+            close_std = max(normalized_data['close'].std(), 1e-6) if 'close' in normalized_data.columns else max(normalized_data['SMA'].std(), 1e-6)
+            normalized_data['SMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['SMA'] - close_mean) / close_std))) - 1
+    
+    # EMA_NORM from EMA_20 or EMA
+    if 'EMA_20' in normalized_data.columns and 'EMA_NORM' not in normalized_data.columns:
+        logger.info("Creating EMA_NORM from EMA_20")
+        if 'EMA_20' in cols_to_scale:
+            # EMA_20 was already normalized, so just rename it
+            normalized_data['EMA_NORM'] = normalized_data['EMA_20']
+        else:
+            # Normalize EMA_20 separately
+            ema_mean = normalized_data['EMA_20'].mean()
+            ema_std = max(normalized_data['EMA_20'].std(), 1e-6)
+            normalized_data['EMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['EMA_20'] - ema_mean) / ema_std))) - 1
+    elif 'EMA' in normalized_data.columns and 'EMA_NORM' not in normalized_data.columns:
+        logger.info("Creating EMA_NORM from EMA")
+        if 'EMA' in cols_to_scale:
+            # EMA was already normalized, so just rename it
+            normalized_data['EMA_NORM'] = normalized_data['EMA']
+        else:
+            # Normalize EMA separately
+            close_mean = normalized_data['close'].mean() if 'close' in normalized_data.columns else normalized_data['EMA'].mean()
+            close_std = max(normalized_data['close'].std(), 1e-6) if 'close' in normalized_data.columns else max(normalized_data['EMA'].std(), 1e-6)
+            normalized_data['EMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['EMA'] - close_mean) / close_std))) - 1
+    
+    # VOLUME_MA from VOLUME or VOLUME_NORM
+    if 'VOLUME' in normalized_data.columns and 'VOLUME_MA' not in normalized_data.columns:
+        logger.info("Creating VOLUME_MA from VOLUME")
+        if 'VOLUME' in cols_to_scale:
+            # VOLUME was already normalized, so just rename it
+            normalized_data['VOLUME_MA'] = normalized_data['VOLUME']
+        else:
+            # Normalize VOLUME separately
+            vol_mean = normalized_data['VOLUME'].mean()
+            vol_std = max(normalized_data['VOLUME'].std(), 1e-6)
+            normalized_data['VOLUME_MA'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['VOLUME'] - vol_mean) / vol_std))) - 1
+    elif 'VOLUME_NORM' in normalized_data.columns and 'VOLUME_MA' not in normalized_data.columns:
+        logger.info("Creating VOLUME_MA from VOLUME_NORM")
+        normalized_data['VOLUME_MA'] = normalized_data['VOLUME_NORM']
+    
+    # VWAP_NORM from VWAP if needed
+    if 'VWAP' in normalized_data.columns and 'VWAP_NORM' not in normalized_data.columns:
+        logger.info("Creating VWAP_NORM from VWAP")
+        if 'VWAP' in cols_to_scale:
+            # VWAP was already normalized, so just rename it
+            normalized_data['VWAP_NORM'] = normalized_data['VWAP']
+        else:
+            # Normalize VWAP separately
+            vwap_mean = normalized_data['VWAP'].mean()
+            vwap_std = max(normalized_data['VWAP'].std(), 1e-6)
+            normalized_data['VWAP_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['VWAP'] - vwap_mean) / vwap_std))) - 1
+    
+    # PSAR_NORM from PSAR if needed
+    if 'PSAR' in normalized_data.columns and 'PSAR_NORM' not in normalized_data.columns:
+        logger.info("Creating PSAR_NORM from PSAR")
+        if 'PSAR' in cols_to_scale:
+            # PSAR was already normalized, so just rename it
+            normalized_data['PSAR_NORM'] = normalized_data['PSAR']
+        else:
+            # Normalize PSAR separately
+            psar_mean = normalized_data['PSAR'].mean()
+            psar_std = max(normalized_data['PSAR'].std(), 1e-6)
+            normalized_data['PSAR_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['PSAR'] - psar_mean) / psar_std))) - 1
+    
+    # OBV_NORM from OBV if needed
+    if 'OBV' in normalized_data.columns and 'OBV_NORM' not in normalized_data.columns:
+        logger.info("Creating OBV_NORM from OBV")
+        if 'OBV' in cols_to_scale:
+            # OBV was already normalized, so just rename it
+            normalized_data['OBV_NORM'] = normalized_data['OBV']
+        else:
+            # Normalize OBV separately
+            obv_mean = normalized_data['OBV'].mean()
+            obv_std = max(normalized_data['OBV'].std(), 1e-6)
+            normalized_data['OBV_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((normalized_data['OBV'] - obv_mean) / obv_std))) - 1
+    
+    # Handle supertrend (should be -1 or 1, not normalized)
+    if 'supertrend' in normalized_data.columns and 'SUPERTREND' not in normalized_data.columns:
+        logger.info("Creating SUPERTREND from supertrend")
+        normalized_data['SUPERTREND'] = normalized_data['supertrend']
+    
+    # Handle trend_direction if it exists but SUPERTREND doesn't
+    if 'trend_direction' in normalized_data.columns and 'SUPERTREND' not in normalized_data.columns:
+        logger.info("Creating SUPERTREND from trend_direction")
+        normalized_data['SUPERTREND'] = normalized_data['trend_direction']
+    
     # Save the scaler if a path is provided
     if save_path:
         with open(save_path, "wb") as f:
@@ -289,10 +401,15 @@ def get_standardized_column_names(df: pd.DataFrame,
     # Default list of columns to skip if none provided
     if skip_columns is None:
         skip_columns = [
-            'close_norm', 'position', 'trend_direction', 'supertrend', 
+            'close_norm', 'position', 'trend_direction', 'supertrend', 'SUPERTREND',
             'time', 'timestamp', 'date', 'DOW', 
             'Up Trend', 'Down Trend', 'open', 'high', 'low', 'close', 
-            'Open', 'High', 'Low', 'Close', 'Volume', 'volume'
+            'Open', 'High', 'Low', 'Close', 'Volume', 'volume',
+            'PSAR_DIR',  # Also add PSAR_DIR as it's a categorical indicator (-1, 1)
+            # Skip any already normalized versions of indicators
+            'SMA_NORM', 'EMA_NORM', 'OBV_NORM', 'PSAR_NORM', 'VWAP_NORM', 'VOLUME_MA',
+            # Skip cyclical time features
+            'DOW_SIN', 'DOW_COS', 'MSO_SIN', 'MSO_COS'
         ]
     
     # Get all numeric columns except those in skip_columns

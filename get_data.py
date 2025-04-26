@@ -370,6 +370,22 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         # Fill any remaining NaN values
         df = df.fillna(0)
         
+        # Create the missing normalized columns needed by the model
+        # SMA_NORM from SMA
+        if 'SMA' in df.columns and 'SMA_NORM' not in df.columns:
+            df['SMA_NORM'] = df['SMA']
+            model_columns.append('SMA_NORM')
+            
+        # EMA_NORM from EMA
+        if 'EMA' in df.columns and 'EMA_NORM' not in df.columns:
+            df['EMA_NORM'] = df['EMA']
+            model_columns.append('EMA_NORM')
+            
+        # VOLUME_MA from VOLUME_NORM
+        if 'VOLUME_NORM' in df.columns and 'VOLUME_MA' not in df.columns:
+            df['VOLUME_MA'] = df['VOLUME_NORM']
+            model_columns.append('VOLUME_MA')
+        
         # Two-stage normalization for technical indicators using only training data statistics
         logger.info("Calculating technical indicators completed. Normalization will be performed per window to avoid data leakage.")
         

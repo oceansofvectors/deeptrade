@@ -411,7 +411,7 @@ class ModelTrader:
             if indicators_config.get("psar", {}).get("enabled", False):
                 enabled_indicators.extend(["PSAR_NORM", "PSAR_DIR"])
             if indicators_config.get("volume", {}).get("enabled", False):
-                enabled_indicators.append("VOLUME_MA")
+                enabled_indicators.append("VOLUME_NORM")
             if indicators_config.get("vwap", {}).get("enabled", False):
                 enabled_indicators.append("VWAP_NORM")
             if indicators_config.get("minutes_since_open", {}).get("enabled", False):
@@ -853,13 +853,19 @@ class ModelTrader:
         logger.info(f"DEBUG: Columns after adding time features: {processed_df.columns.tolist()}")
 
         # 4️⃣ Normalise
-        norm_df = self._normalize_bar(processed_df)
-        if norm_df is None:
-            logger.error("Normalization failed – skipping bar")
-            return None
-        
-        if hasattr(norm_df, 'empty') and norm_df.empty:
-            logger.error("Normalization returned empty DataFrame – skipping bar")
+        try:
+            norm_df = self._normalize_bar(processed_df)
+            if norm_df is None:
+                logger.error("Normalization returned None – skipping bar")
+                return None
+            
+            if hasattr(norm_df, 'empty') and norm_df.empty:
+                logger.error("Normalization returned empty DataFrame – skipping bar")
+                return None
+        except Exception as e:
+            logger.error(f"Exception during normalization: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
         
         # Debug: Log columns after normalization
@@ -914,6 +920,14 @@ class ModelTrader:
         logger.info(f"DEBUG: Ordered columns for prediction: {ordered_cols}")
         logger.info(f"DEBUG: Number of columns in ordered_cols: {len(ordered_cols)}")
         
+        # Verify all ordered columns exist in the dataframe
+        missing_cols = [col for col in ordered_cols if col not in latest.columns]
+        if missing_cols:
+            logger.error(f"Missing columns in normalized data: {missing_cols}")
+            for col in missing_cols:
+                logger.info(f"Adding missing column {col} with zero values")
+                latest[col] = 0.0
+        
         latest = latest[ordered_cols]
         
         # Debug: Log the final dataframe shape
@@ -936,14 +950,15 @@ class ModelTrader:
                 self.scaler = load_scaler("scaler.pkl")
                 
             if self.scaler is None:
-                logger.warning("No scaler found. Using default normalization parameters.")
-                self.scaler = {}
+                logger.warning("No scaler found. A new scaler will be created during the first normalization.")
+                # Not setting self.scaler here, let _normalize_bar handle it
             else:
-                logger.info(f"Normalization scaler loaded successfully with {len(self.scaler)} columns")
+                logger.info(f"Normalization scaler loaded successfully")
                 
         except Exception as e:
             logger.error(f"Error loading normalization scalers: {e}")
-            self.scaler = {}
+            # Set to None so _normalize_bar will create a new scaler
+            self.scaler = None
     
     def execute_trade(self, prediction, bar):
         """
@@ -983,6 +998,12 @@ class ModelTrader:
             # Process the action (0=long/buy, 1=short/sell, 2=hold)
             if action == 0:  # Buy/Long signal
                 if self.current_position <= 0:  # If not already long
+                    # First cancel ALL existing orders (including take profit/stop loss)
+                    self._cancel_all_existing_orders()
+                    
+                    # Wait a brief moment for order cancellations to be processed
+                    time.sleep(0.5)
+                    
                     # Close any existing short position first
                     if self.current_position < 0:
                         logger.info(f"Closing existing short position before going long")
@@ -992,43 +1013,132 @@ class ModelTrader:
                         trade = self.ib.placeOrder(self.contract, close_order)
                         self.order_ids.append(trade.order.orderId)
                         logger.info(f"Placed order to close short position: {trade.order}")
+                        
+                        # Wait for the position to be closed
+                        self._wait_for_position_change()
                     
                     # Now open a new long position
                     logger.info(f"Opening long position of {position_size} contracts")
                     
                     # If risk management is enabled, use bracket orders
                     if self.use_risk_management and (self.stop_loss_pct or self.take_profit_pct):
+                        # Calculate stop loss and take profit prices based on portfolio percentage
+                        # For futures, we need to convert portfolio percentage to price points
+                        
+                        # Point value for NQ futures ($20 per point)
+                        point_value = 20.0
+                        
                         # Calculate stop loss and take profit prices
                         stop_loss_price = None
                         take_profit_price = None
                         
+                        # Use the initial_balance from config.yaml instead of getting from IB
+                        portfolio_value = config["environment"]["initial_balance"]
+                        logger.info(f"Using configured portfolio value for risk: ${portfolio_value}")
+                        
                         if self.stop_loss_pct:
-                            stop_loss_price = round(current_price * (1 - self.stop_loss_pct/100), 2)
+                            # Calculate dollar risk based on portfolio percentage
+                            risk_dollars = portfolio_value * (self.stop_loss_pct / 100)
+                            
+                            # Convert to points (how many points can we risk)
+                            risk_points = risk_dollars / (point_value * position_size)
+                            
+                            # Calculate stop loss price for long position (entry - risk points)
+                            stop_loss_price = round(current_price - risk_points, 2)
+                            logger.info(f"Stop loss: ${risk_dollars:.2f} ({self.stop_loss_pct}% of portfolio), {risk_points:.2f} points, price: {stop_loss_price}")
                             
                         if self.take_profit_pct:
-                            take_profit_price = round(current_price * (1 + self.take_profit_pct/100), 2)
+                            # Calculate dollar profit target based on portfolio percentage
+                            profit_dollars = portfolio_value * (self.take_profit_pct / 100)
+                            
+                            # Convert to points (how many points for target)
+                            profit_points = profit_dollars / (point_value * position_size)
+                            
+                            # Calculate take profit price for long position (entry + profit points)
+                            take_profit_price = round(current_price + profit_points, 2)
+                            logger.info(f"Take profit: ${profit_dollars:.2f} ({self.take_profit_pct}% of portfolio), {profit_points:.2f} points, price: {take_profit_price}")
                         
-                        # Create bracket order - ensure all orders in bracket have transmit=True
-                        parent_order = Order()
-                        parent_order.action = 'BUY'
-                        parent_order.orderType = 'MKT'
-                        parent_order.totalQuantity = position_size
-                        parent_order.transmit = True  # Ensure parent order transmits automatically
+                        # Create parent market order
+                        parent = Order()
+                        parent.orderId = self.ib.client.getReqId()
+                        parent.action = 'BUY'
+                        parent.orderType = 'MKT'
+                        parent.totalQuantity = position_size
+                        parent.transmit = False  # Parent will not transmit until children are attached
                         
-                        bracket = self.ib.bracketOrder(
-                            action='BUY',
-                            quantity=position_size,
-                            limitPrice=current_price,
-                            takeProfitPrice=take_profit_price,
-                            stopLossPrice=stop_loss_price,
-                            transmit=True  # Ensure bracket orders transmit automatically
-                        )
+                        # Store parent order ID for reference
+                        parent_id = parent.orderId
+                        self.active_orders[parent_id] = {
+                            'type': 'parent',
+                            'direction': 'long',
+                            'children': []
+                        }
                         
-                        for o in bracket:
-                            o.transmit = True  # Explicitly set transmit flag for each order
-                            trade = self.ib.placeOrder(self.contract, o)
-                            self.order_ids.append(trade.order.orderId)
-                            logger.info(f"Placed bracket order: {o}")
+                        # Create child orders list
+                        child_orders = []
+                        
+                        # Take profit order (limit order)
+                        if take_profit_price:
+                            take_profit = Order()
+                            take_profit.orderId = self.ib.client.getReqId()
+                            take_profit.action = 'SELL'
+                            take_profit.orderType = 'LMT'
+                            take_profit.totalQuantity = position_size
+                            take_profit.lmtPrice = take_profit_price
+                            take_profit.parentId = parent_id
+                            take_profit.transmit = False  # Don't transmit yet
+                            
+                            # Add to active orders
+                            tp_id = take_profit.orderId
+                            self.active_orders[tp_id] = {
+                                'type': 'take_profit',
+                                'parent_id': parent_id,
+                                'direction': 'long'
+                            }
+                            self.active_orders[parent_id]['children'].append(tp_id)
+                            
+                            child_orders.append(take_profit)
+                        
+                        # Stop loss order (stop order)
+                        if stop_loss_price:
+                            stop_loss = Order()
+                            stop_loss.orderId = self.ib.client.getReqId()
+                            stop_loss.action = 'SELL'
+                            stop_loss.orderType = 'STP'
+                            stop_loss.totalQuantity = position_size
+                            stop_loss.auxPrice = stop_loss_price
+                            stop_loss.parentId = parent_id
+                            # This is the last order, so it will transmit the entire bracket
+                            stop_loss.transmit = True
+                            
+                            # Add to active orders
+                            sl_id = stop_loss.orderId
+                            self.active_orders[sl_id] = {
+                                'type': 'stop_loss',
+                                'parent_id': parent_id,
+                                'direction': 'long'
+                            }
+                            self.active_orders[parent_id]['children'].append(sl_id)
+                            
+                            child_orders.append(stop_loss)
+                        else:
+                            # If no stop loss, the last (or only) take profit order must transmit
+                            if child_orders:
+                                child_orders[-1].transmit = True
+                            else:
+                                # If no child orders, parent must transmit
+                                parent.transmit = True
+                        
+                        # Place parent order first
+                        parent_trade = self.ib.placeOrder(self.contract, parent)
+                        self.order_ids.append(parent_id)
+                        logger.info(f"Placed parent order for long position: {parent_trade.order}")
+                        
+                        # Place child orders
+                        for child in child_orders:
+                            child_trade = self.ib.placeOrder(self.contract, child)
+                            self.order_ids.append(child.orderId)
+                            logger.info(f"Placed child order: {child_trade.order}")
                     else:
                         # Simple market order if no risk management
                         order = MarketOrder('BUY', position_size)
@@ -1047,6 +1157,12 @@ class ModelTrader:
                     
             elif action == 1:  # Sell/Short signal
                 if self.current_position >= 0:  # If not already short
+                    # First cancel ALL existing orders (including take profit/stop loss)
+                    self._cancel_all_existing_orders()
+                    
+                    # Wait a brief moment for order cancellations to be processed
+                    time.sleep(0.5)
+                    
                     # Close any existing long position first
                     if self.current_position > 0:
                         logger.info(f"Closing existing long position before going short")
@@ -1056,37 +1172,132 @@ class ModelTrader:
                         trade = self.ib.placeOrder(self.contract, close_order)
                         self.order_ids.append(trade.order.orderId)
                         logger.info(f"Placed order to close long position: {trade.order}")
+                        
+                        # Wait for the position to be closed
+                        self._wait_for_position_change()
                     
                     # Now open a new short position
                     logger.info(f"Opening short position of {position_size} contracts")
                     
                     # If risk management is enabled, use bracket orders
                     if self.use_risk_management and (self.stop_loss_pct or self.take_profit_pct):
+                        # Calculate stop loss and take profit prices based on portfolio percentage
+                        # For futures, we need to convert portfolio percentage to price points
+                        
+                        # Point value for NQ futures ($20 per point)
+                        point_value = 20.0
+                        
                         # Calculate stop loss and take profit prices
                         stop_loss_price = None
                         take_profit_price = None
                         
+                        # Use the initial_balance from config.yaml instead of getting from IB
+                        portfolio_value = config["environment"]["initial_balance"]
+                        logger.info(f"Using configured portfolio value for risk: ${portfolio_value}")
+                        
                         if self.stop_loss_pct:
-                            stop_loss_price = round(current_price * (1 + self.stop_loss_pct/100), 2)
+                            # Calculate dollar risk based on portfolio percentage
+                            risk_dollars = portfolio_value * (self.stop_loss_pct / 100)
+                            
+                            # Convert to points (how many points can we risk)
+                            risk_points = risk_dollars / (point_value * position_size)
+                            
+                            # Calculate stop loss price for short position (entry + risk points)
+                            stop_loss_price = round(current_price + risk_points, 2)
+                            logger.info(f"Stop loss: ${risk_dollars:.2f} ({self.stop_loss_pct}% of portfolio), {risk_points:.2f} points, price: {stop_loss_price}")
                             
                         if self.take_profit_pct:
-                            take_profit_price = round(current_price * (1 - self.take_profit_pct/100), 2)
+                            # Calculate dollar profit target based on portfolio percentage
+                            profit_dollars = portfolio_value * (self.take_profit_pct / 100)
+                            
+                            # Convert to points (how many points for target)
+                            profit_points = profit_dollars / (point_value * position_size)
+                            
+                            # Calculate take profit price for short position (entry - profit points)
+                            take_profit_price = round(current_price - profit_points, 2)
+                            logger.info(f"Take profit: ${profit_dollars:.2f} ({self.take_profit_pct}% of portfolio), {profit_points:.2f} points, price: {take_profit_price}")
                         
-                        # Create bracket order with transmit=True
-                        bracket = self.ib.bracketOrder(
-                            action='SELL',
-                            quantity=position_size,
-                            limitPrice=current_price,
-                            takeProfitPrice=take_profit_price,
-                            stopLossPrice=stop_loss_price,
-                            transmit=True  # Ensure bracket orders transmit automatically
-                        )
+                        # Create parent market order
+                        parent = Order()
+                        parent.orderId = self.ib.client.getReqId()
+                        parent.action = 'SELL'
+                        parent.orderType = 'MKT'
+                        parent.totalQuantity = position_size
+                        parent.transmit = False  # Parent will not transmit until children are attached
                         
-                        for o in bracket:
-                            o.transmit = True  # Explicitly set transmit flag for each order
-                            trade = self.ib.placeOrder(self.contract, o)
-                            self.order_ids.append(trade.order.orderId)
-                            logger.info(f"Placed bracket order: {o}")
+                        # Store parent order ID for reference
+                        parent_id = parent.orderId
+                        self.active_orders[parent_id] = {
+                            'type': 'parent',
+                            'direction': 'short',
+                            'children': []
+                        }
+                        
+                        # Create child orders list
+                        child_orders = []
+                        
+                        # Take profit order (limit order)
+                        if take_profit_price:
+                            take_profit = Order()
+                            take_profit.orderId = self.ib.client.getReqId()
+                            take_profit.action = 'BUY'
+                            take_profit.orderType = 'LMT'
+                            take_profit.totalQuantity = position_size
+                            take_profit.lmtPrice = take_profit_price
+                            take_profit.parentId = parent_id
+                            take_profit.transmit = False  # Don't transmit yet
+                            
+                            # Add to active orders
+                            tp_id = take_profit.orderId
+                            self.active_orders[tp_id] = {
+                                'type': 'take_profit',
+                                'parent_id': parent_id,
+                                'direction': 'short'
+                            }
+                            self.active_orders[parent_id]['children'].append(tp_id)
+                            
+                            child_orders.append(take_profit)
+                        
+                        # Stop loss order (stop order)
+                        if stop_loss_price:
+                            stop_loss = Order()
+                            stop_loss.orderId = self.ib.client.getReqId()
+                            stop_loss.action = 'BUY'
+                            stop_loss.orderType = 'STP'
+                            stop_loss.totalQuantity = position_size
+                            stop_loss.auxPrice = stop_loss_price
+                            stop_loss.parentId = parent_id
+                            # This is the last order, so it will transmit the entire bracket
+                            stop_loss.transmit = True
+                            
+                            # Add to active orders
+                            sl_id = stop_loss.orderId
+                            self.active_orders[sl_id] = {
+                                'type': 'stop_loss',
+                                'parent_id': parent_id,
+                                'direction': 'short'
+                            }
+                            self.active_orders[parent_id]['children'].append(sl_id)
+                            
+                            child_orders.append(stop_loss)
+                        else:
+                            # If no stop loss, the last (or only) take profit order must transmit
+                            if child_orders:
+                                child_orders[-1].transmit = True
+                            else:
+                                # If no child orders, parent must transmit
+                                parent.transmit = True
+                        
+                        # Place parent order first
+                        parent_trade = self.ib.placeOrder(self.contract, parent)
+                        self.order_ids.append(parent_id)
+                        logger.info(f"Placed parent order for short position: {parent_trade.order}")
+                        
+                        # Place child orders
+                        for child in child_orders:
+                            child_trade = self.ib.placeOrder(self.contract, child)
+                            self.order_ids.append(child.orderId)
+                            logger.info(f"Placed child order: {child_trade.order}")
                     else:
                         # Simple market order if no risk management
                         order = MarketOrder('SELL', position_size)
@@ -1116,6 +1327,70 @@ class ModelTrader:
             import traceback
             logger.error(traceback.format_exc())
             return False
+            
+    def _cancel_all_existing_orders(self):
+        """
+        Cancel ALL existing orders for the current contract.
+        This is more robust than trying to track individual orders.
+        """
+        logger.info("Cancelling ALL existing orders to ensure clean slate")
+        
+        # Get all open trades from IB (trades contain both order and contract)
+        open_trades = self.ib.trades()
+        if not open_trades:
+            logger.info("No open orders found to cancel")
+            return
+            
+        # Count orders for our contract
+        contract_orders = 0
+        
+        # Cancel all orders for our contract
+        for trade in open_trades:
+            # Check if this order is for our contract
+            if trade.contract.symbol == self.contract.symbol and trade.contract.secType == self.contract.secType:
+                contract_orders += 1
+                try:
+                    logger.info(f"Cancelling order: ID={trade.order.orderId}, Action={trade.order.action}, Type={trade.order.orderType}")
+                    self.ib.cancelOrder(trade.order)
+                except Exception as e:
+                    logger.error(f"Error cancelling order {trade.order.orderId}: {e}")
+        
+        logger.info(f"Cancelled {contract_orders} orders for {self.contract.symbol}")
+        
+        # Clear our internal order tracking
+        self.order_ids = []
+        self.active_orders = {}
+    
+    def _wait_for_position_change(self, max_wait_seconds=3):
+        """
+        Wait for position to change after closing a position.
+        This helps ensure we don't move on to placing new orders before the close is processed.
+        
+        Args:
+            max_wait_seconds: Maximum time to wait in seconds
+        """
+        logger.info(f"Waiting for position change confirmation (max {max_wait_seconds} seconds)")
+        start_time = time.time()
+        
+        # Store initial position state
+        initial_position = self.current_position
+        
+        while time.time() - start_time < max_wait_seconds:
+            # Force position verification
+            self.verify_position(force=True)
+            
+            # If position has changed to neutral (0), we can proceed
+            if initial_position != 0 and self.current_position == 0:
+                logger.info(f"Position successfully changed from {initial_position} to {self.current_position}")
+                return
+                
+            # Wait a bit before checking again
+            time.sleep(0.2)
+            
+        logger.warning(f"Timed out waiting for position to change. Current position: {self.current_position}")
+        
+        # One final position verification to make sure we have latest state
+        self.verify_position(force=True)
     
     def fetch_historical_bars(self, days_back=30):
         """
@@ -1182,23 +1457,139 @@ class ModelTrader:
         """
         try:
             if not df.empty:
-                # Use the normalize_data function from the normalization module
-                norm_result = normalize_data(df, self.scaler)
+                # Log sample of pre-normalized values for key features
+                last_row = df.iloc[-1]
+                logger.info(f"DEBUG: PRE-NORMALIZATION values for latest bar:")
+                for col in ['close', 'high', 'low', 'open', 'volume']:
+                    if col in last_row:
+                        logger.info(f"    {col}: {last_row[col]}")
+                
+                # Get key technical indicators if they exist
+                for col in ['RSI', 'MACD', 'ATR', 'SMA_20', 'EMA_20']:
+                    if col in last_row:
+                        logger.info(f"    {col}: {last_row[col]}")
+                
+                # Get the columns to normalize (exclude certain columns like time, position, etc.)
+                cols_to_scale = get_standardized_column_names(df)
+                logger.info(f"Normalizing {len(cols_to_scale)} columns: {cols_to_scale}")
+
+                # Check if self.scaler is a scikit-learn MinMaxScaler
+                from sklearn.preprocessing import MinMaxScaler
+                if not isinstance(self.scaler, MinMaxScaler):
+                    logger.warning("Scaler is not a MinMaxScaler. Creating a new scaler.")
+                    scaler_to_use = None  # Will create a new scaler in normalize_data
+                else:
+                    scaler_to_use = self.scaler
+
+                # Use the normalize_data function from the normalization module with proper parameters
+                norm_result = normalize_data(
+                    data=df,
+                    cols_to_scale=cols_to_scale,
+                    feature_range=self.feature_range,
+                    scaler=scaler_to_use,
+                    use_sigmoid=True,  # Enable sigmoid normalization
+                    sigmoid_k=2.0  # Default steepness parameter
+                )
                 
                 # Handle case where normalize_data returns a tuple instead of a DataFrame
                 if isinstance(norm_result, tuple):
                     logger.info(f"normalize_data returned a tuple of length {len(norm_result)}")
                     # Assuming the first element of the tuple is the normalized DataFrame
                     norm_df = norm_result[0] if len(norm_result) > 0 else None
+                    
+                    # If we created a new scaler, save it for future use
+                    if scaler_to_use is None and len(norm_result) > 1:
+                        self.scaler = norm_result[1]
+                        logger.info("Created and saved new scaler for future normalization")
                 else:
                     norm_df = norm_result
+                
+                # Ensure categorical indicators like supertrend and PSAR_DIR maintain their values
+                if norm_df is not None and not norm_df.empty:
+                    # Fix supertrend values (should be -1 or 1, not normalized)
+                    if 'supertrend' in df.columns:
+                        norm_df['supertrend'] = df['supertrend']
+                        logger.info(f"Restored supertrend original values (should be -1 or 1)")
+                    if 'SUPERTREND' in df.columns:
+                        norm_df['SUPERTREND'] = df['SUPERTREND']
+                        logger.info(f"Restored SUPERTREND original values (should be -1 or 1)")
                     
+                    # Fix PSAR_DIR values (also a directional indicator that should be -1 or 1)
+                    if 'PSAR_DIR' in df.columns:
+                        norm_df['PSAR_DIR'] = df['PSAR_DIR']
+                        logger.info(f"Restored PSAR_DIR original values (should be -1 or 1)")
+                    
+                    # Handle SMA_NORM based on available columns (matching normalization.py logic)
+                    sigmoid_k = 2.0
+                    
+                    # SMA_NORM from either SMA_20 or SMA
+                    if 'SMA_20' in df.columns and 'SMA_NORM' not in norm_df.columns:
+                        # Same logic as in normalization.py
+                        sma_mean = df['SMA_20'].mean()
+                        sma_std = max(df['SMA_20'].std(), 1e-6)
+                        norm_df['SMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((df['SMA_20'] - sma_mean) / sma_std))) - 1
+                        logger.info(f"Created SMA_NORM from SMA_20 using sigmoid normalization")
+                    elif 'SMA' in df.columns and 'SMA_NORM' not in norm_df.columns:
+                        # Same logic as before
+                        close_mean = df['close'].mean()
+                        close_std = max(df['close'].std(), 1e-6)
+                        norm_df['SMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((df['SMA'] - close_mean) / close_std))) - 1
+                        logger.info(f"Created SMA_NORM from SMA using sigmoid normalization")
+                    
+                    # EMA_NORM from either EMA_20 or EMA
+                    if 'EMA_20' in df.columns and 'EMA_NORM' not in norm_df.columns:
+                        # Same logic as in normalization.py
+                        ema_mean = df['EMA_20'].mean()
+                        ema_std = max(df['EMA_20'].std(), 1e-6)
+                        norm_df['EMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((df['EMA_20'] - ema_mean) / ema_std))) - 1
+                        logger.info(f"Created EMA_NORM from EMA_20 using sigmoid normalization")
+                    elif 'EMA' in df.columns and 'EMA_NORM' not in norm_df.columns:
+                        # Same logic as before
+                        close_mean = df['close'].mean()
+                        close_std = max(df['close'].std(), 1e-6)
+                        norm_df['EMA_NORM'] = 2 / (1 + np.exp(-sigmoid_k * ((df['EMA'] - close_mean) / close_std))) - 1
+                        logger.info(f"Created EMA_NORM from EMA using sigmoid normalization")
+                    
+                    # VOLUME_MA from either VOLUME or VOLUME_NORM
+                    if 'VOLUME' in df.columns and 'VOLUME_MA' not in norm_df.columns:
+                        # Same logic as in normalization.py
+                        vol_mean = df['VOLUME'].mean()
+                        vol_std = max(df['VOLUME'].std(), 1e-6)
+                        norm_df['VOLUME_MA'] = 2 / (1 + np.exp(-sigmoid_k * ((df['VOLUME'] - vol_mean) / vol_std))) - 1
+                        logger.info(f"Created VOLUME_MA from VOLUME using sigmoid normalization")
+                    elif 'VOLUME_NORM' in df.columns and 'VOLUME_MA' not in norm_df.columns:
+                        # Previous logic - directly copy VOLUME_NORM to VOLUME_MA
+                        norm_df['VOLUME_MA'] = norm_df['VOLUME_NORM']
+                        logger.info(f"Set VOLUME_MA to match VOLUME_NORM value")
+                
+                # Log sample of normalized values for key features
+                if norm_df is not None and not norm_df.empty:
+                    last_norm_row = norm_df.iloc[-1]
+                    logger.info(f"DEBUG: POST-NORMALIZATION values for latest bar:")
+                    
+                    # Check for normalized price features
+                    for col in ['close_norm', 'high_norm', 'low_norm', 'open_norm']:
+                        if col in last_norm_row:
+                            logger.info(f"    {col}: {last_norm_row[col]}")
+                    
+                    # Check for normalized technical indicators
+                    for col in ['RSI', 'MACD', 'ATR', 'SMA_NORM', 'EMA_NORM']:
+                        if col in last_norm_row:
+                            logger.info(f"    {col}: {last_norm_row[col]}")
+                    
+                    # Specifically log the supertrend and PSAR_DIR values to confirm they're correct
+                    for col in ['supertrend', 'SUPERTREND', 'PSAR_DIR']:
+                        if col in last_norm_row:
+                            logger.info(f"    {col}: {last_norm_row[col]}")
+                
                 return norm_df
             return None
         except Exception as e:
             logger.error(f"Error normalizing data: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
-            
+
     def _add_time_features(self, df):
         """
         Add time-based features (day of week, minutes since open) to the dataframe.
@@ -1279,10 +1670,30 @@ class ModelTrader:
             # Debug: Log the input array shape
             logger.info(f"DEBUG: Reshaped prediction input shape: {prediction_input.shape}")
             
+            # Debug: Log the full NORMALIZED observation vector
+            logger.info(f"DEBUG: Full NORMALIZED observation vector (values should be mostly in [-1,1] range): {prediction_input[0].tolist()}")
+            
+            # Create a more human-readable version with column names
+            readable_vector = {}
+            columns = normalized_df.columns.tolist()
+            values = prediction_input[0].tolist()
+            for i, column in enumerate(columns):
+                if i < len(values):
+                    readable_vector[column] = values[i]
+            
+            logger.info(f"DEBUG: NORMALIZED observation vector with feature names: {readable_vector}")
+            
+            # Additional check to verify normalization worked correctly
+            # Most values should be between -1 and 1 after normalization
+            in_range_count = sum(1 for v in values if -1.1 <= v <= 1.1)  # Allow slight buffer outside [-1,1]
+            pct_in_range = (in_range_count / len(values)) * 100 if values else 0
+            logger.info(f"DEBUG: Normalization check: {in_range_count}/{len(values)} values ({pct_in_range:.1f}%) are within range [-1.1,1.1]")
+            
             # Assert correctness of dimensions before calling the policy
             assert prediction_input.shape[1] == self.model.observation_space.shape[0], \
                 f"vector:{prediction_input.shape[1]} obs:{self.model.observation_space.shape[0]}"
-                
+            
+            logger.info(f"Normalized observation vector: {prediction_input}")
             prediction = self.model.predict(prediction_input)
             
             # Convert the prediction to a readable format
