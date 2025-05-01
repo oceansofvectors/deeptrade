@@ -5,8 +5,8 @@ training:
   fee_rate: 0.0
   # New parameters for iterative training
   max_iterations: 100
-  improvement_threshold: 0.50
-  additional_timesteps: 100
+  improvement_threshold: 0.20
+  additional_timesteps: 1000
   n_stagnant_loops: 20
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
@@ -96,8 +96,8 @@ model:
   learning_rate: 0.0029977835304081614
   n_steps: 465
   batch_size: 17
-  gamma: 0.9420950542553452
-  gae_lambda: 0.9234921190880474
+  gamma: 0.95
+  gae_lambda: 0.95
   use_lr_decay: true
 
 # Risk management configuration for trade.py

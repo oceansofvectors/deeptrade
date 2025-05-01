@@ -445,6 +445,25 @@ def run_feature_pruning_analysis(model_path, data):
     
     return recommendations, importance_df, perm_importance_df
 
+# Helper function for rolling feature pruning across recent windows
+def rolling_pruned_features(importances_list, feature_names, threshold=0.01):
+    """
+    importances_list: list of numpy arrays (shape=(n_features,))
+    feature_names: list of feature names
+    threshold: minimum mean importance
+    """
+    import numpy as np
+    import pandas as pd
+    # Stack importances into matrix: shape (k, n_features)
+    mat = np.vstack(importances_list)
+    # Mean importance across windows
+    mean_imp = mat.mean(axis=0)
+    # Build DataFrame
+    df = pd.DataFrame({'feature': feature_names, 'mean_importance': mean_imp})
+    # Select features meeting threshold
+    selected = df.loc[df['mean_importance'] >= threshold, 'feature'].tolist()
+    return selected
+
 if __name__ == "__main__":
     from get_data import get_data
     import os
