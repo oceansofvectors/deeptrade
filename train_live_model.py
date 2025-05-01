@@ -249,9 +249,6 @@ def get_risk_params():
     position_sizing_config = risk_config.get("position_sizing", {})
     if position_sizing_config.get("enabled", False):
         risk_params["position_size"] = position_sizing_config.get("size_multiplier", 1.0)
-        logger.info(f"Position sizing enabled with multiplier: {risk_params['position_size']}")
-    else:
-        logger.info(f"Position sizing is disabled, using default size: {risk_params['position_size']}")
     
     return risk_params
 

@@ -57,7 +57,7 @@ def train_agent(train_data, total_timesteps: int):
         logger.info(f"Using constant learning rate: {learning_rate}")
     
     # Initialize model with configured learning rate
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=learning_rate)
+    model = PPO("MlpPolicy", env, verbose=1, learning_rate=learning_rate, seed=config.get('seed'))
     
     logger.info("Starting training for %d timesteps", total_timesteps)
     model.learn(total_timesteps=total_timesteps)
@@ -152,6 +152,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         n_steps=model_params.get("n_steps", 2048),
         batch_size=model_params.get("batch_size", 64),
         gamma=model_params.get("gamma", 0.99),
+        seed=config.get('seed'),
         gae_lambda=model_params.get("gae_lambda", 0.95),
     )
     
@@ -733,6 +734,10 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     return model, training_stats
 
 def main():
+    import torch, os
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"   # CUDA 10.2+
     set_global_seed(config["seed"])
     
     # Ensure learning rate decay parameters exist in config

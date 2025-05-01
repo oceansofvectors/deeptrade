@@ -1177,6 +1177,7 @@ def hyperparameter_tuning(
             ent_coef=ent_coef,
             batch_size=batch_size,
             gamma=gamma,
+            seed=config.get('seed'),
             gae_lambda=gae_lambda
         )
         
@@ -1691,9 +1692,6 @@ def main():
         if position_sizing_config.get("enabled", False):
             position_size = position_sizing_config.get("size_multiplier", 1.0)
             max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
-            logger.info(f"Position sizing enabled with multiplier {position_size} and max risk {max_risk_per_trade_pct}%")
-        else:
-            logger.info("  - Position sizing: Disabled")
     else:
         logger.info("Risk management is DISABLED for walk-forward testing")
     
@@ -1763,12 +1761,7 @@ def main():
             print(f"  Trailing Stop: {trailing_stop_pct}%")
         else:
             print("  Trailing Stop: Disabled")
-        
-        # Position sizing
-        if position_sizing_config.get("enabled", False):
-            print(f"  Position Sizing: Multiplier {position_size}, Max Risk {max_risk_per_trade_pct}%")
-        else:
-            print("  Position Sizing: Disabled")
+    
     
     print("Note: All references to 'days' now indicate trading days (NYSE business days), not calendar days")
     print("Note: Training was performed only on NYSE market hours data (9:30 AM to 4:00 PM ET, Monday to Friday)")

@@ -108,11 +108,6 @@ class RiskManager:
         # Calculate actual exposure (notional value)
         notional_value = price * point_value * money.to_decimal(max_contracts)
         
-        # Log position sizing information
-        logger.info(f"Position sizing: price=${float(price):.2f}, portfolio=${float(self.net_worth):.2f}, "
-                   f"position size={float(self.position_size)}, contracts={max_contracts}, "
-                   f"exposure=${float(notional_value):.2f}")
-        
         return max_contracts
     
     def update_stops(self, close_price: float, high_price: float = None, low_price: float = None) -> None:

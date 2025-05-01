@@ -86,6 +86,7 @@ def objective_func(
         transaction_cost=0.0,
         position_size=config["environment"].get("position_size", 1)
     )
+    seed_value = config.get('seed', 42)
     
     # Create model with trial hyperparameters
     model = PPO(
@@ -97,6 +98,7 @@ def objective_func(
         ent_coef=ent_coef,
         batch_size=batch_size,
         gamma=gamma,
+        seed=seed_value,
         gae_lambda=gae_lambda
     )
     
