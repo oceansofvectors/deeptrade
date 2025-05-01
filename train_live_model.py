@@ -326,27 +326,6 @@ def main():
     # Log the final list of enabled indicators
     logger.info(f"Enabled indicators for training: {enabled_indicators}")
 
-    # Dynamic pruning: attempt to load recent_selected_features.json from latest walk-forward session
-    try:
-        session_dirs = [d for d in os.listdir('models') if d.startswith('session_')]
-        session_dirs.sort(reverse=True)
-        recent_feats_path = None
-        for d in session_dirs:
-            candidate = os.path.join('models', d, 'recent_selected_features.json')
-            if os.path.exists(candidate):
-                recent_feats_path = candidate
-                break
-        if recent_feats_path:
-            with open(recent_feats_path) as f:
-                dynamic_feats = json.load(f)
-            logger.info(f"Loaded dynamic pruned features from {recent_feats_path}: {dynamic_feats}")
-            enabled_indicators = dynamic_feats
-            logger.info(f"Updated enabled indicators after dynamic pruning: {enabled_indicators}")
-        else:
-            logger.info("No recent_selected_features.json found in models/session_*; using default enabled indicators")
-    except Exception as e:
-        logger.warning(f"Error during dynamic pruning discovery: {e}")
-
     # DEBUGGING: Print the features that will be used in the observation vector
     # This will help debug why the model expects 9 features
     observation_features = enabled_indicators.copy()  # Use only enabled indicators for observation

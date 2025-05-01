@@ -1,5 +1,6 @@
 from ib_insync import IB, Future, MarketOrder, util, Order, LimitOrder, StopOrder, BracketOrder
 import datetime
+from datetime import UTC  # Add this import for the UTC timezone
 import sys
 import pandas as pd
 import numpy as np
@@ -33,6 +34,7 @@ from normalization import load_scaler, normalize_data, get_standardized_column_n
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 # Global variables for bar buffer and model trader
 bar_buffer = []
 model_trader = None
@@ -44,13 +46,18 @@ MAX_RECONNECTION_ATTEMPTS = 3
 DATA_FLOW_THRESHOLD = 60  # seconds
 MIN_EXECUTION_INTERVAL = 10  # seconds
 
+# Constants for bar synchronization
+FIVE_SEC_PER_BAR = 5
+BARS_PER_FIVE_MIN = (5 * 60) // FIVE_SEC_PER_BAR  # 60
+UTC = pytz.UTC           # convenience alias
+ROUND_TO = timedelta(minutes=5)
+
 # Heartbeat monitoring globals
 heartbeat_interval = 60  # Seconds between heartbeat checks
 state_file = "trader_state.pkl"
 
 # Globals for real-time bar handling
 bar_buckets = defaultdict(list)  # Organize bars by 5-minute intervals
-processed_intervals = set()  # Track which intervals we've already processed
 
 # Function to aggregate a list of 5-second bars into one 5-minute bar.
 def aggregate_bars(bars):
@@ -93,9 +100,23 @@ def aggregate_bars(bars):
             start_time = bars[0].get('time', datetime.now() - timedelta(minutes=5))
             end_time = bars[-1].get('time', datetime.now())
         
+        # Ensure times are timezone-aware
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=UTC)
+        else:
+            start_time = start_time.astimezone(UTC)
+            
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=UTC)
+        else:
+            end_time = end_time.astimezone(UTC)
+            
+        # Create the interval end time as key for the bar
+        interval_end = end_of_interval(end_time)
+        
         # Create and return the aggregated bar
         return {
-            'time': start_time,  # Use start time for indexing
+            'time': interval_end,  # Use interval end for indexing
             'start': start_time,
             'end': end_time,
             'open': open_price,
@@ -124,72 +145,65 @@ def get_interval_key(timestamp):
     interval_time = timestamp.replace(minute=minute, second=0, microsecond=0)
     return interval_time.strftime('%Y-%m-%d %H:%M')
 
+def end_of_interval(ts: datetime, width=ROUND_TO) -> datetime:
+    """
+    Return the *end* of the current `width`-minute interval.
+    `ts` must be timezone-aware (UTC recommended).
+    """
+    ts = ts.astimezone(UTC)
+    floored = ts - timedelta(
+        minutes=ts.minute % (width.seconds // 60),
+        seconds=ts.second,
+        microseconds=ts.microsecond,
+    )
+    return floored + width  # ⬅️  end, not start
+
 def synchronize_bars():
     """
     Check if we have complete 5-minute bars to process.
     Returns the latest complete bar if available, None otherwise.
     """
-    global bar_buckets, processed_intervals, model_trader
-    
-    # Get current time and calculate the most recently completed 5-minute interval
-    now = datetime.utcnow()
-    
-    # Use current time directly instead of going back 1 minute
-    last_complete_interval = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-    
-    # Format as a string key
-    interval_key = last_complete_interval.strftime('%Y-%m-%d %H:%M')
-    
-    # Check if we have bars for this interval and haven't processed it yet
-    if interval_key in bar_buckets and interval_key not in processed_intervals:
-        interval_bars = bar_buckets[interval_key]
+    now_utc = datetime.now(UTC) - timedelta(seconds=1)
+    last_end = end_of_interval(now_utc)
+    key = last_end.strftime("%Y-%m-%d %H:%M")
+
+    if key in bar_buckets and len(bar_buckets[key]) == BARS_PER_FIVE_MIN:
+        logger.info(f"Processing synchronized 5-minute bar for interval {key} with exactly {BARS_PER_FIVE_MIN} 5-second bars")
+        bars = bar_buckets.pop(key)
         
-        # Only process if we have a reasonable number of bars (at least 10)
-        if len(interval_bars) >= 10:
-            logger.info(f"Processing synchronized 5-minute bar for interval {interval_key} with {len(interval_bars)} 5-second bars")
-            
-            # Handle potential errors in bar aggregation
+        # Clean up old buckets to prevent memory growth
+        current_time = datetime.now(UTC)
+        for old_key in list(bar_buckets.keys()):
             try:
-                five_min_bar = aggregate_bars(interval_bars)
-                processed_intervals.add(interval_key)
-                
-                # Additional logging to track what was processed
-                logger.info(f"Created 5-minute bar: open={five_min_bar['open']}, high={five_min_bar['high']}, low={five_min_bar['low']}, close={five_min_bar['close']}, volume={five_min_bar['volume']}")
+                old_time = datetime.strptime(old_key, '%Y-%m-%d %H:%M').replace(tzinfo=UTC)
+                if (current_time - old_time).total_seconds() > 3600:  # Older than 1 hour
+                    del bar_buckets[old_key]
+                    logger.debug(f"Cleaned up old bucket: {old_key}")
             except Exception as e:
-                logger.error(f"Error aggregating bars for interval {interval_key}: {e}")
-                return None
-            
-            # Clean up old buckets to prevent memory growth
-            current_time = datetime.utcnow()
-            for old_key in list(bar_buckets.keys()):
-                try:
-                    old_time = datetime.strptime(old_key, '%Y-%m-%d %H:%M')
-                    if (current_time - old_time).total_seconds() > 3600:  # Older than 1 hour
-                        del bar_buckets[old_key]
-                except Exception as e:
-                    logger.warning(f"Error cleaning up old bar bucket {old_key}: {e}")
-            
-            return five_min_bar
-    
+                logger.warning(f"Error cleaning up old bar bucket {old_key}: {e}")
+        
+        return aggregate_bars(bars)
+
     # Calculate and log the percentage completion of the current interval
-    current_interval = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+    current_interval = end_of_interval(datetime.now(UTC))
     current_key = current_interval.strftime('%Y-%m-%d %H:%M')
     
     # Count bars in the current interval
     current_bars_count = len(bar_buckets.get(current_key, []))
     
     # Calculate elapsed seconds in this interval
-    elapsed_seconds = (now - current_interval).total_seconds()
+    now = datetime.now(UTC)
+    interval_start = current_interval - ROUND_TO
+    elapsed_seconds = (now - interval_start).total_seconds()
     total_seconds = 5 * 60  # 5 minutes = 300 seconds
     time_percent = min(100, round((elapsed_seconds / total_seconds) * 100, 1))
     
-    # Calculate theoretical expected bars (1 bar every 5 seconds = 60 bars in 5 minutes)
-    expected_bars = int(elapsed_seconds / 5)
-    bars_percent = min(100, round((current_bars_count / 60) * 100, 1))
+    # Expected bars based on elapsed time
+    expected_bars = int(elapsed_seconds / FIVE_SEC_PER_BAR)
+    bars_percent = min(100, round((current_bars_count / BARS_PER_FIVE_MIN) * 100, 1))
     
-    # Include both time-based and count-based percentage
     logger.info(f"Current interval: {current_key} | Time: {time_percent}% complete | "
-                f"Bars: {current_bars_count}/~60 ({bars_percent}%) | "
+                f"Bars: {current_bars_count}/{BARS_PER_FIVE_MIN} ({bars_percent}%) | "
                 f"Next prediction at interval completion")
     
     return None
@@ -1719,84 +1733,97 @@ def onBar(bars, hasNewBar):
         bars: RealTimeBarList object from IB API
         hasNewBar: Whether the update contains a new completed bar
     """
-    if hasNewBar:
-        global model_trader, last_execution_time, last_data_timestamp, is_data_flowing, bar_buckets
+    if not hasNewBar:
+        return
         
-        # Update heartbeat monitoring
-        last_data_timestamp = datetime.now()
-        is_data_flowing = True
+    global model_trader, last_execution_time, last_data_timestamp, is_data_flowing, bar_buckets
+    
+    # Update heartbeat monitoring
+    last_data_timestamp = datetime.now()
+    is_data_flowing = True
+    
+    try:
+        # With RealTimeBarList, get the latest bar directly
+        if len(bars) == 0:
+            logger.warning("Received empty bar update")
+            return
+            
+        # Get the latest bar
+        latest_bar = bars[-1]
         
-        try:
-            # With RealTimeBarList, get the latest bar directly
-            if len(bars) == 0:
-                logger.warning("Received empty bar update")
+        # Ensure the bar time is timezone-aware (UTC)
+        bar_time = latest_bar.time
+        if bar_time.tzinfo is None:
+            bar_time = bar_time.replace(tzinfo=pytz.UTC)
+        else:
+            bar_time = bar_time.astimezone(pytz.UTC)
+        
+        # Convert bar to dictionary format - using the actual field names from IB API
+        bar_dict = {
+            'timestamp': bar_time,
+            'time': bar_time,  # Add time key for consistent processing
+            'open': latest_bar.open_,  # Note the trailing underscore
+            'high': latest_bar.high,
+            'low': latest_bar.low,
+            'close': latest_bar.close,
+            'volume': latest_bar.volume
+        }
+        
+        # Log the new bar
+        logger.info(f"New 5-second bar: {bar_dict}")
+        
+        # Add the bar to the appropriate bucket based on the END of the 5-minute interval it belongs to
+        bucket_key_dt = end_of_interval(bar_time)
+        bucket_key = bucket_key_dt.strftime("%Y-%m-%d %H:%M")
+        
+        # Add this bar to the appropriate bucket
+        bar_buckets[bucket_key].append(bar_dict)
+        logger.info(f"Added bar to bucket {bucket_key}, now has {len(bar_buckets[bucket_key])}/{BARS_PER_FIVE_MIN} bars")
+        
+        # Debug logging to help diagnose timing issues
+        logger.debug(
+            f"bucket {bucket_key} size={len(bar_buckets[bucket_key])} last_bar={bar_time} now={datetime.now(UTC)}"
+        )
+        
+        # Check if we have a complete 5-minute bar to process
+        five_min_bar = synchronize_bars()
+        
+        if five_min_bar:
+            # Process the 5-minute bar
+            logger.info(f"Processing complete 5-minute bar: {five_min_bar}")
+            
+            # Check if enough time has passed since last execution
+            now = datetime.now()
+            if last_execution_time and now - last_execution_time < timedelta(seconds=MIN_EXECUTION_INTERVAL):
+                time_since_last = (now - last_execution_time).total_seconds()
+                logger.info(f"Skipping execution - only {time_since_last:.1f} seconds since last execution (min {MIN_EXECUTION_INTERVAL}s)")
                 return
-                
-            # Get the latest bar
-            latest_bar = bars[-1]
             
-            # Convert bar to dictionary format - using the actual field names from IB API
-            bar_dict = {
-                'timestamp': latest_bar.time,
-                'time': latest_bar.time,  # Add time key for consistent processing
-                'open': latest_bar.open_,  # Note the trailing underscore
-                'high': latest_bar.high,
-                'low': latest_bar.low,
-                'close': latest_bar.close,
-                'volume': latest_bar.volume
-            }
+            # Process the bar through indicators and normalization
+            normalized_df = model_trader.preprocess_bar(five_min_bar)
             
-            # Log the new bar
-            logger.info(f"New 5-second bar: {bar_dict}")
+            if normalized_df is None:
+                logger.error("Failed to preprocess 5-minute bar, skipping execution")
+                return
             
-            # Add the bar to the appropriate bucket based on the 5-minute interval it belongs to
-            bar_time = latest_bar.time
-            interval_time = bar_time.replace(minute=(bar_time.minute // 5) * 5, second=0, microsecond=0)
-            interval_key = interval_time.strftime('%Y-%m-%d %H:%M')
+            # Get prediction from model
+            prediction = model_trader.get_prediction(normalized_df)
             
-            # Add this bar to the appropriate bucket
-            bar_buckets[interval_key].append(bar_dict)
-            logger.info(f"Added bar to bucket {interval_key}, now has {len(bar_buckets[interval_key])} bars")
+            if prediction is None:
+                logger.error("Failed to get prediction, skipping execution")
+                return
             
-            # Check if we have a complete 5-minute bar to process
-            five_min_bar = synchronize_bars()
+            # Execute trade based on prediction
+            trade_executed = model_trader.execute_trade(prediction, five_min_bar)
             
-            if five_min_bar:
-                # Process the 5-minute bar
-                logger.info(f"Processing complete 5-minute bar: {five_min_bar}")
-                
-                # Check if enough time has passed since last execution
-                now = datetime.now()
-                if last_execution_time and now - last_execution_time < timedelta(seconds=MIN_EXECUTION_INTERVAL):
-                    time_since_last = (now - last_execution_time).total_seconds()
-                    logger.info(f"Skipping execution - only {time_since_last:.1f} seconds since last execution (min {MIN_EXECUTION_INTERVAL}s)")
-                    return
-                
-                # Process the bar through indicators and normalization
-                normalized_df = model_trader.preprocess_bar(five_min_bar)
-                
-                if normalized_df is None:
-                    logger.error("Failed to preprocess 5-minute bar, skipping execution")
-                    return
-                
-                # Get prediction from model
-                prediction = model_trader.get_prediction(normalized_df)
-                
-                if prediction is None:
-                    logger.error("Failed to get prediction, skipping execution")
-                    return
-                
-                # Execute trade based on prediction
-                trade_executed = model_trader.execute_trade(prediction, five_min_bar)
-                
-                if trade_executed:
-                    # Update last execution time
-                    last_execution_time = now
-                    logger.info(f"Trade executed at {now} based on 5-minute bar prediction")
-        except Exception as e:
-            logger.error(f"Error in onBar: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            if trade_executed:
+                # Update last execution time
+                last_execution_time = now
+                logger.info(f"Trade executed at {now} based on 5-minute bar prediction")
+    except Exception as e:
+        logger.error(f"Error in onBar: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 def heartbeat_monitor():
     """

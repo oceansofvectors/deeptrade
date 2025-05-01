@@ -717,24 +717,6 @@ def process_single_window(
     else:
         window_result["has_trade_history"] = False
     
-    # Compute and save feature importances for this window's training data
-    try:
-        train_env = TradingEnv(
-            train_data,
-            initial_balance=config["environment"]["initial_balance"],
-            position_size=config["environment"].get("position_size", 1)
-        )
-        indicator_names = train_env.technical_indicators
-        imp_df = analyze_feature_importance(f"{window_folder}/model", train_data, indicator_names)
-        features = imp_df["Feature"].tolist()
-        importances = imp_df["Importance"].values
-        np.save(f"{window_folder}/importances.npy", importances)
-        with open(f"{window_folder}/features.json", "w") as f:
-            json.dump(features, f, indent=4)
-        window_logger.info(f"Saved feature importances to {window_folder}/importances.npy and features.json")
-    except Exception as e:
-        window_logger.warning(f"Failed to compute or save feature importances for window {window_idx}: {e}")
-    
     return window_result
 
 def walk_forward_testing(
@@ -1092,35 +1074,6 @@ def walk_forward_testing(
     
     # Export consolidated trade history
     export_consolidated_trade_history(all_window_results, session_folder)
-    
-    # Aggregate recent feature importances and compute rolling pruned features
-    pruning_cfg = config.get("walk_forward", {}).get("dynamic_pruning", {})
-    k = pruning_cfg.get("window_count", 3)
-    threshold = pruning_cfg.get("importance_threshold", 0.01)
-    if len(all_window_results) >= k:
-        importances_list = []
-        feature_names = None
-        for res in all_window_results[-k:]:
-            imp_path = os.path.join(res["window_folder"], "importances.npy")
-            feat_path = os.path.join(res["window_folder"], "features.json")
-            if os.path.exists(imp_path) and os.path.exists(feat_path):
-                imp = np.load(imp_path)
-                with open(feat_path) as f:
-                    feats = json.load(f)
-                if feature_names is None:
-                    feature_names = feats
-                importances_list.append(imp)
-        if importances_list and feature_names:
-            # Exclude non-indicator features like 'close_norm' and 'position'
-            valid_indices = [i for i, f in enumerate(feature_names) if f not in ['close_norm', 'position']]
-            indicator_names = [feature_names[i] for i in valid_indices]
-            filtered_importances = [imp[valid_indices] for imp in importances_list]
-            # Compute selected features based on mean importance
-            selected = rolling_pruned_features(filtered_importances, indicator_names, threshold)
-            sel_path = os.path.join(session_folder, "recent_selected_features.json")
-            with open(sel_path, "w") as f:
-                json.dump(selected, f, indent=4)
-            logger.info(f"Saved dynamic pruned features to {sel_path}")
     
     return summary_results
 
