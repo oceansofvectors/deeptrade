@@ -33,7 +33,11 @@ class RiskManager:
         max_risk_per_trade_pct: float = 2.0,  # Maximum risk per trade as percentage of portfolio
         initial_balance: float = 10000.0,  # Initial portfolio balance
         transaction_cost: float = 0.0,  # Transaction cost as percentage
-        daily_risk_limit: Optional[float] = None  # Maximum dollar loss allowed per trading day
+        daily_risk_limit: Optional[float] = None,  # Maximum dollar loss allowed per trading day
+        stop_loss_mode: str = "percentage",  # Mode for stop loss: "percentage" or "atr"
+        take_profit_mode: str = "percentage",  # Mode for take profit: "percentage" or "atr"
+        stop_loss_atr_multiplier: Optional[float] = None,  # Stop loss as multiple of ATR
+        take_profit_atr_multiplier: Optional[float] = None,  # Take profit as multiple of ATR
     ):
         """
         Initialize the risk manager.
@@ -47,6 +51,10 @@ class RiskManager:
             initial_balance: Initial portfolio balance
             transaction_cost: Transaction cost as percentage
             daily_risk_limit: Maximum dollar loss allowed per trading day (None to disable)
+            stop_loss_mode: Mode for stop loss: "percentage" or "atr"
+            take_profit_mode: Mode for take profit: "percentage" or "atr"
+            stop_loss_atr_multiplier: Stop loss as multiple of ATR
+            take_profit_atr_multiplier: Take profit as multiple of ATR
         """
         # Convert all monetary values to Decimal for precision
         self.stop_loss_pct = money.to_decimal(stop_loss_pct) if stop_loss_pct is not None else None
@@ -57,6 +65,13 @@ class RiskManager:
         self.initial_balance = money.to_decimal(initial_balance)
         self.transaction_cost = money.to_decimal(transaction_cost)
         self.daily_risk_limit = money.to_decimal(daily_risk_limit) if daily_risk_limit is not None else None
+        
+        # ATR-based stop loss and take profit
+        self.stop_loss_mode = stop_loss_mode
+        self.take_profit_mode = take_profit_mode
+        self.stop_loss_atr_multiplier = money.to_decimal(stop_loss_atr_multiplier) if stop_loss_atr_multiplier is not None else None
+        self.take_profit_atr_multiplier = money.to_decimal(take_profit_atr_multiplier) if take_profit_atr_multiplier is not None else None
+        self.current_atr = Decimal('0.0')  # Current ATR value
         
         # Internal state
         self.position = 0  # Current position: 0 (neutral), 1 (long), -1 (short)
@@ -77,7 +92,16 @@ class RiskManager:
         self.daily_lowest_balance = self.initial_balance  # Lowest portfolio value during the day
         self.daily_trading_enabled = True  # Flag to track if trading is allowed for the day
         self.current_trading_day = None  # Current trading day being tracked
+    
+    def set_atr(self, atr_value: float) -> None:
+        """
+        Set the current ATR value.
         
+        Args:
+            atr_value: Current ATR value
+        """
+        self.current_atr = money.to_decimal(atr_value)
+    
     def calculate_position_size(self, price: float) -> int:
         """
         Calculate the number of contracts to trade based on portfolio value.
@@ -109,6 +133,191 @@ class RiskManager:
         notional_value = price * point_value * money.to_decimal(max_contracts)
         
         return max_contracts
+        
+    def enter_position(self, position: int, price: float, date: pd.Timestamp, contracts: int, atr_value: float = None) -> None:
+        """
+        Enter a new position.
+        
+        Args:
+            position: Position to enter (1 for long, -1 for short)
+            price: Entry price
+            date: Entry date
+            contracts: Number of contracts
+            atr_value: Current ATR value (if None, use self.current_atr)
+        """
+        self.position = position
+        self.entry_price = money.to_decimal(price)
+        self.current_contracts = contracts  # Store the number of contracts
+        
+        # Update ATR value if provided
+        if atr_value is not None:
+            self.set_atr(atr_value)
+        
+        # Calculate stop loss and take profit prices based on ATR if applicable
+        if self.position == 1:  # Long position
+            if self.stop_loss_mode == "atr" and self.stop_loss_atr_multiplier is not None:
+                self.stop_loss_price = self.entry_price - (self.current_atr * self.stop_loss_atr_multiplier)
+                logging.info(f"Long position: ATR-based stop loss set at {float(self.stop_loss_price):.2f} ({float(self.stop_loss_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
+            
+            if self.take_profit_mode == "atr" and self.take_profit_atr_multiplier is not None:
+                self.take_profit_price = self.entry_price + (self.current_atr * self.take_profit_atr_multiplier)
+                logging.info(f"Long position: ATR-based take profit set at {float(self.take_profit_price):.2f} ({float(self.take_profit_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
+        
+        elif self.position == -1:  # Short position
+            if self.stop_loss_mode == "atr" and self.stop_loss_atr_multiplier is not None:
+                self.stop_loss_price = self.entry_price + (self.current_atr * self.stop_loss_atr_multiplier)
+                logging.info(f"Short position: ATR-based stop loss set at {float(self.stop_loss_price):.2f} ({float(self.stop_loss_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
+            
+            if self.take_profit_mode == "atr" and self.take_profit_atr_multiplier is not None:
+                self.take_profit_price = self.entry_price - (self.current_atr * self.take_profit_atr_multiplier)
+                logging.info(f"Short position: ATR-based take profit set at {float(self.take_profit_price):.2f} ({float(self.take_profit_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
+        
+        # Ensure we never have a zero portfolio value at entry to prevent division by zero
+        if self.net_worth == 0:
+            # If net_worth is zero, use the initial_balance
+            self.net_worth = self.initial_balance
+            logging.warning(f"Portfolio value was zero at position entry. Using initial balance: {self.initial_balance}")
+            
+        self.entry_portfolio_value = money.to_decimal(self.net_worth)  # Store portfolio value at entry
+        self.highest_unrealized_profit_pct = Decimal('0.0')  # Reset highest profit
+        
+        # Set initial values
+        if self.position == 1:  # Long position
+            self.highest_price = self.entry_price
+        elif self.position == -1:  # Short position
+            self.lowest_price = self.entry_price
+            
+        # Record trade
+        self.trade_history.append({
+            "date": date,
+            "action": "buy" if position == 1 else "sell",
+            "price": float(self.entry_price),  # Convert Decimal to float for serialization
+            "contracts": contracts,
+            "portfolio_value": float(self.net_worth),  # Convert Decimal to float for serialization
+            "atr": float(self.current_atr) if self.current_atr else None,  # Record ATR value
+            "stop_loss_price": float(self.stop_loss_price) if self.stop_loss_price else None,  # Record stop loss price
+            "take_profit_price": float(self.take_profit_price) if self.take_profit_price else None  # Record take profit price
+        })
+        
+    def check_exits(self, close_price: float, high_price: float = None, low_price: float = None) -> Tuple[bool, str]:
+        """
+        Check if any exit conditions are met based on unrealized P&L.
+        
+        Args:
+            close_price: Current closing price
+            high_price: Current candle high price (optional)
+            low_price: Current candle low price (optional)
+            
+        Returns:
+            Tuple[bool, str]: (exit_triggered, reason)
+        """
+        if self.position == 0:
+            return False, ""
+        
+        # Convert prices to Decimal
+        close_price = money.to_decimal(close_price)
+        high_price = money.to_decimal(high_price) if high_price is not None else close_price
+        low_price = money.to_decimal(low_price) if low_price is not None else close_price
+        
+        # Check if any exit conditions are met
+        exit_triggered = False
+        reason = ""
+        
+        # ATR-based stop loss check
+        if self.stop_loss_mode == "atr" and self.stop_loss_atr_multiplier is not None and self.stop_loss_price != 0:
+            if self.position == 1:  # Long position
+                # Use low price for stop loss check (worst case)
+                if low_price <= self.stop_loss_price:
+                    exit_triggered = True
+                    reason = "stop_loss"
+                    logging.info(f"ATR-based stop loss triggered! Price: {float(low_price):.2f}, Stop loss: {float(self.stop_loss_price):.2f}")
+            else:  # Short position
+                # Use high price for stop loss check (worst case)
+                if high_price >= self.stop_loss_price:
+                    exit_triggered = True
+                    reason = "stop_loss"
+                    logging.info(f"ATR-based stop loss triggered! Price: {float(high_price):.2f}, Stop loss: {float(self.stop_loss_price):.2f}")
+        
+        # ATR-based take profit check
+        elif self.take_profit_mode == "atr" and self.take_profit_atr_multiplier is not None and self.take_profit_price != 0:
+            if self.position == 1:  # Long position
+                # Use high price for take profit check (best case)
+                if high_price >= self.take_profit_price:
+                    exit_triggered = True
+                    reason = "take_profit"
+                    logging.info(f"ATR-based take profit triggered! Price: {float(high_price):.2f}, Take profit: {float(self.take_profit_price):.2f}")
+            else:  # Short position
+                # Use low price for take profit check (best case)
+                if low_price <= self.take_profit_price:
+                    exit_triggered = True
+                    reason = "take_profit"
+                    logging.info(f"ATR-based take profit triggered! Price: {float(low_price):.2f}, Take profit: {float(self.take_profit_price):.2f}")
+        
+        # Percentage-based checks (original implementation)
+        elif self.stop_loss_mode == "percentage" or self.take_profit_mode == "percentage":
+            # Point value for NQ futures ($20 per point)
+            point_value = money.to_decimal(20.0)
+            
+            # Calculate unrealized P&L for different scenarios
+            if self.position == 1:  # Long position
+                # For stop loss check, use low price (worst case)
+                pnl_points_stop = low_price - self.entry_price
+                # For take profit check, use high price (best case)
+                pnl_points_profit = high_price - self.entry_price
+            else:  # Short position
+                # For stop loss check, use high price (worst case)
+                pnl_points_stop = self.entry_price - high_price
+                # For take profit check, use low price (best case)
+                pnl_points_profit = self.entry_price - low_price
+                
+            # Convert to dollar value
+            pnl_dollars_stop = pnl_points_stop * point_value * self.current_contracts
+            pnl_dollars_profit = pnl_points_profit * point_value * self.current_contracts
+            
+            # Calculate as percentage of entry portfolio value
+            pnl_pct_stop = (pnl_dollars_stop / self.entry_portfolio_value) * 100 if self.entry_portfolio_value and self.entry_portfolio_value != 0 else Decimal('0.0')
+            pnl_pct_profit = (pnl_dollars_profit / self.entry_portfolio_value) * 100 if self.entry_portfolio_value and self.entry_portfolio_value != 0 else Decimal('0.0')
+            
+            # Add debug logging
+            logging.debug(f"Position: {self.position}, Entry price: {self.entry_price}, Close: {close_price}")
+            logging.debug(f"Stop loss check (using {'low' if self.position == 1 else 'high'} price): P&L = {pnl_pct_stop:.2f}%, Threshold: -{self.stop_loss_pct}%")
+            logging.debug(f"Take profit check (using {'high' if self.position == 1 else 'low'} price): P&L = {pnl_pct_profit:.2f}%, Threshold: +{self.take_profit_pct}%")
+            
+            # Check stop loss - exit if unrealized P&L percentage is below stop loss threshold
+            if self.stop_loss_mode == "percentage" and self.stop_loss_pct is not None and pnl_pct_stop <= -self.stop_loss_pct:
+                exit_triggered = True
+                reason = "stop_loss"
+                logging.info(f"Percentage-based stop loss triggered! Unrealized P&L: {pnl_pct_stop:.2f}%, Threshold: -{self.stop_loss_pct}%")
+                
+            # Check take profit - exit if unrealized P&L percentage is above take profit threshold
+            elif self.take_profit_mode == "percentage" and self.take_profit_pct is not None and pnl_pct_profit >= self.take_profit_pct:
+                exit_triggered = True
+                reason = "take_profit"
+                logging.info(f"Percentage-based take profit triggered! Unrealized P&L: {pnl_pct_profit:.2f}%, Threshold: +{self.take_profit_pct}%")
+        
+        # Check trailing stop - exit if profit has fallen below trailing stop
+        if not exit_triggered and self.trailing_stop_pct is not None and self.highest_unrealized_profit_pct > 0:
+            # Calculate current unrealized P&L percentage using close price
+            if self.position == 1:  # Long position
+                current_pnl_points = close_price - self.entry_price
+            else:  # Short position
+                current_pnl_points = self.entry_price - close_price
+                
+            point_value = money.to_decimal(20.0)
+            current_pnl_dollars = current_pnl_points * point_value * self.current_contracts
+            current_pnl_pct = (current_pnl_dollars / self.entry_portfolio_value) * 100
+            
+            # Add debug logging for trailing stop
+            if self.highest_unrealized_profit_pct > self.trailing_stop_pct:
+                logging.debug(f"Trailing stop check: Current P&L: {current_pnl_pct:.2f}%, Peak: {self.highest_unrealized_profit_pct:.2f}%, Threshold: {self.highest_unrealized_profit_pct - self.trailing_stop_pct:.2f}%")
+            
+            # Check if profit has fallen below trailing stop threshold
+            if current_pnl_pct < (self.highest_unrealized_profit_pct - self.trailing_stop_pct):
+                exit_triggered = True
+                reason = "trailing_stop"
+                logging.info(f"Trailing stop triggered! Current P&L: {current_pnl_pct:.2f}%, Peak: {self.highest_unrealized_profit_pct:.2f}%, Threshold: {self.highest_unrealized_profit_pct - self.trailing_stop_pct:.2f}%")
+                
+        return exit_triggered, reason
     
     def update_stops(self, close_price: float, high_price: float = None, low_price: float = None) -> None:
         """
@@ -159,131 +368,6 @@ class RiskManager:
             if low_price < self.lowest_price:
                 self.lowest_price = low_price
     
-    def check_exits(self, close_price: float, high_price: float = None, low_price: float = None) -> Tuple[bool, str]:
-        """
-        Check if any exit conditions are met based on unrealized P&L.
-        
-        Args:
-            close_price: Current closing price
-            high_price: Current candle high price (optional)
-            low_price: Current candle low price (optional)
-            
-        Returns:
-            Tuple[bool, str]: (exit_triggered, reason)
-        """
-        if self.position == 0:
-            return False, ""
-        
-        # Convert prices to Decimal
-        close_price = money.to_decimal(close_price)
-        high_price = money.to_decimal(high_price) if high_price is not None else close_price
-        low_price = money.to_decimal(low_price) if low_price is not None else close_price
-        
-        # Point value for NQ futures ($20 per point)
-        point_value = money.to_decimal(20.0)
-        
-        # Calculate unrealized P&L for different scenarios
-        if self.position == 1:  # Long position
-            # For stop loss check, use low price (worst case)
-            pnl_points_stop = low_price - self.entry_price
-            # For take profit check, use high price (best case)
-            pnl_points_profit = high_price - self.entry_price
-        else:  # Short position
-            # For stop loss check, use high price (worst case)
-            pnl_points_stop = self.entry_price - high_price
-            # For take profit check, use low price (best case)
-            pnl_points_profit = self.entry_price - low_price
-            
-        # Convert to dollar value
-        pnl_dollars_stop = pnl_points_stop * point_value * self.current_contracts
-        pnl_dollars_profit = pnl_points_profit * point_value * self.current_contracts
-        
-        # Calculate as percentage of entry portfolio value
-        pnl_pct_stop = (pnl_dollars_stop / self.entry_portfolio_value) * 100 if self.entry_portfolio_value and self.entry_portfolio_value != 0 else Decimal('0.0')
-        pnl_pct_profit = (pnl_dollars_profit / self.entry_portfolio_value) * 100 if self.entry_portfolio_value and self.entry_portfolio_value != 0 else Decimal('0.0')
-        
-        # Add debug logging
-        logging.debug(f"Position: {self.position}, Entry price: {self.entry_price}, Close: {close_price}")
-        logging.debug(f"Stop loss check (using {'low' if self.position == 1 else 'high'} price): P&L = {pnl_pct_stop:.2f}%, Threshold: -{self.stop_loss_pct}%")
-        logging.debug(f"Take profit check (using {'high' if self.position == 1 else 'low'} price): P&L = {pnl_pct_profit:.2f}%, Threshold: +{self.take_profit_pct}%")
-        
-        # Check if any exit conditions are met
-        exit_triggered = False
-        reason = ""
-        
-        # Check stop loss - exit if unrealized P&L percentage is below stop loss threshold
-        if self.stop_loss_pct is not None and pnl_pct_stop <= -self.stop_loss_pct:
-            exit_triggered = True
-            reason = "stop_loss"
-            logging.info(f"Stop loss triggered! Unrealized P&L: {pnl_pct_stop:.2f}%, Threshold: -{self.stop_loss_pct}%")
-            
-        # Check take profit - exit if unrealized P&L percentage is above take profit threshold
-        elif self.take_profit_pct is not None and pnl_pct_profit >= self.take_profit_pct:
-            exit_triggered = True
-            reason = "take_profit"
-            logging.info(f"Take profit triggered! Unrealized P&L: {pnl_pct_profit:.2f}%, Threshold: +{self.take_profit_pct}%")
-            
-        # Check trailing stop - exit if profit has fallen below trailing stop
-        elif self.trailing_stop_pct is not None and self.highest_unrealized_profit_pct > 0:
-            # Calculate current unrealized P&L percentage using close price
-            if self.position == 1:  # Long position
-                current_pnl_points = close_price - self.entry_price
-            else:  # Short position
-                current_pnl_points = self.entry_price - close_price
-                
-            current_pnl_dollars = current_pnl_points * point_value * self.current_contracts
-            current_pnl_pct = (current_pnl_dollars / self.entry_portfolio_value) * 100
-            
-            # Add debug logging for trailing stop
-            if self.highest_unrealized_profit_pct > self.trailing_stop_pct:
-                logging.debug(f"Trailing stop check: Current P&L: {current_pnl_pct:.2f}%, Peak: {self.highest_unrealized_profit_pct:.2f}%, Threshold: {self.highest_unrealized_profit_pct - self.trailing_stop_pct:.2f}%")
-            
-            # Check if profit has fallen below trailing stop threshold
-            if current_pnl_pct < (self.highest_unrealized_profit_pct - self.trailing_stop_pct):
-                exit_triggered = True
-                reason = "trailing_stop"
-                logging.info(f"Trailing stop triggered! Current P&L: {current_pnl_pct:.2f}%, Peak: {self.highest_unrealized_profit_pct:.2f}%, Threshold: {self.highest_unrealized_profit_pct - self.trailing_stop_pct:.2f}%")
-                
-        return exit_triggered, reason
-    
-    def enter_position(self, position: int, price: float, date: pd.Timestamp, contracts: int) -> None:
-        """
-        Enter a new position.
-        
-        Args:
-            position: Position to enter (1 for long, -1 for short)
-            price: Entry price
-            date: Entry date
-            contracts: Number of contracts
-        """
-        self.position = position
-        self.entry_price = money.to_decimal(price)
-        self.current_contracts = contracts  # Store the number of contracts
-        
-        # Ensure we never have a zero portfolio value at entry to prevent division by zero
-        if self.net_worth == 0:
-            # If net_worth is zero, use the initial_balance
-            self.net_worth = self.initial_balance
-            logging.warning(f"Portfolio value was zero at position entry. Using initial balance: {self.initial_balance}")
-            
-        self.entry_portfolio_value = money.to_decimal(self.net_worth)  # Store portfolio value at entry
-        self.highest_unrealized_profit_pct = Decimal('0.0')  # Reset highest profit
-        
-        # Set initial values
-        if self.position == 1:  # Long position
-            self.highest_price = self.entry_price
-        elif self.position == -1:  # Short position
-            self.lowest_price = self.entry_price
-            
-        # Record trade
-        self.trade_history.append({
-            "date": date,
-            "action": "buy" if position == 1 else "sell",
-            "price": float(self.entry_price),  # Convert Decimal to float for serialization
-            "contracts": contracts,
-            "portfolio_value": float(self.net_worth)  # Convert Decimal to float for serialization
-        })
-        
     def exit_position(self, price: float, date: pd.Timestamp, reason: str) -> None:
         """
         Exit the current position.
@@ -409,7 +493,11 @@ def trade_with_risk_management(
     verbose: int = 0,
     deterministic: bool = True,
     close_at_end_of_day: bool = True,
-    daily_risk_limit: Optional[float] = None
+    daily_risk_limit: Optional[float] = None,
+    stop_loss_mode: str = "percentage",
+    take_profit_mode: str = "percentage",
+    stop_loss_atr_multiplier: Optional[float] = None,
+    take_profit_atr_multiplier: Optional[float] = None
 ) -> Dict:
     """
     Trade with risk management features enabled.
@@ -428,6 +516,10 @@ def trade_with_risk_management(
         deterministic: Whether to use deterministic actions
         close_at_end_of_day: Whether to close positions at end of day
         daily_risk_limit: Maximum dollar loss allowed per trading day (None to disable)
+        stop_loss_mode: Mode for stop loss: "percentage" or "atr"
+        take_profit_mode: Mode for take profit: "percentage" or "atr"
+        stop_loss_atr_multiplier: Stop loss as multiple of ATR
+        take_profit_atr_multiplier: Take profit as multiple of ATR
         
     Returns:
         Dict containing test results
@@ -438,8 +530,16 @@ def trade_with_risk_management(
     # Log risk management parameters
     if verbose > 0:
         logging.info(f"Risk management parameters:")
-        logging.info(f"  Stop loss: {stop_loss_pct if stop_loss_pct and stop_loss_pct > 0 else 'Disabled'}")
-        logging.info(f"  Take profit: {take_profit_pct if take_profit_pct and take_profit_pct > 0 else 'Disabled'}")
+        if stop_loss_mode == "percentage":
+            logging.info(f"  Stop loss: {stop_loss_pct if stop_loss_pct and stop_loss_pct > 0 else 'Disabled'} (percentage-based)")
+        else:
+            logging.info(f"  Stop loss: {stop_loss_atr_multiplier if stop_loss_atr_multiplier and stop_loss_atr_multiplier > 0 else 'Disabled'} x ATR")
+        
+        if take_profit_mode == "percentage":
+            logging.info(f"  Take profit: {take_profit_pct if take_profit_pct and take_profit_pct > 0 else 'Disabled'} (percentage-based)")
+        else:
+            logging.info(f"  Take profit: {take_profit_atr_multiplier if take_profit_atr_multiplier and take_profit_atr_multiplier > 0 else 'Disabled'} x ATR")
+        
         logging.info(f"  Trailing stop: {trailing_stop_pct if trailing_stop_pct and trailing_stop_pct > 0 else 'Disabled'}")
         logging.info(f"  Position size: {position_size}")
         logging.info(f"  Max risk per trade: {max_risk_per_trade_pct}")
@@ -448,12 +548,16 @@ def trade_with_risk_management(
     # Initialize risk manager with risk management parameters
     # Only enable features that have non-zero values
     risk_manager = RiskManager(
-        stop_loss_pct=stop_loss_pct if stop_loss_pct and stop_loss_pct > 0 else None,
-        take_profit_pct=take_profit_pct if take_profit_pct and take_profit_pct > 0 else None,
+        stop_loss_pct=stop_loss_pct if stop_loss_pct and stop_loss_pct > 0 and stop_loss_mode == "percentage" else None,
+        take_profit_pct=take_profit_pct if take_profit_pct and take_profit_pct > 0 and take_profit_mode == "percentage" else None,
         trailing_stop_pct=trailing_stop_pct if trailing_stop_pct and trailing_stop_pct > 0 else None,
         initial_balance=initial_balance,
         transaction_cost=transaction_cost,
-        daily_risk_limit=daily_risk_limit if daily_risk_limit and daily_risk_limit > 0 else None
+        daily_risk_limit=daily_risk_limit if daily_risk_limit and daily_risk_limit > 0 else None,
+        stop_loss_mode=stop_loss_mode,
+        take_profit_mode=take_profit_mode,
+        stop_loss_atr_multiplier=stop_loss_atr_multiplier if stop_loss_atr_multiplier and stop_loss_atr_multiplier > 0 and stop_loss_mode == "atr" else None,
+        take_profit_atr_multiplier=take_profit_atr_multiplier if take_profit_atr_multiplier and take_profit_atr_multiplier > 0 and take_profit_mode == "atr" else None
     )
     
     # Set position size and max risk per trade
@@ -723,10 +827,17 @@ def trade_with_risk_management(
                             if risk_manager.position != 0:
                                 risk_manager.exit_position(current_price, current_date, "signal_change")
                             
+                            # Get current ATR value if available
+                            current_atr = None
+                            if "atr" in test_data.columns:
+                                current_atr = test_data.loc[test_data.index[i], "atr"]
+                            elif "ATR" in test_data.columns:
+                                current_atr = test_data.loc[test_data.index[i], "ATR"]
+                            
                             # Then enter long position
                             contracts = risk_manager.calculate_position_size(current_price)
                             if contracts > 0:
-                                risk_manager.enter_position(1, current_price, current_date, contracts)
+                                risk_manager.enter_position(1, current_price, current_date, contracts, current_atr)
                                 buy_dates.append(current_date)
                                 buy_prices.append(current_price)
                             else:
@@ -737,10 +848,17 @@ def trade_with_risk_management(
                             if risk_manager.position != 0:
                                 risk_manager.exit_position(current_price, current_date, "signal_change")
                             
+                            # Get current ATR value if available
+                            current_atr = None
+                            if "atr" in test_data.columns:
+                                current_atr = test_data.loc[test_data.index[i], "atr"]
+                            elif "ATR" in test_data.columns:
+                                current_atr = test_data.loc[test_data.index[i], "ATR"]
+                            
                             # Then enter short position
                             contracts = risk_manager.calculate_position_size(current_price)
                             if contracts > 0:
-                                risk_manager.enter_position(-1, current_price, current_date, contracts)
+                                risk_manager.enter_position(-1, current_price, current_date, contracts, current_atr)
                                 sell_dates.append(current_date)
                                 sell_prices.append(current_price)
                             else:
@@ -1212,7 +1330,11 @@ def main():
     trailing_stop_pct = None
     position_size = 1.0
     max_risk_per_trade_pct = 2.0
-    daily_risk_limit = None  # Add daily risk limit parameter
+    daily_risk_limit = None
+    stop_loss_mode = "percentage"
+    take_profit_mode = "percentage" 
+    stop_loss_atr_multiplier = None
+    take_profit_atr_multiplier = None
     
     # Apply risk management configuration if enabled
     if risk_enabled:
@@ -1224,12 +1346,20 @@ def main():
         # Stop loss configuration
         stop_loss_config = risk_config.get("stop_loss", {})
         if stop_loss_config.get("enabled", False):
-            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            stop_loss_mode = stop_loss_config.get("mode", "percentage")
+            if stop_loss_mode == "percentage":
+                stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+            elif stop_loss_mode == "atr":
+                stop_loss_atr_multiplier = stop_loss_config.get("atr_multiplier", 2.0)
         
         # Take profit configuration
         take_profit_config = risk_config.get("take_profit", {})
         if take_profit_config.get("enabled", False):
-            take_profit_pct = take_profit_config.get("percentage", 2.0)
+            take_profit_mode = take_profit_config.get("mode", "percentage")
+            if take_profit_mode == "percentage":
+                take_profit_pct = take_profit_config.get("percentage", 2.0)
+            elif take_profit_mode == "atr":
+                take_profit_atr_multiplier = take_profit_config.get("atr_multiplier", 4.0)
         
         # Trailing stop configuration
         trailing_stop_config = risk_config.get("trailing_stop", {})
@@ -1248,10 +1378,23 @@ def main():
     if risk_enabled:
         logger.info(f"  Daily Risk Limit: {'Enabled' if daily_risk_limit is not None else 'Disabled'}" + 
                    (f" (${daily_risk_limit:.2f})" if daily_risk_limit is not None else ""))
-        logger.info(f"  Stop Loss: {'Enabled' if stop_loss_pct is not None else 'Disabled'}" + 
-                   (f" ({stop_loss_pct}%)" if stop_loss_pct is not None else ""))
-        logger.info(f"  Take Profit: {'Enabled' if take_profit_pct is not None else 'Disabled'}" + 
-                   (f" ({take_profit_pct}%)" if take_profit_pct is not None else ""))
+        
+        # Stop loss logging
+        if stop_loss_mode == "percentage" and stop_loss_pct is not None:
+            logger.info(f"  Stop Loss: Enabled ({stop_loss_pct}% of portfolio value)")
+        elif stop_loss_mode == "atr" and stop_loss_atr_multiplier is not None:
+            logger.info(f"  Stop Loss: Enabled ({stop_loss_atr_multiplier} x ATR)")
+        else:
+            logger.info(f"  Stop Loss: Disabled")
+        
+        # Take profit logging
+        if take_profit_mode == "percentage" and take_profit_pct is not None:
+            logger.info(f"  Take Profit: Enabled ({take_profit_pct}% of portfolio value)")
+        elif take_profit_mode == "atr" and take_profit_atr_multiplier is not None:
+            logger.info(f"  Take Profit: Enabled ({take_profit_atr_multiplier} x ATR)")
+        else:
+            logger.info(f"  Take Profit: Disabled")
+        
         logger.info(f"  Trailing Stop: {'Enabled' if trailing_stop_pct is not None else 'Disabled'}" + 
                    (f" ({trailing_stop_pct}%)" if trailing_stop_pct is not None else ""))
         logger.info(f"  Position Size Multiplier: {position_size}")
@@ -1271,7 +1414,11 @@ def main():
         verbose=config["training"].get("verbose", 1),
         deterministic=True,  # Use deterministic action selection for trading
         close_at_end_of_day=True,  # Close positions at the end of the trading day
-        daily_risk_limit=daily_risk_limit  # Add daily risk limit parameter
+        daily_risk_limit=daily_risk_limit,  # Add daily risk limit parameter
+        stop_loss_mode=stop_loss_mode,
+        take_profit_mode=take_profit_mode,
+        stop_loss_atr_multiplier=stop_loss_atr_multiplier,
+        take_profit_atr_multiplier=take_profit_atr_multiplier
     )
     
     # Plot results

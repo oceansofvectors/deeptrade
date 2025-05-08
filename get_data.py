@@ -608,4 +608,4 @@ def get_data(symbol: str = "NQ=F",
         return None, None, None
 
 if __name__ == "__main__":
-    get_data(use_yfinance=False, normalize_and_save=False)
+    get_data(use_yfinance=False, normalize_and_save=True)

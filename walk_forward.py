@@ -24,7 +24,6 @@ from config import config
 import money
 from utils.seeding import seed_worker  # Import the seed_worker function
 from normalization import scale_window, get_standardized_column_names  # Import both functions from normalization
-from feature_importance import analyze_feature_importance, rolling_pruned_features
 
 # Setup logging to save to file and console
 os.makedirs('models/logs', exist_ok=True)
@@ -597,9 +596,15 @@ def process_single_window(
     trailing_stop_pct = None
     position_size = 1.0
     max_risk_per_trade_pct = 0.0
+    daily_risk_limit = None
     
     # Only set risk parameters if risk management is enabled
     if risk_enabled:
+        # Daily risk limit configuration
+        daily_risk_config = risk_config.get("daily_risk_limit", {})
+        if daily_risk_config.get("enabled", False):
+            daily_risk_limit = daily_risk_config.get("max_daily_loss", 1000.0)
+        
         # Stop loss configuration
         stop_loss_config = risk_config.get("stop_loss", {})
         if stop_loss_config.get("enabled", False):
@@ -625,6 +630,8 @@ def process_single_window(
     window_logger.info("Risk Management Settings:")
     window_logger.info(f"  Risk Management Enabled: {risk_enabled}")
     if risk_enabled:
+        window_logger.info(f"  Daily Risk Limit: {'Enabled' if daily_risk_limit is not None else 'Disabled'}" + 
+                         (f" (${daily_risk_limit})" if daily_risk_limit is not None else ""))
         window_logger.info(f"  Stop Loss: {'Enabled' if stop_loss_pct is not None else 'Disabled'}" + 
                          (f" ({stop_loss_pct}%)" if stop_loss_pct is not None else ""))
         window_logger.info(f"  Take Profit: {'Enabled' if take_profit_pct is not None else 'Disabled'}" + 
@@ -651,7 +658,8 @@ def process_single_window(
             max_risk_per_trade_pct=max_risk_per_trade_pct,
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 0.0),
-            verbose=1
+            verbose=1,
+            daily_risk_limit=daily_risk_limit
         )
     else:
         # Evaluate without risk management

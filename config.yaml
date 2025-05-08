@@ -112,13 +112,17 @@ risk_management:
   
   # Stop loss configuration
   stop_loss:
-    enabled: false
-    percentage: 5  # Stop loss as percentage of portfolio value
+    enabled: false 
+    mode: "atr"  # Options: "percentage", "atr"
+    percentage: 5  # Stop loss as percentage of portfolio value (used when mode="percentage")
+    atr_multiplier: 3.0  # Stop loss as multiple of ATR (used when mode="atr")
   
   # Take profit configuration
   take_profit:
-    enabled: true
-    percentage: 20  # Take profit as percentage of portfolio value
+    enabled: false 
+    mode: "atr"  # Options: "percentage", "atr"
+    percentage: 20  # Take profit as percentage of portfolio value (used when mode="percentage")
+    atr_multiplier: 5.0  # Take profit as multiple of ATR (used when mode="atr")
   
   # Trailing stop loss configuration
   trailing_stop:
