@@ -87,7 +87,7 @@ indicators:
     enabled: true
 
 environment:
-  initial_balance: 10000.0
+  initial_balance: 1000.0
   position_size: 1  # Number of NQ futures contracts to trade (default: 1)
   transaction_cost: 0.0  # Transaction cost as percentage
 
@@ -112,15 +112,15 @@ risk_management:
   
   # Stop loss configuration
   stop_loss:
-    enabled: false 
+    enabled: true 
     mode: "atr"  # Options: "percentage", "atr"
     percentage: 5  # Stop loss as percentage of portfolio value (used when mode="percentage")
-    atr_multiplier: 3.0  # Stop loss as multiple of ATR (used when mode="atr")
+    atr_multiplier: 5.0  # Stop loss as multiple of ATR (used when mode="atr")
   
   # Take profit configuration
   take_profit:
-    enabled: false 
-    mode: "atr"  # Options: "percentage", "atr"
+    enabled: true 
+    mode: "percentage"  # Options: "percentage", "atr"
     percentage: 20  # Take profit as percentage of portfolio value (used when mode="percentage")
     atr_multiplier: 5.0  # Take profit as multiple of ATR (used when mode="atr")
   
