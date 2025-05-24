@@ -474,7 +474,7 @@ class RiskManager:
         daily_loss = self.daily_start_balance - self.daily_lowest_balance
         
         # Check if daily loss exceeds limit
-        if daily_loss >= self.daily_risk_limit:
+        if daily_loss > self.daily_risk_limit:
             logger.warning(f"Daily risk limit exceeded! Daily loss: ${float(daily_loss):.2f}, Limit: ${float(self.daily_risk_limit):.2f}")
             return True, "daily_risk_limit"
             

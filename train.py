@@ -66,7 +66,7 @@ def train_agent(train_data, total_timesteps: int):
 
 def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20, 
                            n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000,
-                           evaluation_metric: str = "return", model_params: dict = None):
+                           evaluation_metric: str = "return", model_params: dict = None, window_folder: str = None):
     """
     Train a PPO model iteratively based on validation performance.
     
@@ -80,6 +80,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         additional_timesteps (int): Number of additional timesteps for each iteration.
         evaluation_metric (str): Metric to use for evaluation ("return", "hit_rate", or "prediction_accuracy").
         model_params (dict, optional): Model hyperparameters to use for training.
+        window_folder (str, optional): Folder to save models and results.
         
     Returns:
         tuple: (best_model, best_results, all_results)
@@ -185,7 +186,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     best_results = results
     
     # Save the initial model as the best model so far
-    best_model.save("best_model")
+    best_model.save(os.path.join(window_folder, "best_model"))
     
     # Log evaluation results based on metric
     logger.info(f"Initial training completed. Validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, " 
@@ -243,7 +244,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
                        f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
             
             # Save the best model
-            best_model.save("best_model")
+            best_model.save(os.path.join(window_folder, "best_model"))
             
             # Reset stagnant counter since we found improvement
             stagnant_counter = 0
@@ -604,7 +605,7 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
 
 def train_walk_forward_model(train_data, validation_data, initial_timesteps=20000, additional_timesteps=10000, 
                          max_iterations=200, n_stagnant_loops=10, improvement_threshold=0.05, window_folder=None,
-                         run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None):
+                         run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None, model_params=None):
     """
     Train a model using walk-forward optimization.
     
@@ -620,6 +621,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         run_hyperparameter_tuning (bool): Whether to run hyperparameter tuning.
         tuning_trials (int): Number of trials for hyperparameter tuning.
         tuning_folder (str): Path to save hyperparameter tuning results.
+        model_params (dict): Pre-tuned hyperparameters to use. If provided, skips tuning.
         
     Returns:
         tuple: (trained_model, training_stats)
@@ -645,36 +647,42 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     evaluation_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
     logger.info(f"Using {evaluation_metric} as the evaluation metric for model selection")
     
-    model_params = None
-    
-    # Perform hyperparameter tuning if enabled
-    if run_hyperparameter_tuning:
+    # Perform hyperparameter tuning only if enabled AND no pre-tuned parameters provided
+    if run_hyperparameter_tuning and model_params is None:
         logger.info(f"Starting hyperparameter tuning with {tuning_trials} trials using {evaluation_metric} metric")
         
         # Import the hyperparameter tuning function
         from walk_forward import hyperparameter_tuning
         
         # Run hyperparameter tuning with specified metric
-        best_params = hyperparameter_tuning(
+        tuning_results = hyperparameter_tuning(
             train_data=train_data,
             validation_data=validation_data,
             n_trials=tuning_trials,
             eval_metric=evaluation_metric
         )
         
-        logger.info(f"Hyperparameter tuning completed. Best parameters: {best_params}")
-        
-        # Use the best parameters for model training
-        model_params = best_params
+        model_params = tuning_results["best_params"]
+        logger.info(f"Hyperparameter tuning completed. Best parameters: {model_params}")
         
         # Save tuning results if a folder is provided
         if tuning_folder:
             os.makedirs(tuning_folder, exist_ok=True)
             with open(os.path.join(tuning_folder, "best_params.json"), "w") as f:
-                json.dump(best_params, f, indent=4)
-    
-    # Log the model parameters being used
-    logger.info(f"Training model with parameters: {model_params if model_params else 'default parameters'}")
+                json.dump(model_params, f, indent=4)
+    elif model_params is not None:
+        logger.info(f"Using provided hyperparameters: {model_params}")
+    else:
+        # Use default parameters from config
+        model_params = {
+            "ent_coef": config["model"].get("ent_coef", 0.01),
+            "learning_rate": config["model"].get("learning_rate", 0.0003),
+            "n_steps": config["model"].get("n_steps", 2048),
+            "batch_size": config["model"].get("batch_size", 64),
+            "gamma": config["model"].get("gamma", 0.99),
+            "gae_lambda": config["model"].get("gae_lambda", 0.95),
+        }
+        logger.info(f"Using default parameters from config: {model_params}")
     
     # Train the model iteratively
     model, validation_results, all_results = train_agent_iteratively(
@@ -686,7 +694,8 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         n_stagnant_loops=n_stagnant_loops,
         improvement_threshold=improvement_threshold,
         evaluation_metric=evaluation_metric,
-        model_params=model_params
+        model_params=model_params,
+        window_folder=window_folder
     )
     
     # Save validation results
@@ -784,7 +793,8 @@ def main():
         max_iterations=max_iterations,
         n_stagnant_loops=n_stagnant_loops,
         improvement_threshold=improvement_threshold,
-        additional_timesteps=additional_timesteps
+        additional_timesteps=additional_timesteps,
+        window_folder=None  # Pass None as window_folder
     )
     
     # Final evaluation on the test data (previously unseen)

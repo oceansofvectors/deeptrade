@@ -33,6 +33,8 @@ from indicators.disparity import calculate_disparity
 from indicators.volume import calculate_volume_indicator
 from indicators.day_of_week import calculate_day_of_week
 from indicators.minutes_since_open import calculate_minutes_since_open
+from indicators.rrcf_anomaly import calculate_rrcf_anomaly
+from indicators.z_score import calculate_zscore
 
 # Import normalization functions
 from normalization import get_standardized_column_names, normalize_data, scale_window
@@ -335,6 +337,24 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         if config["indicators"].get("minutes_since_open", {}).get("enabled", False):
             df = calculate_minutes_since_open(df, sin_col='MSO_SIN', cos_col='MSO_COS')
         
+        # Add RRCF anomaly detection indicator
+        if config["indicators"].get("rrcf_anomaly", {}).get("enabled", False):
+            rrcf_config = config["indicators"]["rrcf_anomaly"]
+            df = calculate_rrcf_anomaly(
+                df, 
+                feature_cols=rrcf_config.get("feature_cols", ["close", "volume"]),
+                window_size=rrcf_config.get("window_size", 100),
+                num_trees=rrcf_config.get("num_trees", 40),
+                tree_size=rrcf_config.get("tree_size", 256),
+                target_col='RRCF_ANOMALY',
+                random_seed=rrcf_config.get("random_seed", 42)
+            )
+
+        # Add Z-Score indicator
+        if config["indicators"].get("z_score", {}).get("enabled", False):
+            df = calculate_zscore(df, length=config["indicators"]["z_score"].get("length", 50),
+                                target_col='ZScore')
+        
         # Create an initial 'position' column (should start with no position)
         df['position'] = 0  # Initialize with no position
         
@@ -359,12 +379,12 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D', 
                          'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R', 
                          'SMA', 'EMA', 'DISPARITY', 'ATR', 'OBV', 
-                         'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM']:
+                         'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM', 'RRCF_ANOMALY', 'ZScore']:
             if indicator in df.columns:
                 model_columns.append(indicator)
                 
                 # Skip indicators that are already guaranteed to be within bounds
-                if indicator not in ['supertrend', 'RSI', 'PSAR_DIR']:
+                if indicator not in ['supertrend', 'RSI', 'PSAR_DIR', 'RRCF_ANOMALY']:
                     indicators_to_normalize.append(indicator)
         
         # Fill any remaining NaN values

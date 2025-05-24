@@ -28,6 +28,28 @@ from trading.model_trader import ModelTrader
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# File to store last trading day
+LAST_TRADING_DAY_FILE = "last_trading_day.txt"
+
+def save_last_trading_day(date):
+    """Save the last trading day to a file."""
+    try:
+        with open(LAST_TRADING_DAY_FILE, 'w') as f:
+            f.write(date.strftime('%Y-%m-%d'))
+        logger.info(f"Saved last trading day: {date}")
+    except Exception as e:
+        logger.error(f"Error saving last trading day: {e}")
+
+def load_last_trading_day():
+    """Load the last trading day from file."""
+    try:
+        if os.path.exists(LAST_TRADING_DAY_FILE):
+            with open(LAST_TRADING_DAY_FILE, 'r') as f:
+                date_str = f.read().strip()
+                return datetime.strptime(date_str, '%Y-%m-%d').date()
+    except Exception as e:
+        logger.error(f"Error loading last trading day: {e}")
+    return None
 
 # Global variables for model trader and execution state
 model_trader = None
@@ -39,9 +61,183 @@ MAX_RECONNECTION_ATTEMPTS = 3
 DATA_FLOW_THRESHOLD = 60  # seconds
 MIN_EXECUTION_INTERVAL = 10  # seconds
 
+# Daily PnL tracking
+daily_pnl = 0.0
+last_trading_day = None
+daily_trading_stopped = False
+realized_pnl = 0.0
+unrealized_pnl = 0.0
+
 # Heartbeat monitoring globals
 heartbeat_interval = 60  # Seconds between heartbeat checks
 state_file = "trader_state.pkl"
+shutdown_requested = False  # Add this flag for coordinated shutdown
+
+def check_daily_limits():
+    """Check if daily PnL limits have been hit."""
+    global daily_trading_stopped, daily_pnl, realized_pnl, unrealized_pnl, model_trader, shutdown_requested
+
+    try:
+        if (config["risk_management"]["enabled"] and 
+            config["risk_management"]["daily_risk_limit"]["enabled"]):
+            
+            max_loss = config["risk_management"]["daily_risk_limit"]["max_daily_loss"]
+            take_profit = config["risk_management"]["daily_risk_limit"]["daily_take_profit"]
+            
+            # Log limit check details
+            logger.info(f"Checking limits - Max Loss: ${max_loss}, "
+                      f"Take Profit: ${take_profit}, "
+                      f"Current PnL: ${daily_pnl:.2f}, "
+                      f"Trading Stopped: {daily_trading_stopped}")
+            
+            # Check if we've already hit the limit
+            if daily_trading_stopped:
+                logger.info(f"Daily trading already stopped. Current PnL: ${daily_pnl:.2f}")
+                if not shutdown_requested:
+                    initiate_shutdown("Daily trading stopped")
+                return
+            
+            # Check for max loss - use abs() to handle negative values correctly
+            if abs(daily_pnl) >= max_loss and daily_pnl < 0:
+                logger.warning(f"!!! DAILY MAX LOSS TRIGGERED !!! "
+                             f"Limit: ${max_loss}, Current Loss: ${abs(daily_pnl):.2f}")
+                daily_trading_stopped = True
+                # Close any open positions
+                if model_trader:
+                    logger.warning("Initiating emergency position closure due to max loss")
+                    # Cancel all existing orders first
+                    _cancel_all_orders_safe()
+                    # Then close positions
+                    model_trader.close_all_positions()
+                    logger.warning("Emergency position closure completed")
+                # Initiate shutdown
+                initiate_shutdown("Daily max loss limit reached")
+            elif daily_pnl >= take_profit:
+                logger.warning(f"!!! DAILY TAKE PROFIT TRIGGERED !!! "
+                             f"Target: ${take_profit}, Current Profit: ${daily_pnl:.2f}")
+                daily_trading_stopped = True
+                # Close any open positions
+                if model_trader:
+                    logger.warning("Initiating position closure due to take profit")
+                    # Cancel all existing orders first
+                    _cancel_all_orders_safe()
+                    # Then close positions
+                    model_trader.close_all_positions()
+                    logger.warning("Take profit position closure completed")
+                # Initiate shutdown
+                initiate_shutdown("Daily take profit target reached")
+    except Exception as e:
+        logger.error(f"Error checking daily limits: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+def _cancel_all_orders_safe():
+    """
+    Safely cancel all orders without trying to cancel order ID 0.
+    """
+    try:
+        logger.info("Safely cancelling all orders")
+        if not model_trader or not model_trader.ib:
+            logger.warning("Cannot cancel orders - model trader or IB connection not available")
+            return
+
+        # Get all open trades
+        open_trades = model_trader.ib.trades()
+        cancelled = 0
+
+        for trade in open_trades:
+            if not trade.order or not trade.contract:
+                continue
+                
+            # Skip orders with ID 0
+            if trade.order.orderId == 0:
+                continue
+                
+            try:
+                logger.info(f"Cancelling order {trade.order.orderId}")
+                model_trader.ib.cancelOrder(trade.order)
+                cancelled += 1
+            except Exception as e:
+                logger.error(f"Error cancelling order {trade.order.orderId}: {e}")
+                
+        logger.info(f"Cancelled {cancelled} orders")
+        
+        # Clear internal order tracking
+        model_trader.order_ids = []
+        model_trader.active_orders = {}
+        
+    except Exception as e:
+        logger.error(f"Error in _cancel_all_orders_safe: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+def onPnL(pnl):
+    """Handle position PnL updates."""
+    global unrealized_pnl, daily_pnl, realized_pnl, daily_trading_stopped
+    
+    try:
+        # Validate PnL values before updating
+        if hasattr(pnl, 'dailyPnL') and isinstance(pnl.dailyPnL, (int, float)) and abs(pnl.dailyPnL) < 1e6:
+            daily_pnl = pnl.dailyPnL
+            # Immediately check limits after updating daily PnL
+            if not daily_trading_stopped:
+                check_daily_limits()
+        if hasattr(pnl, 'unrealizedPnL') and isinstance(pnl.unrealizedPnL, (int, float)) and abs(pnl.unrealizedPnL) < 1e6:
+            unrealized_pnl = pnl.unrealizedPnL
+        if hasattr(pnl, 'realizedPnL') and isinstance(pnl.realizedPnL, (int, float)) and abs(pnl.realizedPnL) < 1e6:
+            realized_pnl = pnl.realizedPnL
+        
+        logger.info(f"Account PnL Update - Daily PnL: ${daily_pnl:.2f}, "
+                   f"Realized: ${realized_pnl:.2f}, "
+                   f"Unrealized: ${unrealized_pnl:.2f}")
+    except Exception as e:
+        logger.error(f"Error in onPnL: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+def onPnLSingle(pnl):
+    """Handle single position PnL updates."""
+    global unrealized_pnl, daily_pnl, realized_pnl, daily_trading_stopped
+    
+    try:
+        # Only process if this is for our active contract
+        if model_trader and model_trader.active_contract and hasattr(pnl, 'conId') and pnl.conId == model_trader.active_contract.conId:
+            # Validate PnL values before updating
+            if hasattr(pnl, 'unrealizedPnL') and isinstance(pnl.unrealizedPnL, (int, float)) and abs(pnl.unrealizedPnL) < 1e6:
+                unrealized_pnl = pnl.unrealizedPnL
+            if hasattr(pnl, 'realizedPnL') and isinstance(pnl.realizedPnL, (int, float)) and abs(pnl.realizedPnL) < 1e6:
+                realized_pnl = pnl.realizedPnL
+            if hasattr(pnl, 'dailyPnL') and isinstance(pnl.dailyPnL, (int, float)) and abs(pnl.dailyPnL) < 1e6:
+                daily_pnl = pnl.dailyPnL
+                # Immediately check limits after updating daily PnL
+                if not daily_trading_stopped:
+                    check_daily_limits()
+            else:
+                # Calculate daily PnL as sum of realized and unrealized
+                daily_pnl = realized_pnl + unrealized_pnl
+                # Check limits with calculated value
+                if not daily_trading_stopped:
+                    check_daily_limits()
+            
+            logger.info(f"Position PnL Update - Daily PnL: ${daily_pnl:.2f}, "
+                       f"Realized: ${realized_pnl:.2f}, "
+                       f"Unrealized: ${unrealized_pnl:.2f}")
+    except Exception as e:
+        logger.error(f"Error in onPnLSingle: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+def onExecDetails(trade, fill):
+    """Handle execution details updates."""
+    global realized_pnl, daily_pnl
+    if trade.contract == model_trader.active_contract:
+        # Update realized PnL when trades are executed
+        if hasattr(fill, 'realizedPNL'):
+            realized_pnl = fill.realizedPNL
+            daily_pnl = realized_pnl + unrealized_pnl
+            logger.info(f"Trade Execution - Realized PnL: ${realized_pnl:.2f}, "
+                       f"Total PnL: ${daily_pnl:.2f}")
+            check_daily_limits()
 
 def onBar(bars, hasNewBar):
     """
@@ -52,16 +248,32 @@ def onBar(bars, hasNewBar):
         bars: RealTimeBarList object from IB API
         hasNewBar: Whether the update contains a new completed bar
     """
-    if not hasNewBar:
-        return
-        
     global model_trader, last_execution_time, last_data_timestamp, is_data_flowing
+    global daily_pnl, last_trading_day, daily_trading_stopped, realized_pnl, unrealized_pnl
     
     # Update heartbeat monitoring
     last_data_timestamp = datetime.now()
     is_data_flowing = True
     
     try:
+        # Check if it's a new trading day
+        current_day = datetime.now().date()
+        stored_last_day = load_last_trading_day()
+        
+        if stored_last_day != current_day:
+            # Reset daily tracking variables
+            daily_pnl = 0.0
+            realized_pnl = 0.0
+            unrealized_pnl = 0.0
+            daily_trading_stopped = False
+            last_trading_day = current_day
+            save_last_trading_day(current_day)
+            logger.info(f"New trading day started: {current_day}")
+
+        # Only process bar completion logic if we have a new bar
+        if not hasNewBar:
+            return
+            
         # With RealTimeBarList, get the latest bar directly
         if len(bars) == 0:
             logger.warning("Received empty bar update")
@@ -88,6 +300,11 @@ def onBar(bars, hasNewBar):
             'volume': latest_bar.volume
         }
         
+        # Skip trading logic if daily limits have been hit
+        if daily_trading_stopped:
+            logger.info(f"Daily trading stopped. Current PnL: ${daily_pnl:.2f}")
+            return
+            
         # Log the new bar
         logger.info(f"New 5-second bar: {bar_dict}")
         
@@ -152,13 +369,19 @@ def heartbeat_monitor():
     """
     Monitor data flow and reconnect if necessary.
     """
-    global ib, model_trader, reconnection_attempts, contract, is_data_flowing
+    global ib, model_trader, reconnection_attempts, contract, is_data_flowing, shutdown_requested
     
     logger.info("Starting heartbeat monitor thread")
     
-    while True:
+    while not shutdown_requested:  # Add shutdown check
         try:
             current_time = datetime.now()
+            
+            # Check if trading has been stopped
+            if daily_trading_stopped and not shutdown_requested:
+                logger.info("Trading stopped detected in heartbeat monitor")
+                initiate_shutdown("Trading stopped detected in heartbeat monitor")
+                break
             
             # Check if data is still flowing
             if is_data_flowing:
@@ -167,24 +390,20 @@ def heartbeat_monitor():
                 # If no data for over DATA_FLOW_THRESHOLD seconds, try to reconnect
                 if time_since_last > DATA_FLOW_THRESHOLD:
                     logger.error(f"No data received for {time_since_last:.1f} seconds. Attempting reconnection.")
-                    # Call reconnect_to_ib which handles ib and model_trader globals
-                    reconnected = reconnect_to_ib() 
+                    reconnected = reconnect_to_ib()
                     
-                    if reconnected and contract: # Check if reconnected and contract exists
-                        # Re-subscribe to data - this needs access to the 'contract' object from main
+                    if reconnected and contract:
                         if ib.isConnected():
                             try:
                                 logger.info(f"Re-subscribing to real-time bars for {contract.localSymbol}")
                                 bars_subscription = ib.reqRealTimeBars(contract, barSize=5, whatToShow='TRADES', useRTH=False)
-                                bars_subscription.updateEvent += onBar # Re-attach event handler
+                                bars_subscription.updateEvent += onBar
                                 logger.info(f"Re-subscribed to real-time bars for {contract.localSymbol}")
-                                is_data_flowing = True # Reset flag optimistically
+                                is_data_flowing = True
                             except Exception as e:
                                 logger.error(f"Error re-subscribing to market data: {e}")
                         else:
                             logger.error("IB is not connected after reconnection attempt, cannot re-subscribe.")
-            # else:
-                # logger.debug(f"Data flowing, {time_since_last:.1f}s since last data.") # Optional: log if data is flowing
             
             # Sleep before next check
             time.sleep(15)
@@ -193,7 +412,9 @@ def heartbeat_monitor():
             logger.error(f"Error in heartbeat monitor: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            time.sleep(15) # Ensure sleep even on error
+            time.sleep(15)
+    
+    logger.info("Heartbeat monitor thread stopping...")
 
 def reconnect_to_ib():
     """Attempt to reconnect to IB and restore the trading state."""
@@ -245,6 +466,91 @@ def reconnect_to_ib():
         import traceback
         logger.error(traceback.format_exc())
         return False
+
+def _cancel_all_existing_orders():
+    """
+    Cancel ALL existing orders for the current contract.
+    This is more robust than trying to track individual orders.
+    """
+    try:
+        logger.info("Cancelling ALL existing orders to ensure clean slate")
+        
+        # Get all open trades from IB (trades contain both order and contract)
+        open_trades = ib.trades()
+        if not open_trades:
+            logger.info("No open orders found to cancel")
+            return
+            
+        # Count orders for our contract
+        contract_orders = 0
+        
+        # Cancel all orders for our contract
+        if model_trader and model_trader.active_contract:
+            for trade in open_trades:
+                # Check if this order is for our contract
+                if (trade.contract.symbol == model_trader.active_contract.symbol and 
+                    trade.contract.secType == model_trader.active_contract.secType and
+                    trade.order.orderId != 0):  # Skip orders with ID 0
+                    contract_orders += 1
+                    try:
+                        logger.info(f"Cancelling order: ID={trade.order.orderId}, Action={trade.order.action}, Type={trade.order.orderType}")
+                        ib.cancelOrder(trade.order)
+                    except Exception as e:
+                        logger.error(f"Error cancelling order {trade.order.orderId}: {e}")
+            logger.info(f"Cancelled {contract_orders} orders for {model_trader.active_contract.symbol}")
+        else:
+            logger.warning("Cannot cancel orders as no active contract is set in ModelTrader.")
+
+        # Clear our internal order tracking
+        if model_trader:
+            model_trader.order_ids = []
+            model_trader.active_orders = {}
+    except Exception as e:
+        logger.error(f"Error in _cancel_all_existing_orders: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+def initiate_shutdown(reason: str):
+    """
+    Initiate a graceful shutdown of the trading system.
+    
+    Args:
+        reason: The reason for shutdown
+    """
+    global shutdown_requested
+    
+    try:
+        shutdown_requested = True
+        logger.warning(f"Initiating trading system shutdown. Reason: {reason}")
+        
+        # Save final state
+        if model_trader:
+            logger.info("Saving final trading state...")
+            model_trader.save_state()
+        
+        # Cancel all pending orders
+        _cancel_all_orders_safe()
+        
+        # Disconnect from IB
+        if ib and ib.isConnected():
+            logger.info("Disconnecting from Interactive Brokers...")
+            ib.disconnect()
+        
+        logger.info("=== Trading Session Summary ===")
+        logger.info(f"Final Daily PnL: ${daily_pnl:.2f}")
+        logger.info(f"Realized PnL: ${realized_pnl:.2f}")
+        logger.info(f"Unrealized PnL: ${unrealized_pnl:.2f}")
+        logger.info(f"Shutdown reason: {reason}")
+        logger.info("==============================")
+        
+        # Exit the script
+        logger.info("Exiting trading system...")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Live trading script for executing model predictions via IB")
@@ -321,6 +627,14 @@ if __name__ == "__main__":
             else:
                 logger.error("No contract details received for MNQ.")
                 sys.exit(1)
+        elif args.contract == "NQ":
+            logger.info("Setting up NQ Futures contract")
+            contracts_details = ib.reqContractDetails(Future(symbol='NQ', exchange='CME'))
+            if contracts_details:
+                contract_obj = get_most_recent_contract(contracts_details)
+            else:
+                logger.error("No contract details received for NQ.")
+                sys.exit(1)
         elif args.contract == "ES":
             logger.info("Setting up ES Futures contract")
             contracts_details = ib.reqContractDetails(Future(symbol='ES', exchange='CME'))
@@ -361,6 +675,19 @@ if __name__ == "__main__":
         logger.info(f"Setting up real-time bar subscription for {contract_obj.localSymbol}")
         bars_subscription = ib.reqRealTimeBars(contract_obj, 5, 'TRADES', False)
         bars_subscription.updateEvent += onBar
+        
+        # Set up PnL monitoring
+        logger.info("Setting up PnL monitoring")
+        ib.pnlEvent += onPnL
+        ib.pnlSingleEvent += onPnLSingle
+        ib.execDetailsEvent += onExecDetails
+        
+        # Request PnL updates
+        if contract_obj:
+            account = ib.managedAccounts()[0]  # Get the first managed account
+            logger.info(f"Requesting PnL updates for account {account}")
+            ib.reqPnL(account, '')  # Request account-wide PnL
+            ib.reqPnLSingle(account, '', contract_obj.conId)  # Request PnL for specific contract
         
         # Log the bar aggregation setup for clarity
         logger.info("====== Bar Aggregation Setup ======")

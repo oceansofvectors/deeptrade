@@ -531,7 +531,8 @@ def process_single_window(
     n_stagnant_loops: int,
     improvement_threshold: float,
     run_hyperparameter_tuning: bool,
-    tuning_trials: int
+    tuning_trials: int,
+    best_hyperparameters: Dict = None
 ) -> Dict:
     """
     Process a single window in the walk-forward analysis.
@@ -577,7 +578,8 @@ def process_single_window(
         improvement_threshold=improvement_threshold,
         window_folder=window_folder,
         run_hyperparameter_tuning=run_hyperparameter_tuning,
-        tuning_trials=tuning_trials
+        tuning_trials=tuning_trials,
+        model_params=best_hyperparameters  # Pass the best hyperparameters to use
     )
     
     # Plot training progress
@@ -743,23 +745,6 @@ def walk_forward_testing(
 ) -> Dict:
     """
     Perform walk-forward testing with anchored walk-forward analysis.
-    
-    Args:
-        data: Full dataset with all technical indicators
-        window_size: Size of each walk-forward window in trading days (not calendar days)
-        step_size: Number of trading days to step forward at each iteration
-        train_ratio: Proportion of window to use for training
-        validation_ratio: Proportion of window to use for validation
-        initial_timesteps: Initial number of training timesteps
-        additional_timesteps: Number of additional timesteps for each training iteration
-        max_iterations: Maximum number of training iterations
-        n_stagnant_loops: Number of consecutive iterations without improvement before stopping
-        improvement_threshold: Minimum percentage improvement considered significant
-        run_hyperparameter_tuning: Whether to run hyperparameter tuning before training
-        tuning_trials: Number of trials for hyperparameter tuning
-        
-    Returns:
-        Dict: Results of walk-forward testing
     """
     # Create session folder within models directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -769,6 +754,9 @@ def walk_forward_testing(
     os.makedirs(f'{session_folder}/reports', exist_ok=True)
     
     logger.info(f"Created session folder: {session_folder}")
+    
+    # Initialize all_window_results list
+    all_window_results = []
     
     # Check if data is empty
     if data is None or len(data) == 0:
@@ -822,9 +810,6 @@ def walk_forward_testing(
     # Calculate number of windows
     num_windows = max(1, (len(trading_days) - window_size) // step_size + 1)
     logger.info(f"Number of walk-forward windows: {num_windows}")
-    
-    # Store results for each window
-    all_window_results = []
     
     # Get evaluation metric from config
     eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
@@ -888,6 +873,8 @@ def walk_forward_testing(
     
     # Prepare window data for all windows
     window_data_list = []
+    best_hyperparameters = None  # Store the best hyperparameters from first window
+    
     for i in range(num_windows):
         # Create window folder
         window_folder = f'{session_folder}/models/window_{i+1}'
@@ -940,6 +927,22 @@ def walk_forward_testing(
             "window_folder": window_folder
         })
     
+    # Do hyperparameter tuning only once on the first window if enabled
+    if run_hyperparameter_tuning:
+        logger.info("Starting hyperparameter tuning on first window data")
+        first_window = window_data_list[0]
+        best_hyperparameters = hyperparameter_tuning(
+            train_data=first_window["train_data"],
+            validation_data=first_window["validation_data"],
+            n_trials=tuning_trials,
+            window_folder=first_window["window_folder"],
+            eval_metric=eval_metric
+        )["best_params"]
+        
+        # Save the best hyperparameters
+        save_json(best_hyperparameters, f'{session_folder}/reports/best_hyperparameters.json')
+        logger.info(f"Best hyperparameters found: {best_hyperparameters}")
+    
     # Process windows - either in parallel or sequentially
     if use_parallel and num_windows > 1:
         # Process windows in parallel
@@ -972,8 +975,9 @@ def walk_forward_testing(
                         max_iterations,
                         n_stagnant_loops,
                         improvement_threshold,
-                        run_hyperparameter_tuning,
-                        tuning_trials
+                        False,  # Don't run hyperparameter tuning for each window
+                        tuning_trials,
+                        best_hyperparameters  # Pass the best hyperparameters found
                     )
                 )
             
@@ -1009,15 +1013,16 @@ def walk_forward_testing(
                     max_iterations,
                     n_stagnant_loops,
                     improvement_threshold,
-                    run_hyperparameter_tuning,
-                    tuning_trials
+                    False,  # Don't run hyperparameter tuning for each window
+                    tuning_trials,
+                    best_hyperparameters  # Pass the best hyperparameters found
                 )
                 all_window_results.append(window_result)
             except Exception as e:
                 logger.error(f"Error processing window {window_data_dict['window_idx']}: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-
+    
     # Aggregate results across all windows
     returns = [res["return"] for res in all_window_results]
     portfolio_values = [res["portfolio_value"] for res in all_window_results]
@@ -1094,7 +1099,7 @@ def hyperparameter_tuning(
     hit_rate_min_trades: int = 5
 ) -> Dict:
     """
-    Run hyperparameter tuning using Optuna.
+    Run hyperparameter tuning using Optuna with parallel processing.
     
     Args:
         train_data: Training data DataFrame
@@ -1109,6 +1114,21 @@ def hyperparameter_tuning(
     """
     logger.info(f"Starting hyperparameter tuning with {n_trials} trials")
     logger.info(f"Evaluation metric: {eval_metric}")
+    
+    # Get parallel processing configuration from config
+    parallel_config = config.get("hyperparameter_tuning", {}).get("parallel_processing", {})
+    use_parallel = parallel_config.get("enabled", True)  # Default to True for parallel
+    n_jobs = parallel_config.get("n_jobs", 0)  # 0 means auto-detect CPU cores
+    
+    # If n_jobs is 0, use all available cores
+    if n_jobs <= 0:
+        n_jobs = multiprocessing.cpu_count()
+    
+    if use_parallel:
+        logger.info(f"Using parallel processing with {n_jobs} workers for hyperparameter tuning")
+    else:
+        logger.info("Parallel processing disabled for hyperparameter tuning")
+        n_jobs = 1
     
     # Get minimum predictions for prediction accuracy metric
     min_predictions = config.get("training", {}).get("evaluation", {}).get("min_predictions", 10)
@@ -1138,12 +1158,12 @@ def hyperparameter_tuning(
         else:
             take_profit_pct = 0
             
-        # Get trailing stop configuration - respect the 'enabled' flag
+        # Get trailing stop configuration
         trailing_stop_config = config.get("risk_management", {}).get("trailing_stop", {})
         if trailing_stop_config.get("enabled", False):
             trailing_stop_pct = trailing_stop_config.get("percentage", 0)
         else:
-            trailing_stop_pct = 0  # Set to 0 to disable if not enabled
+            trailing_stop_pct = 0
             
         # Get position size configuration
         position_size = config["environment"].get("position_size", 1)
@@ -1155,18 +1175,69 @@ def hyperparameter_tuning(
     else:
         logger.info("Risk management is disabled")
     
-    # Create Optuna study
-    study_name = f"wf_hyperparam_tuning_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    study = optuna.create_study(direction="maximize", study_name=study_name)
+    # Create Optuna study with parallel-friendly sampler
+    study_name = f"hyperparam_tuning_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Use TPESampler with multivariate=True for better parallel performance
+    sampler = optuna.samplers.TPESampler(seed=config["seed"], multivariate=True)
+    
+    # Create storage for parallel processing
+    storage = None
+    if use_parallel:
+        # Use SQLite storage for parallel processing
+        if window_folder:
+            storage = f"sqlite:///{window_folder}/optuna.db"
+        else:
+            storage = "sqlite:///optuna.db"
+    
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=True
+    )
     
     def objective(trial):
-        # Define hyperparameters to tune
-        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-        n_steps = trial.suggest_int("n_steps", 128, 2048, log=True)
-        ent_coef = trial.suggest_float("ent_coef", 0.00001, 0.5, log=True)
-        batch_size = trial.suggest_int("batch_size", 8, 128, log=True)
-        gamma = trial.suggest_float("gamma", 0.9, 0.9999)
-        gae_lambda = trial.suggest_float("gae_lambda", 0.9, 0.999)
+        # Get hyperparameter ranges from config
+        hp_config = config.get("hyperparameter_tuning", {}).get("parameters", {})
+        
+        # Define hyperparameters to tune using ranges from config
+        learning_rate_cfg = hp_config.get("learning_rate", {})
+        learning_rate = trial.suggest_float(
+            "learning_rate", 
+            learning_rate_cfg.get("min", 1e-5), 
+            learning_rate_cfg.get("max", 1e-2), 
+            log=learning_rate_cfg.get("log", True)
+        )
+        
+        n_steps_cfg = hp_config.get("n_steps", {})
+        n_steps = trial.suggest_int(
+            "n_steps", 
+            n_steps_cfg.get("min", 128), 
+            n_steps_cfg.get("max", 2048), 
+            log=n_steps_cfg.get("log", True)
+        )
+        
+        ent_coef_cfg = hp_config.get("ent_coef", {})
+        ent_coef = trial.suggest_float(
+            "ent_coef", 
+            ent_coef_cfg.get("min", 0.00001), 
+            ent_coef_cfg.get("max", 0.5), 
+            log=ent_coef_cfg.get("log", True)
+        )
+        
+        batch_size_cfg = hp_config.get("batch_size", {})
+        batch_size = trial.suggest_int(
+            "batch_size", 
+            batch_size_cfg.get("min", 8), 
+            batch_size_cfg.get("max", 128), 
+            log=batch_size_cfg.get("log", True)
+        )
+        
+        # Use fixed values for gamma and gae_lambda from config
+        gamma = hp_config.get("gamma", 0.995)
+        gae_lambda = hp_config.get("gae_lambda", 0.95)
         
         # Create environment
         train_env = TradingEnv(
@@ -1194,65 +1265,29 @@ def hyperparameter_tuning(
         total_timesteps = config["training"].get("total_timesteps", 10000)
         model.learn(total_timesteps=total_timesteps)
         
-        # Evaluate on validation data
-        if risk_enabled and window_folder and eval_metric != "prediction_accuracy":
-            # Save the model temporarily for evaluation with risk management
-            temp_model_path = f"{window_folder}/temp_model_trial_{trial.number}"
-            model.save(temp_model_path)
-            
-            # Evaluate with risk management
-            results = trade_with_risk_management(
-                model_path=temp_model_path,
-                test_data=validation_data,
-                stop_loss_pct=stop_loss_pct,
-                take_profit_pct=take_profit_pct,
-                trailing_stop_pct=trailing_stop_pct,
-                position_size=position_size,
-                max_risk_per_trade_pct=max_risk_per_trade_pct,
-                initial_balance=config["environment"]["initial_balance"],
-                transaction_cost=config["environment"].get("transaction_cost", 0.0),
-                verbose=0,
-                deterministic=True,
-                close_at_end_of_day=True
-            )
-            
-            # Clean up temporary model file
-            if os.path.exists(f"{temp_model_path}.zip"):
-                os.remove(f"{temp_model_path}.zip")
-                
-            # Calculate hit rate from trade results
-            results = calculate_hit_rate_from_trade_results(results)
-        elif eval_metric == "prediction_accuracy":
-            # Use prediction accuracy evaluation
+        # Evaluate on validation data based on the chosen metric
+        if eval_metric == "prediction_accuracy":
             results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=0, deterministic=True)
-        else:
-            # Use standard evaluation without risk management
-            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-        
-        # Determine metric value to optimize
-        if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
-            metric_value = results["hit_rate"]
-            logger.info(f"Trial {trial.number}: Hit Rate = {metric_value:.2f}% ({results.get('profitable_trades', 0)}/{results['trade_count']} trades)")
-        elif eval_metric == "prediction_accuracy" and results.get("total_predictions", 0) >= min_predictions:
             metric_value = results["prediction_accuracy"]
-            logger.info(f"Trial {trial.number}: Prediction Accuracy = {metric_value:.2f}% ({results.get('correct_predictions', 0)}/{results.get('total_predictions', 0)} predictions)")
-        else:
+        elif eval_metric == "hit_rate":
+            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
+            metric_value = results["hit_rate"]
+        else:  # Default to "return"
+            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
             metric_value = results["total_return_pct"]
-            logger.info(f"Trial {trial.number}: Return = {metric_value:.2f}%")
-            
-            if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
-                logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
-            elif eval_metric == "prediction_accuracy" and results.get("total_predictions", 0) < min_predictions:
-                logger.warning(f"Not enough predictions ({results.get('total_predictions', 0)}) for prediction accuracy metric. Using return instead.")
         
-        # Log all hyperparameters
-        logger.info(f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, ent_coef={ent_coef:.6f}, "
-                  f"batch_size={batch_size}, gamma={gamma:.4f}, gae_lambda={gae_lambda:.4f}")
+        # Log trial results
+        logger.info(f"Trial {trial.number}: {eval_metric} = {metric_value:.2f}%, "
+                   f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, "
+                   f"ent_coef={ent_coef:.6f}, batch_size={batch_size}")
         
         return metric_value
     
-    # Run optimization
-    study.optimize(objective, n_trials=n_trials)
+    # Run optimization with parallel processing if enabled
+    if use_parallel:
+        study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
+    else:
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     
     # Get best parameters
     best_params = study.best_params
@@ -1268,14 +1303,23 @@ def hyperparameter_tuning(
     # Save visualization if folder is provided
     if window_folder:
         try:
-            # Create optimization visualization plots
-            fig1 = optuna.visualization.plot_optimization_history(study)
-            fig1.write_image(f'{window_folder}/optimization_history.png')
+            os.makedirs('models/plots/tuning', exist_ok=True)
+            timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
             
-            fig2 = optuna.visualization.plot_param_importances(study)
-            fig2.write_image(f'{window_folder}/param_importances.png')
-            
-            logger.info(f"Saved optimization visualizations to {window_folder}")
+            # Create optimization visualization plots if plotly is available
+            try:
+                import plotly
+                
+                # Create optimization visualization plots
+                fig1 = optuna.visualization.plot_optimization_history(study)
+                fig1.write_image(f'models/plots/tuning/optimization_history_{timestamp}.png')
+                
+                fig2 = optuna.visualization.plot_param_importances(study)
+                fig2.write_image(f'models/plots/tuning/param_importances_{timestamp}.png')
+                
+                logger.info(f"Saved optimization visualizations to models/plots/tuning/")
+            except ImportError:
+                logger.warning("Plotly is not installed. Skipping optimization visualization plots.")
         except Exception as e:
             logger.warning(f"Could not save optimization visualizations: {e}")
     

@@ -106,6 +106,8 @@ class TradingEnv(gym.Env):
                 self.technical_indicators.append('MSO_SIN')
             if 'MSO_COS' in self.data.columns:
                 self.technical_indicators.append('MSO_COS')
+            if 'ZScore' in self.data.columns:
+                self.technical_indicators.append('MSO_COS')
             
         # Calculate observation space size: close_norm + all technical indicators + position
         obs_size = 1 + len(self.technical_indicators) + 1

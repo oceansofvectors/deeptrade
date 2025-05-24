@@ -85,17 +85,27 @@ indicators:
     enabled: true
   minutes_since_open:
     enabled: true
+  z_score:
+    enabled: true
+    length: 50  # Lookback period for calculating rolling mean and std
+  rrcf_anomaly:
+    enabled: false
+    window_size: 100  # Size of sliding window for RRCF calculation
+    num_trees: 64     # Number of trees in the forest (reduced from 40 for speed)
+    tree_size: 256    # Maximum size of each tree (reduced from 256 for speed)
+    feature_cols: ["close"]  # Features to use for anomaly detection
+    random_seed: 42   # Random seed for reproducibility
 
 environment:
-  initial_balance: 1000.0
+  initial_balance: 10000.0
   position_size: 1  # Number of NQ futures contracts to trade (default: 1)
   transaction_cost: 0.0  # Transaction cost as percentage
 
 model:
   ent_coef: 0.00011640494075069245
   learning_rate: 0.0029977835304081614
-  n_steps: 465
-  batch_size: 17
+  n_steps: 562
+  batch_size: 22
   gamma: 0.95
   gae_lambda: 0.95
   use_lr_decay: true
@@ -108,13 +118,14 @@ risk_management:
   # Daily risk limit configuration
   daily_risk_limit:
     enabled: false  # Enable/disable daily risk limit
-    max_daily_loss: 1000.0  # Maximum dollar loss allowed per trading day
+    max_daily_loss: 3000.0  # Maximum dollar loss allowed per trading day
+    daily_take_profit: 2000.0  # Maximum profit target for the day, stop trading when reached
   
   # Stop loss configuration
   stop_loss:
-    enabled: true 
-    mode: "atr"  # Options: "percentage", "atr"
-    percentage: 5  # Stop loss as percentage of portfolio value (used when mode="percentage")
+    enabled: false 
+    mode: "percentage"  # Options: "percentage", "atr"
+    percentage: 17  # Stop loss as percentage of portfolio value (used when mode="percentage")
     atr_multiplier: 5.0  # Stop loss as multiple of ATR (used when mode="atr")
   
   # Take profit configuration
@@ -137,21 +148,21 @@ risk_management:
 
 # Walk-forward testing configuration
 walk_forward:
-  enabled: true  # Set to true to use walk-forward testing instead of standard train/val/test
-  window_size: 120  # Size of each walk-forward window in trading days (NYSE business days)
-  step_size: 30    # Number of trading days to step forward at each iteration (NYSE business days)
+  enabled: true
+  window_size: 120
+  step_size: 30
   parallel_processing:
-    enabled: true   # Enable parallel processing of walk-forward windows
-    n_processes: 0  # Number of processes to use (0 = auto-detect based on CPU cores)
-    max_workers: 0  # Maximum number of workers (0 = use n_processes)
+    enabled: true   # Enable parallel processing for walk-forward windows
+    n_processes: 0  # Auto-detect number of CPU cores
+    max_workers: 0  # Use all available workers
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: false  # Set to true to enable hyperparameter tuning during training
-  n_trials: 30     # Number of trials for the optimization
+  enabled: false
+  n_trials: 30
   parallel_processing:
-    enabled: true  # Whether to run trials in parallel
-    n_jobs: 0      # Number of parallel jobs (0 = auto-detect based on CPU cores)
+    enabled: false  # Disable parallel processing for hyperparameter tuning
+    n_jobs: 1      # Use single process for tuning
   # Parameters to tune (these are the search spaces)
   parameters:
     learning_rate: 

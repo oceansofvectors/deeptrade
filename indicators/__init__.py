@@ -22,4 +22,5 @@ from indicators.vwap import calculate_vwap
 from indicators.disparity import calculate_disparity
 from indicators.volume import calculate_volume_indicator
 from indicators.day_of_week import calculate_day_of_week
-from indicators.minutes_since_open import calculate_minutes_since_open 
+from indicators.minutes_since_open import calculate_minutes_since_open
+from indicators.rrcf_anomaly import calculate_rrcf_anomaly 

@@ -35,6 +35,7 @@ class ModelTrader:
         self.state_file_path = state_file_path # Store state_file_path
         self.model = None
         self.current_position = 0  # Current position (quantity)
+        self.active_contract = None  # Initialize active_contract attribute
         self.contract = None  # Current trading contract
         self.order_ids = []  # Track order IDs
         self.bar_history = []  # Store historical bars
@@ -435,6 +436,7 @@ class ModelTrader:
     def set_active_contract(self, contract):
         """Set the active trading contract."""
         self.contract = contract
+        self.active_contract = contract  # Set both contract and active_contract
         logger.info(f"Active contract set to {contract}")
     
     def save_state(self):
@@ -854,8 +856,8 @@ class ModelTrader:
                         # Calculate stop loss and take profit prices based on portfolio percentage
                         # For futures, we need to convert portfolio percentage to price points
                         
-                        # Point value for MNQ futures ($2 per point)
-                        point_value = 2.0
+                        # Point value for NQ futures ($20 per point)
+                        point_value = 20.0
                         
                         # Calculate stop loss and take profit prices
                         stop_loss_price = None
@@ -1013,8 +1015,8 @@ class ModelTrader:
                         # Calculate stop loss and take profit prices based on portfolio percentage
                         # For futures, we need to convert portfolio percentage to price points
                         
-                        # Point value for MNQ futures ($2 per point)
-                        point_value = 2.0
+                        # Point value for NQ futures ($20 per point)
+                        point_value = 20.0
                         
                         # Calculate stop loss and take profit prices
                         stop_loss_price = None
@@ -1552,3 +1554,49 @@ class ModelTrader:
             import traceback # Add import for traceback
             logger.error(traceback.format_exc())
             return None 
+
+    def close_all_positions(self):
+        """
+        Close all open positions for the current contract.
+        Used when daily risk limits are hit.
+        """
+        logger.info("Closing all positions due to daily risk limit")
+        
+        try:
+            # First cancel all existing orders
+            self._cancel_all_existing_orders()
+            
+            # Wait a brief moment for order cancellations to be processed
+            time.sleep(0.5)
+            
+            # Get current position
+            self.verify_position(force=True)
+            
+            if self.current_position != 0:
+                # Create market order to close position
+                action = 'BUY' if self.current_position < 0 else 'SELL'
+                quantity = abs(self.expected_position)
+                
+                close_order = MarketOrder(action, quantity)
+                close_order.transmit = True
+                
+                # Place the order
+                trade = self.ib.placeOrder(self.contract, close_order)
+                self.order_ids.append(trade.order.orderId)
+                logger.info(f"Placed order to close position: {trade.order}")
+                
+                # Wait for the position to be closed
+                self._wait_for_position_change()
+                
+                # Update internal state
+                self.current_position = 0
+                self.expected_position = 0
+                
+                logger.info("Successfully closed all positions")
+            else:
+                logger.info("No positions to close")
+                
+        except Exception as e:
+            logger.error(f"Error closing all positions: {e}")
+            import traceback
+            logger.error(traceback.format_exc()) 
