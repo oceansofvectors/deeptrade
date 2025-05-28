@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/8fcd7522e4c7427085d36a5011127b89/artifacts
+end_time: 1748149858843
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 8fcd7522e4c7427085d36a5011127b89
+run_name: Pretraining_Hyperparameter_Tuning_return
+run_uuid: 8fcd7522e4c7427085d36a5011127b89
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149000096
+status: 3
+tags: []
+user_id: odin

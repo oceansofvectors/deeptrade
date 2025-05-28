@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/2109c05f11d048fa877104d5ab8c6798/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 2109c05f11d048fa877104d5ab8c6798
+run_name: skittish-stork-272
+run_uuid: 2109c05f11d048fa877104d5ab8c6798
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149462857
+status: 1
+tags: []
+user_id: odin

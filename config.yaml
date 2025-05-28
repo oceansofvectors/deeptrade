@@ -158,7 +158,7 @@ walk_forward:
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: false
+  enabled: true
   n_trials: 30
   parallel_processing:
     enabled: false  # Disable parallel processing for hyperparameter tuning
@@ -184,3 +184,45 @@ hyperparameter_tuning:
     # Fixed values for gamma and gae_lambda
     gamma: 0.995  # Fixed value instead of search range
     gae_lambda: 0.95  # Fixed value instead of search range
+
+# Pretraining configuration
+pretraining:
+  enabled: true  # Enable/disable pretraining on synthetic data
+  timesteps: 500  # Number of timesteps to train on each synthetic file
+  synthetic_data_dir: "./synthetic_normalized"  # Directory containing synthetic data files
+  
+  # Hyperparameter tuning specifically for pretraining
+  hyperparameter_tuning:
+    enabled: false  # Enable/disable hyperparameter tuning for pretraining
+    n_trials: 20   # Number of trials for pretraining hyperparameter optimization
+    sample_files: 50  # Number of synthetic files to use for evaluation during tuning (for speed)
+    parallel_processing:
+      enabled: true  # Enable parallel processing for pretraining hyperparameter tuning
+      n_jobs: 0     # Auto-detect number of CPU cores (0 = use all cores)
+    
+    # Parameters to tune for pretraining (can be different from main training)
+    parameters:
+      learning_rate: 
+        min: 0.00001
+        max: 0.01
+        log: true
+      n_steps:
+        min: 256
+        max: 2048
+        log: true
+      ent_coef:
+        min: 0.00001
+        max: 0.1
+        log: true
+      batch_size:
+        min: 16
+        max: 128
+        log: true
+      # Pretraining-specific parameter: timesteps per synthetic file
+      timesteps_per_file:
+        min: 500
+        max: 5000
+        log: false  # Linear scale for timesteps
+      # Fixed values for gamma and gae_lambda
+      gamma: 0.995  # Fixed value instead of search range
+      gae_lambda: 0.95  # Fixed value instead of search range

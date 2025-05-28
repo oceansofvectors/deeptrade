@@ -15,6 +15,8 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
 import pickle
+import glob
+import mlflow
 
 from environment import TradingEnv
 from get_data import get_data
@@ -24,6 +26,8 @@ from config import config
 import money
 from utils.seeding import seed_worker  # Import the seed_worker function
 from normalization import scale_window, get_standardized_column_names  # Import both functions from normalization
+from utils.seeding import set_global_seed  # Import the set_global_seed function
+from pretraining import pretrain_on_synthetic_data, hyperparameter_tuning_pretraining  # Import pretraining functions
 
 # Setup logging to save to file and console
 os.makedirs('models/logs', exist_ok=True)
@@ -298,173 +302,6 @@ def calculate_hit_rate_from_trade_results(results: Dict) -> Dict:
     
     return results
 
-def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministic=True):
-    """
-    Evaluate a trained agent's prediction accuracy on test data.
-    
-    This function focuses on measuring how accurately the model predicts price direction
-    (up or down) in the next candle, rather than measuring returns.
-    
-    Args:
-        model: Trained PPO model
-        test_data: Test data DataFrame
-        verbose: Verbosity level (0=silent, 1=info)
-        deterministic: Whether to make deterministic predictions
-        
-    Returns:
-        Dict: Results including prediction accuracy metrics
-    """
-    # Determine which case is used for price columns
-    if 'Close' in test_data.columns:
-        close_col = 'Close'
-    elif 'CLOSE' in test_data.columns:
-        close_col = 'CLOSE'
-    else:
-        close_col = 'close'
-        
-    # Create evaluation environment
-    env = TradingEnv(
-        test_data,
-        initial_balance=config["environment"]["initial_balance"],
-        transaction_cost=config["environment"].get("transaction_cost", 0.0),
-        position_size=config["environment"].get("position_size", 1)
-    )
-    
-    # Initialize tracking variables
-    total_predictions = 0
-    correct_predictions = 0
-    
-    # Portfolio tracking
-    initial_balance = config["environment"]["initial_balance"]
-    current_portfolio = money.to_decimal(initial_balance)
-    
-    # Position tracking
-    current_position = 0  # 0 = no position, 1 = long, -1 = short
-    
-    # Trade tracking
-    trade_history = []
-    trade_count = 0
-    
-    # Track action history for plotting
-    action_history = []
-    portfolio_history = [float(initial_balance)]
-    
-    # Reset environment to start evaluation
-    obs, _ = env.reset()
-    done = False
-    
-    if verbose > 0:
-        logger.info("Starting model evaluation with prediction accuracy tracking")
-    
-    # Step through the environment until done
-    while not done:
-        # Get current step and price before taking action
-        current_step = env.current_step
-        current_price = money.to_decimal(test_data.iloc[current_step][close_col])
-        
-        # Get model's action
-        action, _ = model.predict(obs, deterministic=deterministic)
-        action_history.append(int(action))
-        
-        # Convert action to position (0 = long/buy, 1 = short/sell, 2 = hold)
-        if action == 0:  # Long
-            new_position = 1
-        elif action == 1:  # Short
-            new_position = -1
-        else:  # Hold - maintain current position
-            new_position = current_position
-        
-        # Check if we're at the last step or not
-        # We need the next price to determine if prediction was correct
-        if current_step < len(test_data) - 1:
-            # Get next price
-            next_price = money.to_decimal(test_data.iloc[current_step + 1][close_col])
-            price_change = next_price - current_price
-            
-            # Evaluate prediction accuracy based on action type
-            prediction_correct = False
-            
-            if action == 0:  # Long - prediction is correct if price goes up
-                prediction_correct = price_change > 0
-            elif action == 1:  # Short - prediction is correct if price goes down
-                prediction_correct = price_change < 0
-            elif action == 2:  # Hold - prediction is correct if price doesn't change much
-                # For hold, we'll define "correct" as the price not changing significantly
-                # Using a threshold of 0.1% of the current price
-                threshold = current_price * money.to_decimal(0.001)
-                prediction_correct = abs(price_change) <= threshold
-            
-            # Record prediction
-            total_predictions += 1
-            if prediction_correct:
-                correct_predictions += 1
-                
-            # Log information if verbose
-            if verbose > 0 and total_predictions % 100 == 0:
-                accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
-                logger.info(f"Step {current_step}: Predictions so far - {correct_predictions}/{total_predictions} correct ({accuracy:.2f}%)")
-        
-        # Record every action, including HOLD actions
-        trade_count += 1
-        trade_info = {
-            "step": current_step,
-            "action": "BUY" if action == 0 else "SELL" if action == 1 else "HOLD",
-            "price": float(current_price),
-            "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step]),
-            "position_change": new_position != current_position
-        }
-        trade_history.append(trade_info)
-        
-        # Update position
-        current_position = new_position
-        
-        # Take step in environment
-        new_obs, reward, done, truncated, info = env.step(action)
-        obs = new_obs
-        done = done or truncated
-        
-        # Update portfolio from environment
-        current_portfolio = env.net_worth
-        portfolio_history.append(float(current_portfolio))
-    
-    # Calculate final metrics
-    prediction_accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
-    total_return_pct = money.calculate_return_pct(current_portfolio, initial_balance)
-    
-    # Calculate hit rate (percentage of profitable trades)
-    hit_rate = 0
-    profitable_trades = 0
-    if trade_count > 0:
-        # For simplicity, estimate profitable trades based on overall performance
-        # In a more detailed implementation, we'd track each trade's profitability
-        profitable_trades = int(trade_count * (prediction_accuracy / 100))
-        hit_rate = (profitable_trades / trade_count) * 100
-    
-    # Create results dictionary
-    results = {
-        "prediction_accuracy": prediction_accuracy,
-        "correct_predictions": correct_predictions,
-        "total_predictions": total_predictions,
-        "total_return_pct": float(total_return_pct),
-        "final_portfolio_value": float(current_portfolio),
-        "initial_portfolio_value": float(initial_balance),
-        "trade_count": trade_count,
-        "trade_history": trade_history,
-        "hit_rate": hit_rate,
-        "profitable_trades": profitable_trades,
-        "final_position": current_position,
-        "portfolio_history": portfolio_history,
-        "action_history": action_history
-    }
-    
-    # Log summary
-    if verbose > 0:
-        logger.info(f"Evaluation complete: {correct_predictions}/{total_predictions} correct predictions ({prediction_accuracy:.2f}%)")
-        logger.info(f"Return: {float(total_return_pct):.2f}%, Final portfolio: ${float(current_portfolio):.2f}")
-        logger.info(f"Total trades: {trade_count}")
-    
-    return results
-
 def export_consolidated_trade_history(all_window_results: List[Dict], session_folder: str) -> None:
     """
     Consolidate trade histories from all windows into a single CSV file.
@@ -532,7 +369,8 @@ def process_single_window(
     improvement_threshold: float,
     run_hyperparameter_tuning: bool,
     tuning_trials: int,
-    best_hyperparameters: Dict = None
+    best_hyperparameters: Dict = None,
+    pretrained_model_path: str = None  # Changed from pretrained_model to pretrained_model_path
 ) -> Dict:
     """
     Process a single window in the walk-forward analysis.
@@ -579,7 +417,8 @@ def process_single_window(
         window_folder=window_folder,
         run_hyperparameter_tuning=run_hyperparameter_tuning,
         tuning_trials=tuning_trials,
-        model_params=best_hyperparameters  # Pass the best hyperparameters to use
+        model_params=best_hyperparameters,  # Pass the best hyperparameters to use
+        pretrained_model_path=pretrained_model_path  # Fixed parameter name
     )
     
     # Plot training progress
@@ -660,7 +499,7 @@ def process_single_window(
             max_risk_per_trade_pct=max_risk_per_trade_pct,
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 0.0),
-            verbose=1,
+            verbose=0,
             daily_risk_limit=daily_risk_limit
         )
     else:
@@ -741,11 +580,27 @@ def walk_forward_testing(
     n_stagnant_loops: int = 3,
     improvement_threshold: float = 0.1,
     run_hyperparameter_tuning: bool = False,
-    tuning_trials: int = 30
+    tuning_trials: int = 30,
+    use_pretraining: bool = True,
+    pretraining_timesteps: int = 2000,
+    run_pretraining_hyperparameter_tuning: bool = False,
+    pretraining_tuning_trials: int = 20
 ) -> Dict:
     """
     Perform walk-forward testing with anchored walk-forward analysis.
+    
+    Args:
+        use_pretraining: Whether to run pretraining on synthetic data first
+        pretraining_timesteps: Number of timesteps to train on each synthetic file
+        run_pretraining_hyperparameter_tuning: Whether to run hyperparameter tuning for pretraining
+        pretraining_tuning_trials: Number of trials for pretraining hyperparameter tuning
     """
+    # Import seeding function for window-specific seeds
+    from utils.seeding import set_global_seed
+    
+    # Get seed value for reproducibility
+    seed_value = config.get("seed", 42)
+    
     # Create session folder within models directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     session_folder = f'models/session_{timestamp}'
@@ -754,6 +609,28 @@ def walk_forward_testing(
     os.makedirs(f'{session_folder}/reports', exist_ok=True)
     
     logger.info(f"Created session folder: {session_folder}")
+    
+    # Start MLflow run for walk-forward testing
+    mlflow.start_run(run_name=f"Walk_Forward_Testing_{timestamp}")
+    
+    # Log walk-forward testing configuration
+    mlflow.log_param("session_timestamp", timestamp)
+    mlflow.log_param("window_size_trading_days", window_size)
+    mlflow.log_param("step_size_trading_days", step_size)
+    mlflow.log_param("train_ratio", train_ratio)
+    mlflow.log_param("validation_ratio", validation_ratio)
+    mlflow.log_param("initial_timesteps", initial_timesteps)
+    mlflow.log_param("additional_timesteps", additional_timesteps)
+    mlflow.log_param("max_iterations", max_iterations)
+    mlflow.log_param("n_stagnant_loops", n_stagnant_loops)
+    mlflow.log_param("improvement_threshold", improvement_threshold)
+    mlflow.log_param("run_hyperparameter_tuning", run_hyperparameter_tuning)
+    mlflow.log_param("tuning_trials", tuning_trials)
+    mlflow.log_param("use_pretraining", use_pretraining)
+    mlflow.log_param("pretraining_timesteps", pretraining_timesteps)
+    mlflow.log_param("run_pretraining_hyperparameter_tuning", run_pretraining_hyperparameter_tuning)
+    mlflow.log_param("pretraining_tuning_trials", pretraining_tuning_trials)
+    mlflow.log_param("seed", seed_value)
     
     # Initialize all_window_results list
     all_window_results = []
@@ -770,6 +647,8 @@ def walk_forward_testing(
             "error": "Empty dataset"
         }
         save_json(error_report, f'{session_folder}/reports/error_report.json')
+        mlflow.log_param("error", "Empty dataset")
+        mlflow.end_run()
         return error_report
     
     if not isinstance(data.index, pd.DatetimeIndex):
@@ -783,15 +662,24 @@ def walk_forward_testing(
             "error": "Invalid index type"
         }
         save_json(error_report, f'{session_folder}/reports/error_report.json')
+        mlflow.log_param("error", "Invalid index type")
+        mlflow.end_run()
         return error_report
     
     # Filter data to include only market hours
     logger.info("Filtering data to include only NYSE market hours")
     data = filter_market_hours(data)
     
+    # Log data information
+    mlflow.log_param("data_start", data.index[0])
+    mlflow.log_param("data_end", data.index[-1])
+    mlflow.log_param("data_length", len(data))
+    mlflow.log_param("market_hours_only", True)
+    
     # Get list of unique trading days in the dataset
     trading_days = get_trading_days(data)
     logger.info(f"Total number of trading days in dataset: {len(trading_days)}")
+    mlflow.log_param("total_trading_days", len(trading_days))
     
     # Verify we have enough data for at least one window
     if len(trading_days) < window_size:
@@ -805,14 +693,31 @@ def walk_forward_testing(
             "error": "Insufficient trading days"
         }
         save_json(error_report, f'{session_folder}/reports/error_report.json')
+        mlflow.log_param("error", "Insufficient trading days")
+        mlflow.end_run()
         return error_report
     
     # Calculate number of windows
     num_windows = max(1, (len(trading_days) - window_size) // step_size + 1)
     logger.info(f"Number of walk-forward windows: {num_windows}")
+    mlflow.log_param("num_windows", num_windows)
     
     # Get evaluation metric from config
     eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
+    mlflow.log_param("evaluation_metric", eval_metric)
+    
+    # Log enabled indicators from config
+    indicators_config = config.get("indicators", {})
+    enabled_indicators = {}
+    
+    for indicator_name, indicator_config in indicators_config.items():
+        if indicator_config.get("enabled", False):
+            enabled_indicators[indicator_name] = indicator_config
+    
+    # Log enabled indicators
+    mlflow.log_param("enabled_indicators", list(enabled_indicators.keys()))
+    for indicator_name, indicator_config in enabled_indicators.items():
+        mlflow.log_param(f"indicator_{indicator_name}_config", indicator_config)
     
     # Get parallel processing configuration
     parallel_config = config.get("walk_forward", {}).get("parallel_processing", {})
@@ -829,10 +734,96 @@ def walk_forward_testing(
         max_workers = n_processes
     
     # Log parallelization settings
+    mlflow.log_param("parallel_processing", use_parallel)
+    mlflow.log_param("n_processes", n_processes)
+    mlflow.log_param("max_workers", max_workers)
+    
     if use_parallel:
         logger.info(f"Parallel processing enabled with {max_workers} workers (out of {n_processes} CPU cores)")
     else:
         logger.info(f"Parallel processing disabled. Processing {num_windows} windows sequentially.")
+    
+    # PRETRAINING PHASE
+    pretrained_model = None
+    pretrained_model_path = None  # Add variable to store the path
+    if use_pretraining:
+        logger.info("="*80)
+        logger.info("STARTING PRETRAINING PHASE")
+        logger.info("="*80)
+        
+        # Get hyperparameters for pretraining
+        pretrain_params = None
+        
+        # Run pretraining hyperparameter tuning if enabled
+        if run_pretraining_hyperparameter_tuning:
+            logger.info("="*60)
+            logger.info("PRETRAINING HYPERPARAMETER TUNING")
+            logger.info("="*60)
+            
+            pretraining_tuning_results = hyperparameter_tuning_pretraining(
+                synthetic_data_dir="./synthetic_normalized",
+                n_trials=pretraining_tuning_trials,
+                eval_metric=eval_metric,
+                sample_files=3,  # Use 3 files for faster tuning
+                timesteps_per_file=1000  # Use 1000 timesteps for tuning evaluation
+            )
+            
+            if pretraining_tuning_results is not None:
+                pretrain_params = pretraining_tuning_results["best_params"]
+                # Extract timesteps_per_file from tuning results if present
+                tuned_timesteps = pretrain_params.pop("timesteps_per_file", pretraining_timesteps)
+                
+                # Save pretraining tuning results
+                save_json(pretraining_tuning_results["best_params"], f'{session_folder}/reports/best_pretraining_hyperparameters.json')
+                logger.info(f"Best pretraining hyperparameters found: {pretrain_params}")
+                logger.info(f"Optimal timesteps per file: {tuned_timesteps}")
+                
+                # Use the tuned timesteps for actual pretraining
+                pretraining_timesteps = tuned_timesteps
+            else:
+                logger.warning("Pretraining hyperparameter tuning failed. Using default parameters.")
+                pretrain_params = None
+        
+        # If no tuning or regular hyperparameter tuning is enabled but pretraining tuning is not
+        if pretrain_params is None:
+            if run_hyperparameter_tuning and not run_pretraining_hyperparameter_tuning:
+                # If hyperparameter tuning is enabled, we'll get the best parameters from first window later
+                logger.info("Main hyperparameter tuning enabled - will use those optimized parameters for pretraining")
+            else:
+                # Use default parameters from config for pretraining
+                logger.info("Using default parameters from config for pretraining")
+                pretrain_params = {
+                    "ent_coef": config["model"].get("ent_coef", 0.01),
+                    "learning_rate": config["model"].get("learning_rate", 0.0003),
+                    "n_steps": config["model"].get("n_steps", 2048),
+                    "batch_size": config["model"].get("batch_size", 64),
+                    "gamma": config["model"].get("gamma", 0.99),
+                    "gae_lambda": config["model"].get("gae_lambda", 0.95),
+                }
+        
+        # Run pretraining on synthetic data only if we have parameters
+        if pretrain_params is not None:
+            logger.info("Running pretraining with determined parameters")
+            pretrained_model = pretrain_on_synthetic_data(
+                synthetic_data_dir="./synthetic_normalized",
+                initial_timesteps=pretraining_timesteps,
+                model_params=pretrain_params
+            )
+            
+            if pretrained_model is not None:
+                # Save pretrained model
+                model_suffix = "tuned" if run_pretraining_hyperparameter_tuning else "default"
+                pretrained_model_path = f'{session_folder}/pretrained_model_{model_suffix}.zip'
+                pretrained_model.save(pretrained_model_path)
+                logger.info(f"Pretrained model saved to {pretrained_model_path}")
+                try:
+                    mlflow.log_artifact(pretrained_model_path)
+                except Exception as e:
+                    logger.warning(f"Failed to log pretrained model artifact to MLflow: {e}")
+            else:
+                logger.warning("Pretraining failed or no synthetic data available. Proceeding without pretraining.")
+        else:
+            logger.info("No pretraining parameters available yet. Will run pretraining after main hyperparameter tuning if enabled.")
     
     # Save session parameters
     session_params = {
@@ -855,16 +846,12 @@ def walk_forward_testing(
         "evaluation_metric": eval_metric,
         "parallel_processing": use_parallel,
         "n_processes": n_processes,
-        "max_workers": max_workers
+        "max_workers": max_workers,
+        "use_pretraining": use_pretraining,
+        "pretraining_timesteps": pretraining_timesteps,
+        "run_pretraining_hyperparameter_tuning": run_pretraining_hyperparameter_tuning,
+        "pretraining_tuning_trials": pretraining_tuning_trials
     }
-    
-    # Add enabled indicators from config
-    indicators_config = config.get("indicators", {})
-    enabled_indicators = {}
-    
-    for indicator_name, indicator_config in indicators_config.items():
-        if indicator_config.get("enabled", False):
-            enabled_indicators[indicator_name] = indicator_config
     
     # Add enabled indicators to session parameters
     session_params["enabled_indicators"] = enabled_indicators
@@ -942,6 +929,30 @@ def walk_forward_testing(
         # Save the best hyperparameters
         save_json(best_hyperparameters, f'{session_folder}/reports/best_hyperparameters.json')
         logger.info(f"Best hyperparameters found: {best_hyperparameters}")
+        
+        # Log best hyperparameters to MLflow
+        for param, value in best_hyperparameters.items():
+            mlflow.log_param(f"best_hp_{param}", value)
+        
+        # If we have pretraining enabled but no pretrain_params were set yet, 
+        # use the best hyperparameters for pretraining
+        if use_pretraining and pretrained_model is None:
+            logger.info("Running pretraining with optimized hyperparameters")
+            pretrained_model = pretrain_on_synthetic_data(
+                synthetic_data_dir="./synthetic_normalized",
+                initial_timesteps=pretraining_timesteps,
+                model_params=best_hyperparameters
+            )
+            
+            if pretrained_model is not None:
+                # Save pretrained model
+                pretrained_model_path = f'{session_folder}/pretrained_model_optimized.zip'
+                pretrained_model.save(pretrained_model_path)
+                logger.info(f"Optimized pretrained model saved to {pretrained_model_path}")
+                try:
+                    mlflow.log_artifact(pretrained_model_path)
+                except Exception as e:
+                    logger.warning(f"Failed to log optimized pretrained model artifact to MLflow: {e}")
     
     # Process windows - either in parallel or sequentially
     if use_parallel and num_windows > 1:
@@ -977,7 +988,8 @@ def walk_forward_testing(
                         improvement_threshold,
                         False,  # Don't run hyperparameter tuning for each window
                         tuning_trials,
-                        best_hyperparameters  # Pass the best hyperparameters found
+                        best_hyperparameters,  # Pass the best hyperparameters found
+                        pretrained_model_path  # Pass the pretrained model path
                     )
                 )
             
@@ -1000,6 +1012,11 @@ def walk_forward_testing(
         
         for window_data_dict in window_data_list:
             try:
+                # Set window-specific seed for reproducibility
+                window_seed = seed_value + window_data_dict["window_idx"]
+                set_global_seed(window_seed)
+                logger.debug(f"Set seed to {window_seed} for window {window_data_dict['window_idx']}")
+                
                 window_result = process_single_window(
                     window_data_dict["window_idx"],
                     num_windows,
@@ -1015,7 +1032,8 @@ def walk_forward_testing(
                     improvement_threshold,
                     False,  # Don't run hyperparameter tuning for each window
                     tuning_trials,
-                    best_hyperparameters  # Pass the best hyperparameters found
+                    best_hyperparameters,  # Pass the best hyperparameters found
+                    pretrained_model_path  # Pass the pretrained model path
                 )
                 all_window_results.append(window_result)
             except Exception as e:
@@ -1046,6 +1064,40 @@ def walk_forward_testing(
     avg_prediction_accuracy = np.mean(prediction_accuracies) if prediction_accuracies else 0
     avg_correct_predictions = np.mean(correct_predictions) if correct_predictions else 0
     avg_total_predictions = np.mean(total_predictions) if total_predictions else 0
+    
+    # Log aggregated results to MLflow
+    mlflow.log_metric("avg_return", avg_return)
+    mlflow.log_metric("avg_portfolio", avg_portfolio)
+    mlflow.log_metric("avg_trades", avg_trades)
+    mlflow.log_metric("avg_hit_rate", avg_hit_rate)
+    mlflow.log_metric("avg_profitable_trades", avg_profitable_trades)
+    mlflow.log_metric("avg_prediction_accuracy", avg_prediction_accuracy)
+    mlflow.log_metric("avg_correct_predictions", avg_correct_predictions)
+    mlflow.log_metric("avg_total_predictions", avg_total_predictions)
+    
+    # Log individual window results
+    for i, res in enumerate(all_window_results):
+        window_num = i + 1
+        mlflow.log_metric(f"window_{window_num}_return", res["return"], step=window_num)
+        mlflow.log_metric(f"window_{window_num}_portfolio", res["portfolio_value"], step=window_num)
+        mlflow.log_metric(f"window_{window_num}_trades", res["trade_count"], step=window_num)
+        if "hit_rate" in res:
+            mlflow.log_metric(f"window_{window_num}_hit_rate", res["hit_rate"], step=window_num)
+        if "prediction_accuracy" in res:
+            mlflow.log_metric(f"window_{window_num}_prediction_accuracy", res["prediction_accuracy"], step=window_num)
+    
+    # Calculate and log additional statistics
+    if returns:
+        mlflow.log_metric("return_std", np.std(returns))
+        mlflow.log_metric("return_min", np.min(returns))
+        mlflow.log_metric("return_max", np.max(returns))
+        mlflow.log_metric("positive_return_windows", sum(1 for r in returns if r > 0))
+        mlflow.log_metric("negative_return_windows", sum(1 for r in returns if r < 0))
+        
+        # Calculate Sharpe-like ratio (return/volatility)
+        if np.std(returns) > 0:
+            sharpe_like_ratio = avg_return / np.std(returns)
+            mlflow.log_metric("sharpe_like_ratio", sharpe_like_ratio)
     
     logger.info(f"\n{'='*80}\nWalk-Forward Testing Summary\n{'='*80}")
     logger.info(f"Number of windows: {num_windows}")
@@ -1085,8 +1137,33 @@ def walk_forward_testing(
     # Plot results
     plot_walk_forward_results(all_window_results, session_folder, eval_metric)
     
+    # Log plots as artifacts
+    try:
+        plot_files = glob.glob(f'{session_folder}/plots/*.png')
+        for plot_file in plot_files:
+            try:
+                mlflow.log_artifact(plot_file)
+            except Exception as e:
+                logger.warning(f"Failed to log plot artifact {plot_file} to MLflow: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to log plot artifacts: {e}")
+    
     # Export consolidated trade history
     export_consolidated_trade_history(all_window_results, session_folder)
+    
+    # Log consolidated trade history as artifact
+    try:
+        trade_history_file = f'{session_folder}/reports/all_windows_trade_history.csv'
+        if os.path.exists(trade_history_file):
+            try:
+                mlflow.log_artifact(trade_history_file)
+            except Exception as e:
+                logger.warning(f"Failed to log trade history artifact to MLflow: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to log trade history artifact: {e}")
+    
+    # End MLflow run
+    mlflow.end_run()
     
     return summary_results
 
@@ -1115,6 +1192,18 @@ def hyperparameter_tuning(
     logger.info(f"Starting hyperparameter tuning with {n_trials} trials")
     logger.info(f"Evaluation metric: {eval_metric}")
     
+    # Start MLflow run for hyperparameter tuning (nested if parent run exists)
+    is_nested = mlflow.active_run() is not None
+    mlflow.start_run(run_name=f"Hyperparameter_Tuning_{eval_metric}", nested=is_nested)
+    
+    # Log hyperparameter tuning configuration
+    mlflow.log_param("n_trials", n_trials)
+    mlflow.log_param("eval_metric", eval_metric)
+    mlflow.log_param("hit_rate_min_trades", hit_rate_min_trades)
+    mlflow.log_param("train_data_size", len(train_data))
+    mlflow.log_param("validation_data_size", len(validation_data))
+    mlflow.log_param("is_nested_run", is_nested)
+    
     # Get parallel processing configuration from config
     parallel_config = config.get("hyperparameter_tuning", {}).get("parallel_processing", {})
     use_parallel = parallel_config.get("enabled", True)  # Default to True for parallel
@@ -1130,11 +1219,17 @@ def hyperparameter_tuning(
         logger.info("Parallel processing disabled for hyperparameter tuning")
         n_jobs = 1
     
+    # Log parallel processing configuration
+    mlflow.log_param("use_parallel", use_parallel)
+    mlflow.log_param("n_jobs", n_jobs)
+    
     # Get minimum predictions for prediction accuracy metric
     min_predictions = config.get("training", {}).get("evaluation", {}).get("min_predictions", 10)
+    mlflow.log_param("min_predictions", min_predictions)
     
     # Get risk management parameters from config
     risk_enabled = config.get("risk_management", {}).get("enabled", False)
+    mlflow.log_param("risk_management_enabled", risk_enabled)
     
     # Set up risk management parameters if enabled
     stop_loss_pct = 0
@@ -1169,6 +1264,13 @@ def hyperparameter_tuning(
         position_size = config["environment"].get("position_size", 1)
         max_risk_per_trade_pct = config.get("risk_management", {}).get("position_sizing", {}).get("max_risk_per_trade_percentage", 1.0)
         
+        # Log risk management parameters
+        mlflow.log_param("stop_loss_pct", stop_loss_pct)
+        mlflow.log_param("take_profit_pct", take_profit_pct)
+        mlflow.log_param("trailing_stop_pct", trailing_stop_pct)
+        mlflow.log_param("position_size", position_size)
+        mlflow.log_param("max_risk_per_trade_pct", max_risk_per_trade_pct)
+        
         logger.info(f"Risk management is enabled: SL={stop_loss_pct}% (enabled={stop_loss_config.get('enabled', False)}), " +
                    f"TP={take_profit_pct}% (enabled={take_profit_config.get('enabled', False)}), " +
                    f"TS={trailing_stop_pct}% (enabled={trailing_stop_config.get('enabled', False)})")
@@ -1197,6 +1299,9 @@ def hyperparameter_tuning(
         storage=storage,
         load_if_exists=True
     )
+    
+    # Track trial metrics for MLflow
+    trial_metrics = []
     
     def objective(trial):
         # Get hyperparameter ranges from config
@@ -1276,6 +1381,45 @@ def hyperparameter_tuning(
             results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
             metric_value = results["total_return_pct"]
         
+        # Store trial metrics for MLflow logging
+        trial_data = {
+            "trial_number": trial.number,
+            "learning_rate": learning_rate,
+            "n_steps": n_steps,
+            "ent_coef": ent_coef,
+            "batch_size": batch_size,
+            "gamma": gamma,
+            "gae_lambda": gae_lambda,
+            "metric_value": metric_value,
+            "total_return_pct": results.get("total_return_pct", 0),
+            "final_portfolio_value": results.get("final_portfolio_value", 0),
+            "trade_count": results.get("trade_count", 0),
+            "hit_rate": results.get("hit_rate", 0),
+            "prediction_accuracy": results.get("prediction_accuracy", 0),
+            "correct_predictions": results.get("correct_predictions", 0),
+            "total_predictions": results.get("total_predictions", 0)
+        }
+        trial_metrics.append(trial_data)
+        
+        # Log trial metrics to MLflow
+        step = trial.number
+        mlflow.log_metric(f"trial_{eval_metric}", metric_value, step=step)
+        mlflow.log_metric("trial_learning_rate", learning_rate, step=step)
+        mlflow.log_metric("trial_n_steps", n_steps, step=step)
+        mlflow.log_metric("trial_ent_coef", ent_coef, step=step)
+        mlflow.log_metric("trial_batch_size", batch_size, step=step)
+        mlflow.log_metric("trial_total_return_pct", results.get("total_return_pct", 0), step=step)
+        mlflow.log_metric("trial_final_portfolio_value", results.get("final_portfolio_value", 0), step=step)
+        mlflow.log_metric("trial_trade_count", results.get("trade_count", 0), step=step)
+        
+        if eval_metric == "hit_rate":
+            mlflow.log_metric("trial_hit_rate", results.get("hit_rate", 0), step=step)
+            mlflow.log_metric("trial_profitable_trades", results.get("profitable_trades", 0), step=step)
+        elif eval_metric == "prediction_accuracy":
+            mlflow.log_metric("trial_prediction_accuracy", results.get("prediction_accuracy", 0), step=step)
+            mlflow.log_metric("trial_correct_predictions", results.get("correct_predictions", 0), step=step)
+            mlflow.log_metric("trial_total_predictions", results.get("total_predictions", 0), step=step)
+        
         # Log trial results
         logger.info(f"Trial {trial.number}: {eval_metric} = {metric_value:.2f}%, "
                    f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, "
@@ -1292,6 +1436,39 @@ def hyperparameter_tuning(
     # Get best parameters
     best_params = study.best_params
     best_value = study.best_value
+    
+    # Log best results to MLflow
+    mlflow.log_param("best_learning_rate", best_params.get("learning_rate", 0))
+    mlflow.log_param("best_n_steps", best_params.get("n_steps", 0))
+    mlflow.log_param("best_ent_coef", best_params.get("ent_coef", 0))
+    mlflow.log_param("best_batch_size", best_params.get("batch_size", 0))
+    mlflow.log_metric(f"best_{eval_metric}", best_value)
+    
+    # Log study statistics
+    mlflow.log_metric("total_trials", len(study.trials))
+    mlflow.log_metric("completed_trials", len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]))
+    mlflow.log_metric("failed_trials", len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]))
+    
+    # Calculate and log optimization progress metrics
+    if trial_metrics:
+        metric_values = [t["metric_value"] for t in trial_metrics]
+        mlflow.log_metric("optimization_mean", np.mean(metric_values))
+        mlflow.log_metric("optimization_std", np.std(metric_values))
+        mlflow.log_metric("optimization_min", np.min(metric_values))
+        mlflow.log_metric("optimization_max", np.max(metric_values))
+        
+        # Log improvement over trials
+        best_so_far = []
+        current_best = float('-inf')
+        for value in metric_values:
+            if value > current_best:
+                current_best = value
+            best_so_far.append(current_best)
+        
+        # Log final improvement
+        if len(best_so_far) > 1:
+            total_improvement = best_so_far[-1] - best_so_far[0]
+            mlflow.log_metric("total_improvement", total_improvement)
     
     logger.info("\n" + "="*80)
     logger.info("Hyperparameter Tuning Results:")
@@ -1317,11 +1494,25 @@ def hyperparameter_tuning(
                 fig2 = optuna.visualization.plot_param_importances(study)
                 fig2.write_image(f'models/plots/tuning/param_importances_{timestamp}.png')
                 
+                # Log plots as artifacts to MLflow
+                try:
+                    mlflow.log_artifact(f'models/plots/tuning/optimization_history_{timestamp}.png')
+                except Exception as e:
+                    logger.warning(f"Failed to log optimization history plot to MLflow: {e}")
+                
+                try:
+                    mlflow.log_artifact(f'models/plots/tuning/param_importances_{timestamp}.png')
+                except Exception as e:
+                    logger.warning(f"Failed to log parameter importances plot to MLflow: {e}")
+                
                 logger.info(f"Saved optimization visualizations to models/plots/tuning/")
             except ImportError:
                 logger.warning("Plotly is not installed. Skipping optimization visualization plots.")
         except Exception as e:
             logger.warning(f"Could not save optimization visualizations: {e}")
+    
+    # End MLflow run
+    mlflow.end_run()
     
     return {
         "best_params": best_params,
@@ -1678,8 +1869,13 @@ def plot_walk_forward_results(all_window_results: List[Dict], session_folder: st
     plt.tight_layout()
     plt.savefig(f'{session_folder}/plots/cumulative_performance_{eval_metric}.png')
     plt.close()
-
 def main():
+    # Set global seed for reproducibility
+    from utils.seeding import set_global_seed
+    seed_value = config.get("seed", 42)
+    set_global_seed(seed_value)
+    logger.info(f"Set global seed to {seed_value} for walk-forward testing")
+    
     # Create model directories if they don't exist
     os.makedirs('models', exist_ok=True)
     os.makedirs('models/logs', exist_ok=True)
@@ -1752,6 +1948,22 @@ def main():
     hyperparameter_tuning_enabled = config.get("hyperparameter_tuning", {}).get("enabled", False)
     tuning_trials = config.get("hyperparameter_tuning", {}).get("n_trials", 30)
     
+    # Check if pretraining and pretraining hyperparameter tuning are enabled
+    pretraining_config = config.get("pretraining", {})
+    use_pretraining = pretraining_config.get("enabled", True)
+    pretraining_timesteps = pretraining_config.get("timesteps", 500)
+    
+    pretraining_hp_tuning_enabled = pretraining_config.get("hyperparameter_tuning", {}).get("enabled", False)
+    pretraining_tuning_trials = pretraining_config.get("hyperparameter_tuning", {}).get("n_trials", 20)
+    
+    # Log pretraining settings
+    logger.info(f"Pretraining enabled: {use_pretraining}")
+    if use_pretraining:
+        logger.info(f"Pretraining timesteps per file: {pretraining_timesteps}")
+        logger.info(f"Pretraining hyperparameter tuning: {'Enabled' if pretraining_hp_tuning_enabled else 'Disabled'}")
+        if pretraining_hp_tuning_enabled:
+            logger.info(f"Pretraining tuning trials: {pretraining_tuning_trials}")
+    
     # Run walk-forward testing with hyperparameter tuning if enabled
     results = walk_forward_testing(
         data=full_data,
@@ -1765,7 +1977,11 @@ def main():
         n_stagnant_loops=config["training"].get("n_stagnant_loops", 3),
         improvement_threshold=config["training"].get("improvement_threshold", 0.1),
         run_hyperparameter_tuning=hyperparameter_tuning_enabled,
-        tuning_trials=tuning_trials
+        tuning_trials=tuning_trials,
+        use_pretraining=use_pretraining,
+        pretraining_timesteps=pretraining_timesteps,
+        run_pretraining_hyperparameter_tuning=pretraining_hp_tuning_enabled,
+        pretraining_tuning_trials=pretraining_tuning_trials
     )
     
     # Check if we have results

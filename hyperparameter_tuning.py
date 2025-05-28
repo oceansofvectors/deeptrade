@@ -7,6 +7,7 @@ import concurrent.futures
 import multiprocessing
 import optuna
 from stable_baselines3 import PPO
+import mlflow
 
 from environment import TradingEnv
 from config import config
@@ -215,6 +216,30 @@ def objective_func(
         elif eval_metric == "prediction_accuracy" and results.get("total_predictions", 0) < min_predictions:
             logger.warning(f"Not enough predictions ({results.get('total_predictions', 0)}) for prediction accuracy metric. Using return instead.")
     
+    # Log trial metrics to MLflow (if MLflow run is active)
+    try:
+        if mlflow.active_run():
+            step = trial.number
+            mlflow.log_metric(f"parallel_trial_{eval_metric}", metric_value, step=step)
+            mlflow.log_metric("parallel_trial_learning_rate", learning_rate, step=step)
+            mlflow.log_metric("parallel_trial_n_steps", n_steps, step=step)
+            mlflow.log_metric("parallel_trial_ent_coef", ent_coef, step=step)
+            mlflow.log_metric("parallel_trial_batch_size", batch_size, step=step)
+            mlflow.log_metric("parallel_trial_total_return_pct", results.get("total_return_pct", 0), step=step)
+            mlflow.log_metric("parallel_trial_final_portfolio_value", results.get("final_portfolio_value", 0), step=step)
+            mlflow.log_metric("parallel_trial_trade_count", results.get("trade_count", 0), step=step)
+            
+            if eval_metric == "hit_rate":
+                mlflow.log_metric("parallel_trial_hit_rate", results.get("hit_rate", 0), step=step)
+                mlflow.log_metric("parallel_trial_profitable_trades", results.get("profitable_trades", 0), step=step)
+            elif eval_metric == "prediction_accuracy":
+                mlflow.log_metric("parallel_trial_prediction_accuracy", results.get("prediction_accuracy", 0), step=step)
+                mlflow.log_metric("parallel_trial_correct_predictions", results.get("correct_predictions", 0), step=step)
+                mlflow.log_metric("parallel_trial_total_predictions", results.get("total_predictions", 0), step=step)
+    except Exception as e:
+        # Don't fail the trial if MLflow logging fails
+        logger.warning(f"Failed to log trial {trial.number} to MLflow: {e}")
+    
     # Log all hyperparameters
     logger.info(f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, ent_coef={ent_coef:.6f}, "
                f"batch_size={batch_size}, gamma={gamma:.4f}, gae_lambda={gae_lambda:.4f}")
@@ -248,16 +273,66 @@ def parallel_hyperparameter_tuning(
     logger.info(f"Starting parallel hyperparameter tuning with {n_trials} trials")
     logger.info(f"Evaluation metric: {eval_metric}")
     
+    # Start MLflow run for parallel hyperparameter tuning (nested if parent run exists)
+    is_nested = mlflow.active_run() is not None
+    mlflow.start_run(run_name=f"Parallel_Hyperparameter_Tuning_{eval_metric}", nested=is_nested)
+    
+    # Log parallel hyperparameter tuning configuration
+    mlflow.log_param("n_trials", n_trials)
+    mlflow.log_param("eval_metric", eval_metric)
+    mlflow.log_param("hit_rate_min_trades", hit_rate_min_trades)
+    mlflow.log_param("min_predictions", min_predictions)
+    mlflow.log_param("train_data_size", len(train_data))
+    mlflow.log_param("validation_data_size", len(validation_data))
+    mlflow.log_param("is_nested_run", is_nested)
+    
     # If n_jobs is -1, use all available cores
     if n_jobs == -1:
         n_jobs = multiprocessing.cpu_count()
     
     logger.info(f"Using {n_jobs} parallel workers for hyperparameter tuning")
     
+    # Log parallel processing configuration
+    mlflow.log_param("n_jobs", n_jobs)
+    mlflow.log_param("parallel_processing", True)
+    
+    # Get risk management parameters from config and log them
+    risk_config = config.get("risk_management", {})
+    risk_enabled = risk_config.get("enabled", False)
+    mlflow.log_param("risk_management_enabled", risk_enabled)
+    
+    if risk_enabled:
+        # Log risk management parameters
+        stop_loss_config = risk_config.get("stop_loss", {})
+        take_profit_config = risk_config.get("take_profit", {})
+        trailing_stop_config = risk_config.get("trailing_stop", {})
+        position_sizing_config = risk_config.get("position_sizing", {})
+        
+        mlflow.log_param("stop_loss_enabled", stop_loss_config.get("enabled", False))
+        mlflow.log_param("take_profit_enabled", take_profit_config.get("enabled", False))
+        mlflow.log_param("trailing_stop_enabled", trailing_stop_config.get("enabled", False))
+        mlflow.log_param("position_sizing_enabled", position_sizing_config.get("enabled", False))
+        
+        if stop_loss_config.get("enabled", False):
+            mlflow.log_param("stop_loss_percentage", stop_loss_config.get("percentage", 1.0))
+        if take_profit_config.get("enabled", False):
+            mlflow.log_param("take_profit_percentage", take_profit_config.get("percentage", 2.0))
+        if trailing_stop_config.get("enabled", False):
+            mlflow.log_param("trailing_stop_percentage", trailing_stop_config.get("percentage", 0.5))
+        if position_sizing_config.get("enabled", False):
+            mlflow.log_param("position_size_multiplier", position_sizing_config.get("size_multiplier", 1.0))
+            mlflow.log_param("max_risk_per_trade_percentage", position_sizing_config.get("max_risk_per_trade_percentage", 2.0))
+    
     # Create Optuna study
     study_name = f"parallel_hyperparam_tuning_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
     sampler = optuna.samplers.TPESampler(seed=config["seed"])
     study = optuna.create_study(direction="maximize", sampler=sampler, study_name=study_name)
+    
+    # Log study configuration
+    mlflow.log_param("study_name", study_name)
+    mlflow.log_param("sampler_type", "TPESampler")
+    mlflow.log_param("optimization_direction", "maximize")
+    mlflow.log_param("seed", config["seed"])
     
     # Create a partial function with fixed arguments
     from functools import partial
@@ -277,6 +352,40 @@ def parallel_hyperparameter_tuning(
     best_params = study.best_params
     best_value = study.best_value
     
+    # Log best results to MLflow
+    mlflow.log_param("best_learning_rate", best_params.get("learning_rate", 0))
+    mlflow.log_param("best_n_steps", best_params.get("n_steps", 0))
+    mlflow.log_param("best_ent_coef", best_params.get("ent_coef", 0))
+    mlflow.log_param("best_batch_size", best_params.get("batch_size", 0))
+    mlflow.log_metric(f"best_parallel_{eval_metric}", best_value)
+    
+    # Log study statistics
+    mlflow.log_metric("parallel_total_trials", len(study.trials))
+    mlflow.log_metric("parallel_completed_trials", len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]))
+    mlflow.log_metric("parallel_failed_trials", len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]))
+    
+    # Calculate and log optimization progress metrics
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if completed_trials:
+        trial_values = [t.value for t in completed_trials]
+        mlflow.log_metric("parallel_optimization_mean", np.mean(trial_values))
+        mlflow.log_metric("parallel_optimization_std", np.std(trial_values))
+        mlflow.log_metric("parallel_optimization_min", np.min(trial_values))
+        mlflow.log_metric("parallel_optimization_max", np.max(trial_values))
+        
+        # Log improvement over trials
+        best_so_far = []
+        current_best = float('-inf')
+        for value in trial_values:
+            if value > current_best:
+                current_best = value
+            best_so_far.append(current_best)
+        
+        # Log final improvement
+        if len(best_so_far) > 1:
+            total_improvement = best_so_far[-1] - best_so_far[0]
+            mlflow.log_metric("parallel_total_improvement", total_improvement)
+    
     logger.info("\n" + "="*80)
     logger.info("Hyperparameter Tuning Results:")
     logger.info(f"Best {eval_metric}: {best_value:.2f}%")
@@ -295,16 +404,30 @@ def parallel_hyperparameter_tuning(
             
             # Create optimization visualization plots
             fig1 = optuna.visualization.plot_optimization_history(study)
-            fig1.write_image(f'models/plots/tuning/optimization_history_{timestamp}.png')
+            fig1.write_image(f'models/plots/tuning/parallel_optimization_history_{timestamp}.png')
             
             fig2 = optuna.visualization.plot_param_importances(study)
-            fig2.write_image(f'models/plots/tuning/param_importances_{timestamp}.png')
+            fig2.write_image(f'models/plots/tuning/parallel_param_importances_{timestamp}.png')
             
-            logger.info(f"Saved optimization visualizations to models/plots/tuning/")
+            # Log plots as artifacts to MLflow
+            try:
+                mlflow.log_artifact(f'models/plots/tuning/parallel_optimization_history_{timestamp}.png')
+            except Exception as e:
+                logger.warning(f"Failed to log parallel optimization history plot to MLflow: {e}")
+            
+            try:
+                mlflow.log_artifact(f'models/plots/tuning/parallel_param_importances_{timestamp}.png')
+            except Exception as e:
+                logger.warning(f"Failed to log parallel parameter importances plot to MLflow: {e}")
+            
+            logger.info(f"Saved parallel optimization visualizations to models/plots/tuning/")
         except ImportError:
             logger.warning("Plotly is not installed. Skipping optimization visualization plots.")
     except Exception as e:
         logger.warning(f"Could not save optimization visualizations: {e}")
+    
+    # End MLflow run
+    mlflow.end_run()
     
     return {
         "best_params": best_params,

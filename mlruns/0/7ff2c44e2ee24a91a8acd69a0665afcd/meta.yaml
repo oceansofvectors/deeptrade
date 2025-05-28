@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/7ff2c44e2ee24a91a8acd69a0665afcd/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 7ff2c44e2ee24a91a8acd69a0665afcd
+run_name: Walk_Forward_Testing_20250524_213048
+run_uuid: 7ff2c44e2ee24a91a8acd69a0665afcd
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748143848570
+status: 1
+tags: []
+user_id: odin

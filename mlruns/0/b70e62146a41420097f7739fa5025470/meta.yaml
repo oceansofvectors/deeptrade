@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/b70e62146a41420097f7739fa5025470/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: b70e62146a41420097f7739fa5025470
+run_name: Pretraining
+run_uuid: b70e62146a41420097f7739fa5025470
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748148046434
+status: 1
+tags: []
+user_id: odin

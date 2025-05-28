@@ -57,7 +57,7 @@ def train_agent(train_data, total_timesteps: int):
         logger.info(f"Using constant learning rate: {learning_rate}")
     
     # Initialize model with configured learning rate
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=learning_rate, seed=config.get('seed'))
+    model = PPO("MlpPolicy", env, verbose=0, learning_rate=learning_rate, seed=config.get('seed'))
     
     logger.info("Starting training for %d timesteps", total_timesteps)
     model.learn(total_timesteps=total_timesteps)
@@ -66,7 +66,8 @@ def train_agent(train_data, total_timesteps: int):
 
 def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20, 
                            n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000,
-                           evaluation_metric: str = "return", model_params: dict = None, window_folder: str = None):
+                           evaluation_metric: str = "return", model_params: dict = None, window_folder: str = None,
+                           pretrained_model_path: str = None):
     """
     Train a PPO model iteratively based on validation performance.
     
@@ -81,6 +82,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         evaluation_metric (str): Metric to use for evaluation ("return", "hit_rate", or "prediction_accuracy").
         model_params (dict, optional): Model hyperparameters to use for training.
         window_folder (str, optional): Folder to save models and results.
+        pretrained_model_path (str): Path to pretrained model to use as starting point. If provided, loads this model.
         
     Returns:
         tuple: (best_model, best_results, all_results)
@@ -108,7 +110,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     logger.info(f"Total observation components: close_norm + {len(train_env.technical_indicators)} indicators + position = {1 + len(train_env.technical_indicators) + 1}")
     
     # Get verbosity level from config
-    verbose_level = config["training"].get("verbose", 1)
+    verbose_level = config["training"].get("verbose", 0)
     
     # Use provided model parameters or get defaults from config
     if model_params is None:
@@ -143,22 +145,91 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         learning_rate = model_params.get("learning_rate", 0.0003)
         logger.info(f"Using constant learning rate: {learning_rate}")
     
-    # Initialize the PPO model with the specified parameters
-    model = PPO(
-        "MlpPolicy", 
-        train_env, 
-        verbose=verbose_level,
-        ent_coef=model_params.get("ent_coef", 0.01),
-        learning_rate=learning_rate,
-        n_steps=model_params.get("n_steps", 2048),
-        batch_size=model_params.get("batch_size", 64),
-        gamma=model_params.get("gamma", 0.99),
-        seed=config.get('seed'),
-        gae_lambda=model_params.get("gae_lambda", 0.95),
-    )
+    # Initialize or use pretrained PPO model
+    if pretrained_model_path is not None:
+        logger.info("Using pretrained model as starting point")
+        
+        # Load the pretrained model
+        pretrained_model = PPO.load(pretrained_model_path)
+        
+        # Check if observation spaces match
+        if pretrained_model.observation_space.shape != train_env.observation_space.shape:
+            logger.warning(f"Observation space mismatch detected!")
+            logger.warning(f"Pretrained model expects: {pretrained_model.observation_space.shape}")
+            logger.warning(f"Current environment has: {train_env.observation_space.shape}")
+            logger.warning("Skipping pretrained model and creating new model from scratch")
+            
+            # Create a new model instead
+            model = PPO(
+                "MlpPolicy", 
+                train_env, 
+                verbose=verbose_level,
+                ent_coef=model_params.get("ent_coef", 0.01),
+                learning_rate=learning_rate,
+                n_steps=model_params.get("n_steps", 2048),
+                batch_size=model_params.get("batch_size", 64),
+                gamma=model_params.get("gamma", 0.99),
+                seed=config.get('seed'),
+                gae_lambda=model_params.get("gae_lambda", 0.95),
+            )
+        else:
+            # Log information about learning rate handling
+            if callable(learning_rate):
+                logger.info("Creating new model with learning rate schedule and copying pretrained weights")
+                logger.info("This allows us to use learning rate decay while benefiting from pretraining")
+            else:
+                logger.info("Creating new model with constant learning rate and copying pretrained weights")
+            
+            # Create a new model with the desired learning rate schedule and hyperparameters
+            model = PPO(
+                "MlpPolicy", 
+                train_env, 
+                verbose=verbose_level,
+                ent_coef=model_params.get("ent_coef", 0.01),
+                learning_rate=learning_rate,  # Use the (potentially scheduled) learning rate
+                n_steps=model_params.get("n_steps", 2048),
+                batch_size=model_params.get("batch_size", 64),
+                gamma=model_params.get("gamma", 0.99),
+                seed=config.get('seed'),
+                gae_lambda=model_params.get("gae_lambda", 0.95),
+            )
+            
+            # Copy the policy weights from the pretrained model to the new model
+            logger.info("Copying weights from pretrained model to new model")
+            try:
+                # Copy the policy network weights
+                model.policy.load_state_dict(pretrained_model.policy.state_dict())
+                
+                # Copy the value function weights if they exist
+                if hasattr(model.policy, 'value_net') and hasattr(pretrained_model.policy, 'value_net'):
+                    model.policy.value_net.load_state_dict(pretrained_model.policy.value_net.state_dict())
+                
+                logger.info("Successfully copied weights from pretrained model")
+                
+            except Exception as e:
+                logger.warning(f"Failed to copy weights from pretrained model: {e}")
+                logger.warning("Continuing with randomly initialized model")
+            
+            logger.info("Model initialization completed with pretrained weights and current hyperparameters")
+    else:
+        logger.info("Creating new model from scratch")
+        
+        # Initialize the PPO model with the specified parameters
+        model = PPO(
+            "MlpPolicy", 
+            train_env, 
+            verbose=verbose_level,
+            ent_coef=model_params.get("ent_coef", 0.01),
+            learning_rate=learning_rate,
+            n_steps=model_params.get("n_steps", 2048),
+            batch_size=model_params.get("batch_size", 64),
+            gamma=model_params.get("gamma", 0.99),
+            seed=config.get('seed'),
+            gae_lambda=model_params.get("gae_lambda", 0.95),
+        )
     
     # Initial training
-    logger.info(f"Starting initial training for {initial_timesteps} timesteps")
+    logger.info(f"Starting {'continued' if pretrained_model_path is not None else 'initial'} training for {initial_timesteps} timesteps")
     model.learn(total_timesteps=initial_timesteps)
     
     # Evaluate initial model on validation data using the specified metric
@@ -605,7 +676,8 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
 
 def train_walk_forward_model(train_data, validation_data, initial_timesteps=20000, additional_timesteps=10000, 
                          max_iterations=200, n_stagnant_loops=10, improvement_threshold=0.05, window_folder=None,
-                         run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None, model_params=None):
+                         run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None, model_params=None,
+                         pretrained_model_path=None):
     """
     Train a model using walk-forward optimization.
     
@@ -622,6 +694,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         tuning_trials (int): Number of trials for hyperparameter tuning.
         tuning_folder (str): Path to save hyperparameter tuning results.
         model_params (dict): Pre-tuned hyperparameters to use. If provided, skips tuning.
+        pretrained_model_path (str): Path to pretrained model to use as starting point. If provided, loads and uses this model.
         
     Returns:
         tuple: (trained_model, training_stats)
@@ -633,6 +706,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     logger.info(f"- max_iterations: {max_iterations}")
     logger.info(f"- n_stagnant_loops: {n_stagnant_loops}")
     logger.info(f"- improvement_threshold: {improvement_threshold}")
+    logger.info(f"- pretrained_model_path: {'Yes' if pretrained_model_path is not None else 'No'}")
     
     # Get learning rate decay configuration
     use_lr_decay = config["model"].get("use_lr_decay", False)
@@ -695,7 +769,8 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         improvement_threshold=improvement_threshold,
         evaluation_metric=evaluation_metric,
         model_params=model_params,
-        window_folder=window_folder
+        window_folder=window_folder,
+        pretrained_model_path=pretrained_model_path
     )
     
     # Save validation results
@@ -794,12 +869,13 @@ def main():
         n_stagnant_loops=n_stagnant_loops,
         improvement_threshold=improvement_threshold,
         additional_timesteps=additional_timesteps,
-        window_folder=None  # Pass None as window_folder
+        window_folder=None,  # Pass None as window_folder
+        pretrained_model_path=None  # Pass None as pretrained_model_path
     )
     
     # Final evaluation on the test data (previously unseen)
     logger.info("Performing final evaluation on test data (previously unseen)")
-    test_results = evaluate_agent(best_model, test_data, verbose=config["training"].get("verbose", 1), deterministic=True)
+    test_results = evaluate_agent(best_model, test_data, verbose=config["training"].get("verbose", 0), deterministic=True)
     
     # Log detailed evaluation results for the best model on test data
     logger.info("Final Test Results:")

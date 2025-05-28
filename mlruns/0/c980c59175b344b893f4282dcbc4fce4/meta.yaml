@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/c980c59175b344b893f4282dcbc4fce4/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: c980c59175b344b893f4282dcbc4fce4
+run_name: gaudy-bug-955
+run_uuid: c980c59175b344b893f4282dcbc4fce4
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149291742
+status: 1
+tags: []
+user_id: odin

@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/d52861b1bb7f40f480af34cd325c6929/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: d52861b1bb7f40f480af34cd325c6929
+run_name: Tuning
+run_uuid: d52861b1bb7f40f480af34cd325c6929
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748150830636
+status: 1
+tags: []
+user_id: odin

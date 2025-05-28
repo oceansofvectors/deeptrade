@@ -418,4 +418,179 @@ def get_standardized_column_names(df: pd.DataFrame,
         if col not in skip_columns and pd.api.types.is_numeric_dtype(df[col]):
             cols_to_scale.append(col)
     
-    return cols_to_scale 
+    return cols_to_scale
+
+def normalize_synthetic_episodes(synthetic_dir: str = "./synthetic", 
+                                output_dir: Optional[str] = None,
+                                feature_range: Tuple[float, float] = (-1, 1),
+                                use_sigmoid: bool = True,
+                                sigmoid_k: float = 2.0,
+                                save_scalers: bool = True) -> Dict[str, MinMaxScaler]:
+    """
+    Normalize all synthetic episode files in the specified directory.
+    
+    This function processes each CSV file in the synthetic directory as a separate episode
+    for pretraining. Each episode is normalized independently to prevent data leakage
+    between episodes.
+    
+    Args:
+        synthetic_dir: Directory containing synthetic CSV files
+        output_dir: Directory to save normalized files (if None, overwrites originals)
+        feature_range: Target range for scaled features, default (-1, 1)
+        use_sigmoid: Whether to apply sigmoid transformation after min-max scaling
+        sigmoid_k: Steepness parameter for sigmoid if used
+        save_scalers: Whether to save the scaler for each episode
+        
+    Returns:
+        Dictionary mapping episode filenames to their respective scalers
+    """
+    logger = logging.getLogger(__name__)
+    
+    if not os.path.exists(synthetic_dir):
+        logger.error(f"Synthetic directory not found: {synthetic_dir}")
+        return {}
+    
+    # Get all CSV files in the synthetic directory
+    csv_files = [f for f in os.listdir(synthetic_dir) if f.endswith('.csv')]
+    
+    if not csv_files:
+        logger.warning(f"No CSV files found in {synthetic_dir}")
+        return {}
+    
+    logger.info(f"Found {len(csv_files)} CSV files to normalize in {synthetic_dir}")
+    
+    # Set output directory
+    if output_dir is None:
+        output_dir = synthetic_dir
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    scalers = {}
+    
+    # Process each episode file
+    for csv_file in csv_files:
+        try:
+            episode_name = os.path.splitext(csv_file)[0]
+            input_path = os.path.join(synthetic_dir, csv_file)
+            output_path = os.path.join(output_dir, csv_file)
+            
+            logger.info(f"Processing episode: {episode_name}")
+            
+            # Load the episode data
+            data = pd.read_csv(input_path)
+            
+            # Check if data has the expected columns
+            expected_cols = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+            if not all(col in data.columns for col in expected_cols):
+                logger.warning(f"Episode {episode_name} missing expected columns. Skipping.")
+                continue
+            
+            # Convert timestamp to datetime if it's not already
+            if 'Timestamp' in data.columns:
+                data['Timestamp'] = pd.to_datetime(data['Timestamp'])
+            
+            # Define columns to scale (price and volume data, excluding Close)
+            cols_to_scale = ['Open', 'High', 'Low', 'Volume']  # Removed 'Close'
+            
+            # Log basic statistics for this episode
+            logger.info(f"Episode {episode_name}: {len(data)} rows, "
+                       f"Close range: [{data['Close'].min():.2f}, {data['Close'].max():.2f}], "
+                       f"Volume range: [{data['Volume'].min():.2f}, {data['Volume'].max():.2f}]")
+            
+            # Normalize the episode data
+            normalized_data, scaler = normalize_data(
+                data=data,
+                cols_to_scale=cols_to_scale,
+                feature_range=feature_range,
+                use_sigmoid=use_sigmoid,
+                sigmoid_k=sigmoid_k,
+                save_path=os.path.join(output_dir, f"{episode_name}_scaler.pkl") if save_scalers else None
+            )
+            
+            # Save the normalized episode
+            normalized_data.to_csv(output_path, index=False)
+            scalers[episode_name] = scaler
+            
+            logger.info(f"Successfully normalized and saved episode: {episode_name}")
+            
+            # Log normalized statistics (Close is NOT normalized)
+            normalized_open = normalized_data['Open']
+            normalized_volume = normalized_data['Volume']
+            close_values = normalized_data['Close']  # Not normalized
+            logger.info(f"Normalized {episode_name}: "
+                       f"Open range: [{normalized_open.min():.4f}, {normalized_open.max():.4f}], "
+                       f"Volume range: [{normalized_volume.min():.4f}, {normalized_volume.max():.4f}]")
+            logger.info(f"Close (NOT normalized): range: [{close_values.min():.4f}, {close_values.max():.4f}]")
+            
+        except Exception as e:
+            logger.error(f"Error processing episode {csv_file}: {e}")
+            continue
+    
+    logger.info(f"Successfully processed {len(scalers)} out of {len(csv_files)} episodes")
+    
+    # Save a master scaler info file
+    if save_scalers and scalers:
+        master_info = {
+            'total_episodes': len(scalers),
+            'feature_range': feature_range,
+            'use_sigmoid': use_sigmoid,
+            'sigmoid_k': sigmoid_k,
+            'processed_episodes': list(scalers.keys())
+        }
+        
+        master_info_path = os.path.join(output_dir, "normalization_info.pkl")
+        with open(master_info_path, "wb") as f:
+            pickle.dump(master_info, f)
+        logger.info(f"Saved master normalization info to {master_info_path}")
+    
+    return scalers
+
+def load_episode_scaler(episode_name: str, scalers_dir: str = "./synthetic") -> Optional[MinMaxScaler]:
+    """
+    Load a scaler for a specific episode.
+    
+    Args:
+        episode_name: Name of the episode (without .csv extension)
+        scalers_dir: Directory containing the scaler files
+        
+    Returns:
+        MinMaxScaler object or None if loading fails
+    """
+    scaler_path = os.path.join(scalers_dir, f"{episode_name}_scaler.pkl")
+    return load_scaler(scaler_path)
+
+def normalize_new_episode_with_existing_scaler(data: pd.DataFrame, 
+                                             episode_scaler: MinMaxScaler,
+                                             cols_to_scale: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Normalize a new episode using an existing scaler from a similar episode.
+    
+    Args:
+        data: DataFrame to normalize
+        episode_scaler: Pre-fitted scaler from another episode
+        cols_to_scale: List of columns to scale (if None, uses default price/volume columns)
+        
+    Returns:
+        Normalized DataFrame
+    """
+    logger = logging.getLogger(__name__)
+    
+    if cols_to_scale is None:
+        cols_to_scale = ['Open', 'High', 'Low', 'Volume']  # Removed 'Close'
+    
+    # Make a copy to avoid modifying the original data
+    normalized_data = data.copy()
+    
+    # Filter columns that actually exist in the data
+    cols_to_scale = [col for col in cols_to_scale if col in normalized_data.columns]
+    
+    if not cols_to_scale:
+        logger.warning("No columns to scale found in the data")
+        return normalized_data
+    
+    # Apply the existing scaler
+    normalized_data[cols_to_scale] = episode_scaler.transform(normalized_data[cols_to_scale])
+    
+    logger.info(f"Normalized data using existing scaler for {len(cols_to_scale)} columns")
+    
+    return normalized_data 

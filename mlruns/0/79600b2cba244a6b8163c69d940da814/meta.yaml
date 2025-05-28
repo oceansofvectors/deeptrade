@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/79600b2cba244a6b8163c69d940da814/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 79600b2cba244a6b8163c69d940da814
+run_name: gregarious-steed-514
+run_uuid: 79600b2cba244a6b8163c69d940da814
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149402578
+status: 1
+tags: []
+user_id: odin

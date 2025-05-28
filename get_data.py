@@ -406,6 +406,21 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             df['VOLUME_MA'] = df['VOLUME_NORM']
             model_columns.append('VOLUME_MA')
         
+        # OBV_NORM from OBV (missing from original code)
+        if 'OBV' in df.columns and 'OBV_NORM' not in df.columns:
+            df['OBV_NORM'] = df['OBV']
+            model_columns.append('OBV_NORM')
+            
+        # PSAR_NORM from PSAR (missing from original code)
+        if 'PSAR' in df.columns and 'PSAR_NORM' not in df.columns:
+            df['PSAR_NORM'] = df['PSAR']
+            model_columns.append('PSAR_NORM')
+            
+        # VWAP_NORM from VWAP (missing from original code)
+        if 'VWAP' in df.columns and 'VWAP_NORM' not in df.columns:
+            df['VWAP_NORM'] = df['VWAP']
+            model_columns.append('VWAP_NORM')
+        
         # Two-stage normalization for technical indicators using only training data statistics
         logger.info("Calculating technical indicators completed. Normalization will be performed per window to avoid data leakage.")
         

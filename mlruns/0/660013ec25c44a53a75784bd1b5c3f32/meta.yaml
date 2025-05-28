@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/660013ec25c44a53a75784bd1b5c3f32/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 660013ec25c44a53a75784bd1b5c3f32
+run_name: popular-mole-554
+run_uuid: 660013ec25c44a53a75784bd1b5c3f32
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748147272485
+status: 1
+tags: []
+user_id: odin

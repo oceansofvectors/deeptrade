@@ -1,0 +1,1 @@
+{'enabled': True, 'length': 20, 'multiplier': 4, 'smooth_periods': 3, 'lookback_periods': 2}

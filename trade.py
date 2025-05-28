@@ -1411,7 +1411,7 @@ def main():
         max_risk_per_trade_pct=max_risk_per_trade_pct,
         initial_balance=config["environment"]["initial_balance"],
         transaction_cost=config["environment"].get("transaction_cost", 0.0),
-        verbose=config["training"].get("verbose", 1),
+        verbose=config["training"].get("verbose", 0),
         deterministic=True,  # Use deterministic action selection for trading
         close_at_end_of_day=True,  # Close positions at the end of the trading day
         daily_risk_limit=daily_risk_limit,  # Add daily risk limit parameter

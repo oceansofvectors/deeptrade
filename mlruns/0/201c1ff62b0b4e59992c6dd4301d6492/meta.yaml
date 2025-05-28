@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/201c1ff62b0b4e59992c6dd4301d6492/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 201c1ff62b0b4e59992c6dd4301d6492
+run_name: brawny-yak-200
+run_uuid: 201c1ff62b0b4e59992c6dd4301d6492
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149794390
+status: 1
+tags: []
+user_id: odin

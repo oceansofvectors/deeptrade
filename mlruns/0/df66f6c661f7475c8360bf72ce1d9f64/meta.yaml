@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/df66f6c661f7475c8360bf72ce1d9f64/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: df66f6c661f7475c8360bf72ce1d9f64
+run_name: amusing-grub-603
+run_uuid: df66f6c661f7475c8360bf72ce1d9f64
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149457917
+status: 1
+tags: []
+user_id: odin

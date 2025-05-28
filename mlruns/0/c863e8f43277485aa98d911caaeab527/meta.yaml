@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/c863e8f43277485aa98d911caaeab527/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: c863e8f43277485aa98d911caaeab527
+run_name: classy-kit-569
+run_uuid: c863e8f43277485aa98d911caaeab527
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149368289
+status: 1
+tags: []
+user_id: odin

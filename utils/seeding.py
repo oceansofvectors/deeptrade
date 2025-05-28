@@ -16,5 +16,9 @@ def set_global_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def seed_worker(window_idx: int):
-    set_global_seed(seed_value + window_idx)
+def seed_worker(base_seed: int):
+    """Initialize worker process with a unique seed based on the process ID."""
+    # Use process ID to create unique seed for each worker
+    process_id = multiprocessing.current_process().pid
+    unique_seed = base_seed + (process_id % 10000)  # Mod to keep numbers reasonable
+    set_global_seed(unique_seed)

@@ -1,0 +1,15 @@
+artifact_uri: mlflow-artifacts:/0/1d0768f26b804bdd9bebc1f6ab234ea4/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 1d0768f26b804bdd9bebc1f6ab234ea4
+run_name: upset-ape-485
+run_uuid: 1d0768f26b804bdd9bebc1f6ab234ea4
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748149718572
+status: 1
+tags: []
+user_id: odin
