@@ -11,7 +11,7 @@ from collections import defaultdict
 
 from stable_baselines3 import PPO
 from environment import TradingEnv
-from get_data import get_data
+from data import get_data
 from config import config
 import money  # Import the new money module
 
@@ -583,25 +583,12 @@ def trade_with_risk_management(
     # Track daily portfolio values
     daily_portfolio_values = {}
     
-    # Make sure all column names are consistent
-    if 'close' in test_data.columns and 'Close' not in test_data.columns:
-        # Use lowercase column names consistently
-        required_columns = ['close', 'high', 'low', 'open']
-        column_mapping = {}
-        for col in test_data.columns:
-            if col.lower() in required_columns and col != col.lower():
-                column_mapping[col] = col.lower()
-        if column_mapping:
-            test_data = test_data.rename(columns=column_mapping)
-    elif 'Close' in test_data.columns and 'close' not in test_data.columns:
-        # Use uppercase column names consistently
-        required_columns = ['Close', 'High', 'Low', 'Open']
-        column_mapping = {}
-        for col in test_data.columns:
-            if col.upper() in [c.upper() for c in required_columns] and col != col.upper():
-                column_mapping[col] = col.upper()
-        if column_mapping:
-            test_data = test_data.rename(columns=column_mapping)
+    # Ensure all required columns are present (assume lowercase format)
+    required_columns = ['close', 'high', 'low', 'open']
+    missing_columns = [col for col in required_columns if col not in test_data.columns]
+    if missing_columns:
+        logger.error(f"Missing required columns: {missing_columns}")
+        raise ValueError(f"Test data is missing required columns: {missing_columns}")
     
     # Debug log the column names after standardization
     logger.info(f"Column names after standardization: {test_data.columns.tolist()}")
@@ -627,19 +614,10 @@ def trade_with_risk_management(
         current_date = test_data.index[i]
         current_date_et = current_date.tz_convert('America/New_York')
         
-        # Get price data using the actual column names from the DataFrame
-        if 'CLOSE' in test_data.columns:
-            current_price = test_data['CLOSE'].iloc[i]
-            current_high = test_data['HIGH'].iloc[i]
-            current_low = test_data['LOW'].iloc[i]
-        elif 'Close' in test_data.columns:
-            current_price = test_data['Close'].iloc[i]
-            current_high = test_data['High'].iloc[i]
-            current_low = test_data['Low'].iloc[i]
-        else:
-            current_price = test_data['close'].iloc[i]
-            current_high = test_data['high'].iloc[i]
-            current_low = test_data['low'].iloc[i]
+        # Get price data (assuming lowercase column names)
+        current_price = test_data['close'].iloc[i]
+        current_high = test_data['high'].iloc[i]
+        current_low = test_data['low'].iloc[i]
         
         # Check daily risk limit
         daily_limit_exceeded, limit_reason = risk_manager.check_daily_risk_limit(current_date)
@@ -751,12 +729,7 @@ def trade_with_risk_management(
                     logger.info(f"Second-to-last candle of day detected at {current_date_et}. Closing position.")
                 
                 # For second-to-last candle exit, use open price instead of close price
-                if 'OPEN' in test_data.columns:
-                    exit_price = test_data.loc[test_data.index[i], "OPEN"]
-                elif 'Open' in test_data.columns:
-                    exit_price = test_data.loc[test_data.index[i], "Open"]
-                else:
-                    exit_price = test_data.loc[test_data.index[i], "open"]
+                exit_price = test_data.loc[test_data.index[i], "open"]
                 
                 # Record portfolio value before exit for profit checking
                 portfolio_before_exit = risk_manager.net_worth

@@ -161,7 +161,6 @@ Desktop.ini
 *.dat
 *.out
 *.pid
-*.gz
 *.zip
 
 # Logs
@@ -170,5 +169,4 @@ logs/
 
 models 
 plots
-data
 trader_state.pkl

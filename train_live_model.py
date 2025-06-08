@@ -15,7 +15,7 @@ from typing import List, Dict, Tuple, Optional, Union
 
 # Import custom modules
 from config import config
-from get_data import process_technical_indicators, ensure_numeric
+from data import process_technical_indicators, ensure_numeric
 import money  # Import for formatting functions
 from normalization import scale_window, get_standardized_column_names  # Add normalization module
 
@@ -161,12 +161,11 @@ def normalize_window_data(data: pd.DataFrame, window_folder: str) -> pd.DataFram
     test_data = data.iloc[validation_split_idx:].copy()
     
     # Get columns to normalize
-    skip_columns = [
-        'close_norm', 'position', 'trend_direction', 'supertrend', 
-        'time', 'timestamp', 'date', 'DOW', 
-        'Up Trend', 'Down Trend', 'open', 'high', 'low', 'close', 
-        'Open', 'High', 'Low', 'Close', 'Volume', 'volume'
-    ]
+            skip_columns = [
+            'close_norm', 'position', 'trend_direction', 'supertrend',
+            'time', 'timestamp', 'date', 'DOW', 
+            'Up Trend', 'Down Trend', 'open', 'high', 'low', 'close', 'volume'
+        ]
     cols_to_scale = get_standardized_column_names(data, skip_columns)
     
     logger.info(f"Normalizing {len(cols_to_scale)} columns: {cols_to_scale}")

@@ -12,7 +12,7 @@ from stable_baselines3 import PPO
 from ib_insync import MarketOrder, Order, LimitOrder, StopOrder, BracketOrder # Future, Contract may not be needed directly if ib_instance handles it
 
 from config import config
-from get_data import process_technical_indicators # ensure_numeric is a dependency of this
+from data import process_technical_indicators # ensure_numeric is a dependency of this
 from normalization import load_scaler, normalize_data, get_standardized_column_names
 
 logger = logging.getLogger(__name__)
