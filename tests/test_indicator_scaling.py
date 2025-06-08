@@ -89,29 +89,29 @@ def test_indicator_scaling():
         logger.info(f"  {col}: train={train_data[col].min():.2f} to {train_data[col].max():.2f}, "
                    f"test={test_data[col].min():.2f} to {test_data[col].max():.2f}")
     
-    # Test our new window-based scaling function
+    # Test our sigmoid transformation function
     cols_to_scale = ['IND1', 'IND2', 'IND3']
-    scaler, train_scaled, val_scaled, test_scaled = scale_window(
+    sigmoid_params, train_scaled, val_scaled, test_scaled = scale_window(
         train_data=train_data,
         val_data=val_data,
         test_data=test_data,
         cols_to_scale=cols_to_scale,
-        feature_range=(-1, 1)
+        sigmoid_k=2.0
     )
     
-    # Verify proper scaling in train set
-    logger.info("\nWindow-based scaling results:")
+    # Verify proper sigmoid transformation in train set
+    logger.info("\nSigmoid transformation results:")
     for col in cols_to_scale:
         train_min, train_max = train_scaled[col].min(), train_scaled[col].max()
         test_min, test_max = test_scaled[col].min(), test_scaled[col].max()
         logger.info(f"  {col}: train=({train_min:.2f} to {train_max:.2f}), "
                    f"test=({test_min:.2f} to {test_max:.2f})")
         
-        # Check if test data exceeds boundaries, which confirms no leakage
-        if test_min < -1 or test_max > 1:
-            logger.info(f"  ✓ {col} test data exceeds [-1, 1] range, confirming no leakage")
+        # Sigmoid always keeps values within (-1, 1), even for extreme data
+        if -1 < test_min < 1 and -1 < test_max < 1:
+            logger.info(f"  ✓ {col} all data properly bounded within (-1, 1) range")
         else:
-            logger.warning(f"  ✗ {col} test data within [-1, 1] range, possible issue")
+            logger.warning(f"  ✗ {col} data outside expected sigmoid range")
     
     # For comparison, show what happens with global scaling (the leaky approach)
     logger.info("\nFor comparison - Global scaling (leaky approach):")

@@ -210,11 +210,12 @@ class WalkForwardTester:
         
         logger.info(f"Processing window {window_idx}")
         
-        # Scale data to prevent leakage
+        # Apply sigmoid transformation to prevent leakage
         cols_to_scale = get_standardized_column_names(train_data)
-        scaler, train_data, validation_data, test_data = scale_window(
+        sigmoid_params, train_data, validation_data, test_data = scale_window(
             train_data, validation_data, test_data, cols_to_scale, 
-            feature_range=(-1, 1), window_folder=window_folder
+            window_folder=window_folder,
+            sigmoid_k=2.0  # Use sigmoid transformation only
         )
         
         # Train model

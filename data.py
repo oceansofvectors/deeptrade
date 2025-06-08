@@ -191,20 +191,9 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 logger.warning(f"Found NaN values in {col} column. Filling with forward fill.")
                 df[col] = df[col].fillna(method='ffill')
         
-        # Calculate normalized close
-        window = 100  # Use last 100 bars for min-max scaling
-        # For each point, calculate min/max over the previous window periods
-        rolling_min = df['close'].rolling(window=window, min_periods=1).min()
-        rolling_max = df['close'].rolling(window=window, min_periods=1).max()
-        
-        # Avoid division by zero and ensure values are in [0, 1]
-        df['close_norm'] = np.where(
-            rolling_max > rolling_min,
-            (df['close'] - rolling_min) / (rolling_max - rolling_min),
-            0.5  # Default to middle value when there's no range
-        )
-        # Ensure NaN values are filled
-        df['close_norm'] = df['close_norm'].fillna(0.5)
+        # Create close_norm column for normalization (copy of close)
+        # This will be normalized by normalization.py using sigmoid transformation
+        df['close_norm'] = df['close'].copy()
         
         # Add all the requested technical indicators using the individual modules
         
@@ -351,7 +340,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         df['position'] = 0  # Initialize with no position
         
         # Initial list of model columns for observation space
-        model_columns = ['close', 'close_norm', 'DOW_SIN', 'DOW_COS']
+        model_columns = ['close_norm', 'DOW_SIN', 'DOW_COS']
         
         # Add minutes since open indicators if present
         if 'MSO_SIN' in df.columns and 'MSO_COS' in df.columns:
@@ -360,8 +349,9 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         # Add position for the environment
         model_columns.append('position')
         
-        # List of indicators that need normalization
-        indicators_to_normalize = []
+        # Use get_standardized_column_names to determine which columns need normalization
+        indicators_to_normalize = get_standardized_column_names(df)
+        logger.info(f"Columns identified for normalization: {indicators_to_normalize}")
         
         # Add supertrend if it exists
         if 'supertrend' in df.columns:
@@ -374,16 +364,12 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                          'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP', 'RRCF_ANOMALY', 'ZScore']:
             if indicator in df.columns:
                 model_columns.append(indicator)
-                
-                # Skip indicators that are already guaranteed to be within bounds
-                if indicator not in ['supertrend', 'RSI', 'PSAR_DIR', 'RRCF_ANOMALY']:
-                    indicators_to_normalize.append(indicator)
         
         # Fill any remaining NaN values
         df = df.fillna(0)
         
-        # Two-stage normalization for technical indicators using only training data statistics
-        logger.info("Calculating technical indicators completed. Normalization will be performed per window to avoid data leakage.")
+        # Normalization will be handled by normalization.py using sigmoid transformation
+        logger.info("Calculating technical indicators completed. Normalization will be performed per window using sigmoid transformation to avoid data leakage.")
         
         return df
     except Exception as e:
@@ -549,14 +535,14 @@ def get_data(symbol: str = "NQ=F",
                 cols_to_normalize = get_standardized_column_names(df)
                 logger.info(f"Normalizing {len(cols_to_normalize)} columns using MinMaxScaler")
                 
-                # Use scale_window function to normalize data
-                # This uses MinMaxScaler with default range (-1, 1)
-                scaler, train_df_norm, validation_df_norm, test_df_norm = scale_window(
+                # Use scale_window function to apply sigmoid transformation
+                # This applies sigmoid transformation mapping to (-1, 1) range
+                sigmoid_params, train_df_norm, validation_df_norm, test_df_norm = scale_window(
                     train_data=train_df, 
                     val_data=validation_df, 
                     test_data=test_df, 
                     cols_to_scale=cols_to_normalize,
-                    feature_range=(-1, 1)
+                    sigmoid_k=2.0  # Use sigmoid transformation only
                 )
                 
                 # Save normalized DataFrames
@@ -564,13 +550,13 @@ def get_data(symbol: str = "NQ=F",
                 validation_df_norm.to_csv('data/validation_df_normalized.csv')
                 test_df_norm.to_csv('data/test_df_normalized.csv')
                 
-                # Save the scaler
-                if scaler is not None:
+                # Save the sigmoid parameters
+                if sigmoid_params:
                     os.makedirs('data/models', exist_ok=True)
                     import pickle
-                    with open('data/models/feature_scaler.pkl', 'wb') as f:
-                        pickle.dump(scaler, f)
-                    logger.info("Saved feature scaler to data/models/feature_scaler.pkl")
+                    with open('data/models/sigmoid_params.pkl', 'wb') as f:
+                        pickle.dump(sigmoid_params, f)
+                    logger.info("Saved sigmoid parameters to data/models/sigmoid_params.pkl")
                 
                 logger.info("Normalized data saved to data/train_df_normalized.csv, data/validation_df_normalized.csv, and data/test_df_normalized.csv")
             except Exception as e:

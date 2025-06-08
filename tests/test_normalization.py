@@ -73,34 +73,36 @@ class TestNormalization(unittest.TestCase):
         train_indicator2_mean = self.train_data['indicator2'].mean()
         
         # Call scale_window
-        scaler, train_scaled, val_scaled, test_scaled = scale_window(
+        sigmoid_params, train_scaled, val_scaled, test_scaled = scale_window(
             self.train_data,
             self.val_data,
             self.test_data,
             cols_to_scale,
-            feature_range=(-1, 1),
-            window_folder=self.test_dir
+            window_folder=self.test_dir,
+            sigmoid_k=2.0
         )
         
-        # Check that scaler was created
-        self.assertIsNotNone(scaler)
+        # Check that sigmoid parameters were created
+        self.assertIsNotNone(sigmoid_params)
         
-        # Check that scaler was saved
-        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "indicator_scaler.pkl")))
+        # Check that sigmoid parameters were saved
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "sigmoid_params.pkl")))
         
         # Check that data was transformed
         self.assertNotEqual(train_indicator1_mean, train_scaled['indicator1'].mean())
         self.assertNotEqual(train_indicator2_mean, train_scaled['indicator2'].mean())
         
-        # Verify scaling is within range
-        self.assertTrue(train_scaled['indicator1'].min() >= -1)
-        self.assertTrue(train_scaled['indicator1'].max() <= 1)
-        self.assertTrue(train_scaled['indicator2'].min() >= -1)
-        self.assertTrue(train_scaled['indicator2'].max() <= 1)
+        # Verify sigmoid transformation is within range (-1, 1)
+        self.assertTrue(train_scaled['indicator1'].min() > -1)
+        self.assertTrue(train_scaled['indicator1'].max() < 1)
+        self.assertTrue(train_scaled['indicator2'].min() > -1)
+        self.assertTrue(train_scaled['indicator2'].max() < 1)
         
-        # Out-of-range values may exist in test data since it has more extreme values
-        self.assertTrue(test_scaled['indicator1'].min() < -1 or test_scaled['indicator1'].max() > 1 or
-                       test_scaled['indicator2'].min() < -1 or test_scaled['indicator2'].max() > 1)
+        # Sigmoid always keeps values within (-1, 1) even for extreme test data
+        self.assertTrue(test_scaled['indicator1'].min() > -1)
+        self.assertTrue(test_scaled['indicator1'].max() < 1)
+        self.assertTrue(test_scaled['indicator2'].min() > -1)
+        self.assertTrue(test_scaled['indicator2'].max() < 1)
         
         # Check that non-scaled columns are unchanged
         np.testing.assert_array_equal(self.train_data['close'].values, train_scaled['close'].values)

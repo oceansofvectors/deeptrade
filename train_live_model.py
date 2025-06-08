@@ -173,15 +173,13 @@ def normalize_window_data(data: pd.DataFrame, window_folder: str) -> pd.DataFram
     # Use feature range from config
     feature_range = config.get("normalization", {}).get("feature_range", (-1, 1))
     
-    # Normalize the data
-    scaler, normalized_train, normalized_val, normalized_test = scale_window(
+    # Apply sigmoid transformation to the data
+    sigmoid_params, normalized_train, normalized_val, normalized_test = scale_window(
         train_data=train_data,
         val_data=validation_data,
         test_data=test_data,
         cols_to_scale=cols_to_scale,
-        feature_range=feature_range,
         window_folder=window_folder,
-        use_sigmoid=config.get("normalization", {}).get("use_sigmoid", True),
         sigmoid_k=config.get("normalization", {}).get("sigmoid_k", 2.0)
     )
     
