@@ -16,6 +16,7 @@ import optuna
 from environment import TradingEnv
 from data import get_data
 from train import ModelTrainer, ModelEvaluator, save_trade_history
+from data_augmentation import DataAugmenter
 from config import config
 import money
 from utils.seeding import seed_worker
@@ -222,14 +223,33 @@ class WalkForwardTester:
         trainer = ModelTrainer(train_data, validation_data)
         training_config = self.config.get("training", {})
         
-        model, training_info = trainer.train_with_validation(
-            initial_timesteps=training_config.get("total_timesteps", 20000),
-            additional_timesteps=training_config.get("additional_timesteps", 5000),
-            max_iterations=training_config.get("max_iterations", 10),
-            patience=training_config.get("n_stagnant_loops", 3),
-            improvement_threshold=training_config.get("improvement_threshold", 0.1),
-            save_path=window_folder
-        )
+        # Check if data augmentation is enabled
+        use_augmentation = training_config.get("data_augmentation", {}).get("enabled", False)
+        
+        if use_augmentation:
+            logger.info(f"Training with data augmentation for window {window_idx}")
+            augmentation_config = training_config.get("data_augmentation", {}).get("config", None)
+            
+            model, training_info = trainer.train_with_augmented_data(
+                initial_timesteps=training_config.get("total_timesteps", 20000),
+                additional_timesteps=training_config.get("additional_timesteps", 5000),
+                max_iterations=training_config.get("max_iterations", 10),
+                patience=training_config.get("n_stagnant_loops", 3),
+                improvement_threshold=training_config.get("improvement_threshold", 0.1),
+                save_path=window_folder,
+                use_data_augmentation=True,
+                augmentation_config=augmentation_config
+            )
+        else:
+            logger.info(f"Training without data augmentation for window {window_idx}")
+            model, training_info = trainer.train_with_validation(
+                initial_timesteps=training_config.get("total_timesteps", 20000),
+                additional_timesteps=training_config.get("additional_timesteps", 5000),
+                max_iterations=training_config.get("max_iterations", 10),
+                patience=training_config.get("n_stagnant_loops", 3),
+                improvement_threshold=training_config.get("improvement_threshold", 0.1),
+                save_path=window_folder
+            )
         
         # Plot training progress
         if training_info and 'history' in training_info:
@@ -246,10 +266,12 @@ class WalkForwardTester:
         return {
             'window': window_idx,
             'return': test_results['total_return_pct'],
+            'sharpe_ratio': test_results.get('sharpe_ratio', 0),
             'portfolio_value': test_results['final_portfolio_value'],
             'trade_count': test_results['trade_count'],
             'hit_rate': test_results.get('hit_rate', 0),
             'prediction_accuracy': test_results.get('prediction_accuracy', 0),
+            'portfolio_bankrupted': test_results.get('portfolio_bankrupted', False),
             'window_folder': window_folder
         }
     
@@ -259,19 +281,28 @@ class WalkForwardTester:
             return {'error': 'No results to aggregate'}
         
         returns = [r['return'] for r in results]
+        sharpe_ratios = [r.get('sharpe_ratio', 0) for r in results]
         portfolio_values = [r['portfolio_value'] for r in results]
         trade_counts = [r['trade_count'] for r in results]
         hit_rates = [r.get('hit_rate', 0) for r in results]
         prediction_accuracies = [r.get('prediction_accuracy', 0) for r in results]
+        bankruptcies = [r.get('portfolio_bankrupted', False) for r in results]
+        
+        # Count bankrupted windows
+        bankrupted_windows = sum(bankruptcies)
         
         summary = {
             'num_windows': len(results),
             'avg_return': np.mean(returns),
             'std_return': np.std(returns),
+            'avg_sharpe_ratio': np.mean(sharpe_ratios),
+            'std_sharpe_ratio': np.std(sharpe_ratios),
             'avg_portfolio': np.mean(portfolio_values),
             'avg_trades': np.mean(trade_counts),
             'avg_hit_rate': np.mean(hit_rates),
             'avg_prediction_accuracy': np.mean(prediction_accuracies),
+            'bankrupted_windows': bankrupted_windows,
+            'bankruptcy_rate': (bankrupted_windows / len(results)) * 100 if results else 0,
             'all_window_results': results,
             'timestamp': timestamp
         }
@@ -283,6 +314,9 @@ class WalkForwardTester:
             json.dump(summary_for_json, f, indent=4, default=str)
         
         logger.info(f"Walk-forward testing complete. Average return: {summary['avg_return']:.2f}%")
+        logger.info(f"Average Sharpe ratio: {summary['avg_sharpe_ratio']:.2f}")
+        if summary['bankrupted_windows'] > 0:
+            logger.warning(f"Bankruptcy Alert: {summary['bankrupted_windows']} windows ({summary['bankruptcy_rate']:.1f}%) resulted in portfolio bankruptcy")
         return summary
 
 def load_tradingview_data(csv_filepath: str) -> pd.DataFrame:
@@ -377,8 +411,11 @@ def main():
         print(f"\nWalk-Forward Testing Complete!")
         print(f"Number of windows: {results['num_windows']}")
         print(f"Average return: {results['avg_return']:.2f}% ± {results['std_return']:.2f}%")
+        print(f"Average Sharpe ratio: {results['avg_sharpe_ratio']:.2f} ± {results['std_sharpe_ratio']:.2f}")
         print(f"Average portfolio value: ${results['avg_portfolio']:.2f}")
         print(f"Average trades per window: {results['avg_trades']:.1f}")
+        if results.get('bankrupted_windows', 0) > 0:
+            print(f"⚠️  BANKRUPTCY WARNING: {results['bankrupted_windows']} windows ({results['bankruptcy_rate']:.1f}%) went bankrupt (-100% loss)")
         print(f"Results saved to: models/session_{results['timestamp']}")
     else:
         print(f"Error: {results['error']}")

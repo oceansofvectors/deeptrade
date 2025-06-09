@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import json
 from typing import Dict, List, Tuple
+import numpy as np
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
@@ -13,6 +14,7 @@ from data import get_data
 from config import config
 import money
 from utils.seeding import set_global_seed
+from data_augmentation import DataAugmenter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,13 +26,15 @@ class ModelTrainer:
         self.train_data = train_data
         self.validation_data = validation_data
         self.config = config
+        self.data_augmenter = DataAugmenter(random_seed=self.config.get('seed', 42))
         
     def create_model(self, model_params: Dict = None) -> PPO:
         """Create a PPO model with specified parameters."""
         env = TradingEnv(
             self.train_data,
             initial_balance=self.config["environment"]["initial_balance"],
-            position_size=self.config["environment"].get("position_size", 1)
+            position_size=self.config["environment"].get("position_size", 1),
+            returns_window=self.config["environment"].get("returns_window", 30)
         )
         check_env(env, skip_render_check=True)
         
@@ -92,6 +96,135 @@ class ModelTrainer:
         logger.info("Training completed")
         return model
     
+    def train_with_augmented_data(self,
+                                initial_timesteps: int = 20000,
+                                additional_timesteps: int = 10000,
+                                max_iterations: int = 20,
+                                patience: int = 3,
+                                improvement_threshold: float = 0.1,
+                                model_params: Dict = None,
+                                save_path: str = None,
+                                use_data_augmentation: bool = True,
+                                augmentation_config: Dict = None) -> Tuple[PPO, Dict]:
+        """Train model with data augmentation and validation-based early stopping."""
+        
+        if self.validation_data is None:
+            raise ValueError("Validation data required for iterative training")
+        
+        # Create augmented datasets if enabled
+        if use_data_augmentation:
+            logger.info("Creating augmented training datasets")
+            
+            if augmentation_config is None:
+                # Default augmentation configuration
+                augmentation_config = {
+                    'jittering': {
+                        'enabled': True,
+                        'num_datasets': 2,
+                        'config': {
+                            'price_noise_std': 0.0005,  # Smaller noise for stability
+                            'indicator_noise_std': 0.01,
+                            'volume_noise_std': 0.03
+                        }
+                    },
+                    'cutpaste': {
+                        'enabled': True,
+                        'num_datasets': 1,
+                        'config': {
+                            'segment_size_range': (30, 100),
+                            'num_operations': 1,
+                            'preserve_trend': True
+                        }
+                    },
+                    'bootstrap': {
+                        'enabled': False,  # Disable bootstrap for now
+                        'num_datasets': 1,
+                        'sample_ratio': 0.9
+                    }
+                }
+            
+            augmented_datasets = self.data_augmenter.augment_with_multiple_strategies(
+                self.train_data, augmentation_config
+            )
+            logger.info(f"Created {len(augmented_datasets)} training datasets for multi-episode training")
+        else:
+            augmented_datasets = [self.train_data]
+        
+        # Initialize model with first dataset
+        model = self.create_model(model_params)
+        evaluator = ModelEvaluator()
+        
+        # Track training across all datasets
+        best_results = None
+        best_model = None
+        best_metric = float('-inf')
+        patience_counter = 0
+        training_history = []
+        
+        # Initial training on first dataset
+        logger.info(f"Initial training on dataset 1/{len(augmented_datasets)} for {initial_timesteps} timesteps")
+        model.learn(total_timesteps=initial_timesteps)
+        
+        # Initial evaluation
+        best_results = evaluator.evaluate(model, self.validation_data)
+        best_model = model
+        best_metric = self._get_metric_value(best_results)
+        training_history.append(best_results)
+        
+        if save_path:
+            os.makedirs(save_path, exist_ok=True)
+            model.save(os.path.join(save_path, "best_model"))
+        
+        # Iterative training with multiple datasets
+        for iteration in range(1, max_iterations + 1):
+            # Cycle through augmented datasets
+            dataset_idx = iteration % len(augmented_datasets)
+            current_dataset = augmented_datasets[dataset_idx]
+            
+            logger.info(f"Iteration {iteration}: training on dataset {dataset_idx+1}/{len(augmented_datasets)} for {additional_timesteps} timesteps")
+            
+            # Create new environment with current dataset
+            # Each dataset gets a fresh environment to ensure proper episode boundaries
+            env = TradingEnv(
+                current_dataset,
+                initial_balance=self.config["environment"]["initial_balance"],
+                position_size=self.config["environment"].get("position_size", 1),
+                returns_window=self.config["environment"].get("returns_window", 30)
+            )
+            
+            # Update model environment - this ensures fresh episodes start from beginning
+            # of each dataset rather than continuing from previous dataset's final state
+            model.set_env(env)
+            
+            # Train on the new dataset - PPO will handle episode resets internally
+            # reset_num_timesteps=False keeps the global timestep counter continuous
+            model.learn(total_timesteps=additional_timesteps, reset_num_timesteps=False)
+            
+            # Evaluate on validation data
+            results = evaluator.evaluate(model, self.validation_data)
+            current_metric = self._get_metric_value(results)
+            training_history.append(results)
+            
+            improvement = current_metric - best_metric
+            logger.info(f"Iteration {iteration}: metric = {current_metric:.2f}%, improvement = {improvement:.2f}%")
+            
+            if improvement > improvement_threshold:
+                best_metric = current_metric
+                best_model = model
+                best_results = results
+                patience_counter = 0
+                
+                if save_path:
+                    model.save(os.path.join(save_path, "best_model"))
+                logger.info(f"New best model! Metric: {best_metric:.2f}%")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    logger.info(f"Early stopping after {patience} iterations without improvement")
+                    break
+        
+        return best_model, {"best_results": best_results, "history": training_history}
+
     def train_with_validation(self, 
                             initial_timesteps: int = 20000,
                             additional_timesteps: int = 10000,
@@ -155,12 +288,14 @@ class ModelTrainer:
     
     def _get_metric_value(self, results: Dict) -> float:
         """Extract the metric value based on config."""
-        metric = self.config.get("training", {}).get("evaluation", {}).get("metric", "return")
+        metric = self.config.get("training", {}).get("evaluation", {}).get("metric", "sharpe_ratio")
         
         if metric == "hit_rate":
             return results.get("hit_rate", 0)
         elif metric == "prediction_accuracy":
             return results.get("prediction_accuracy", 0)
+        elif metric == "sharpe_ratio":
+            return results.get("sharpe_ratio", 0)
         else:
             return results.get("total_return_pct", 0)
 
@@ -180,7 +315,8 @@ class ModelEvaluator:
             test_data,
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 0.0),
-            position_size=config["environment"].get("position_size", 1)
+            position_size=config["environment"].get("position_size", 1),
+            returns_window=config["environment"].get("returns_window", 30)
         )
         
         # Run evaluation
@@ -189,6 +325,7 @@ class ModelEvaluator:
         
         portfolio_history = [float(env.net_worth)]
         action_history = []
+        portfolio_bankrupted = False
         
         done = False
         step_count = 0
@@ -200,22 +337,36 @@ class ModelEvaluator:
             obs, reward, terminated, truncated, info = env.step(int(action))
             done = terminated or truncated
             
+            # Check if portfolio was bankrupted
+            if info.get("portfolio_bankrupted", False):
+                portfolio_bankrupted = True
+                logger.warning(f"Portfolio bankrupted during evaluation at step {step_count}")
+            
             portfolio_history.append(float(env.net_worth))
             step_count += 1
         
         # Calculate metrics
         final_balance = env.net_worth
-        total_return_pct = money.calculate_return_pct(final_balance, initial_balance)
+        
+        # If portfolio was bankrupted, return exactly -100%
+        if portfolio_bankrupted:
+            total_return_pct = -100.0
+            sharpe_ratio = -999.0  # Very negative Sharpe for bankruptcy
+        else:
+            total_return_pct = money.calculate_return_pct(final_balance, initial_balance)
+            sharpe_ratio = self._calculate_sharpe_ratio(portfolio_history)
         
         return {
             "final_portfolio_value": float(final_balance),
             "total_return_pct": float(total_return_pct),
+            "sharpe_ratio": float(sharpe_ratio),
             "trade_count": step_count,
             "hit_rate": self._calculate_hit_rate(action_history, test_data),
             "prediction_accuracy": self._calculate_prediction_accuracy(action_history, test_data),
             "portfolio_history": portfolio_history,
             "action_history": action_history,
-            "final_position": env.position
+            "final_position": env.position,
+            "portfolio_bankrupted": portfolio_bankrupted
         }
     
     def _get_close_column(self, data: pd.DataFrame) -> str:
@@ -249,6 +400,40 @@ class ModelEvaluator:
     def _calculate_prediction_accuracy(self, actions: List[int], data: pd.DataFrame) -> float:
         """Calculate prediction accuracy - same as hit rate for now."""
         return self._calculate_hit_rate(actions, data)
+    
+    def _calculate_sharpe_ratio(self, portfolio_history: List[float], risk_free_rate: float = 0.0) -> float:
+        """Calculate Sharpe ratio from portfolio history."""
+        if len(portfolio_history) < 2:
+            return 0.0
+        
+        # Calculate period returns
+        returns = []
+        for i in range(1, len(portfolio_history)):
+            if portfolio_history[i-1] != 0:
+                period_return = (portfolio_history[i] - portfolio_history[i-1]) / portfolio_history[i-1]
+                returns.append(period_return)
+        
+        if len(returns) == 0:
+            return 0.0
+        
+        returns = pd.Series(returns)
+        
+        # Calculate mean return and standard deviation
+        mean_return = returns.mean()
+        std_return = returns.std()
+        
+        # Handle edge cases
+        if pd.isna(mean_return) or pd.isna(std_return) or std_return == 0:
+            return 0.0
+        
+        # Calculate Sharpe ratio
+        sharpe_ratio = (mean_return - risk_free_rate) / std_return
+        
+        # Annualize the Sharpe ratio (assuming daily data)
+        # For intraday data, this might need adjustment based on your data frequency
+        sharpe_ratio_annualized = sharpe_ratio * np.sqrt(252)  # 252 trading days per year
+        
+        return sharpe_ratio_annualized
 
 def save_trade_history(trade_history: List[Dict], filename: str = "trade_history.csv"):
     """Save trade history to CSV file."""
@@ -310,6 +495,7 @@ def main():
     logger.info("="*60)
     logger.info(f"Final Portfolio Value: ${test_results['final_portfolio_value']:.2f}")
     logger.info(f"Total Return: {test_results['total_return_pct']:.2f}%")
+    logger.info(f"Sharpe Ratio: {test_results['sharpe_ratio']:.2f}")
     logger.info(f"Hit Rate: {test_results['hit_rate']:.2f}%")
     logger.info(f"Prediction Accuracy: {test_results['prediction_accuracy']:.2f}%")
     
