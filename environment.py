@@ -4,25 +4,28 @@ from gymnasium.utils import seeding
 import numpy as np
 import pandas as pd
 from decimal import Decimal
+from collections import deque
 import money  # Import the new money module
 import logging
 from config import config
 from stable_baselines3.common.env_util import make_vec_env
 
+logger = logging.getLogger(__name__)
+
 class TradingEnv(gym.Env):
     """
     Custom Gymnasium environment for trading with multiple technical indicators.
 
-    Observation Space: [close_norm, technical_indicators..., position]
+    Observation Space: [close_norm, technical_indicators..., position, unrealized_profit_norm]
     Action Space:
-        0: Long (Buy)
-        1: Short (Sell)
+        0: Buy (Open long if neutral, Close short if short, Hold if already long)
+        1: Sell (Open short if neutral, Close long if long, Hold if already short)
         2: Hold (Stay in current position or do nothing)
     """
 
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None):
+    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None, returns_window: int = 30):
         """
         Initialize the trading environment.
 
@@ -37,12 +40,13 @@ class TradingEnv(gym.Env):
                                      Default is 0.0 (no transaction costs).
             position_size (int): Number of contracts to trade (default: 1).
             enabled_indicators (list): List of enabled indicators to use in the observation space.
+            returns_window (int): Window size for calculating Sharpe ratio (default: 30).
         """
         super(TradingEnv, self).__init__()
         self.data = data.reset_index(drop=True)
         self.total_steps = len(self.data) - 1  # Last valid index
 
-        # Action space: 0 = long (buy), 1 = short (sell), 2 = hold (stay in current position)
+        # Action space: 0 = buy, 1 = sell, 2 = hold (stay in current position)
         self.action_space = spaces.Discrete(3)
 
         # Define the technical indicators to include in the observation space
@@ -107,10 +111,10 @@ class TradingEnv(gym.Env):
             if 'MSO_COS' in self.data.columns:
                 self.technical_indicators.append('MSO_COS')
             if 'ZScore' in self.data.columns:
-                self.technical_indicators.append('MSO_COS')
+                self.technical_indicators.append('ZScore')
             
-        # Calculate observation space size: close_norm + all technical indicators + position
-        obs_size = 1 + len(self.technical_indicators) + 1
+        # Calculate observation space size: close_norm + all technical indicators + position + unrealized_profit_norm
+        obs_size = 1 + len(self.technical_indicators) + 1 + 1
         
         # Create observation space with appropriate bounds
         # Most indicators are normalized between -1 and 1 or 0 and 1
@@ -136,6 +140,90 @@ class TradingEnv(gym.Env):
         
         # Position sizing
         self.position_size = position_size
+        
+        # Sharpe ratio calculation
+        self.returns_window = returns_window
+        self.returns_history = deque(maxlen=returns_window)
+        self.risk_free_rate = 0.02 / 252  # Assume 2% annual risk-free rate, daily
+        
+        # Track unrealized profit normalization bounds
+        self.max_unrealized_profit = Decimal('0.0')
+        self.min_unrealized_profit = Decimal('0.0')
+
+    def _calculate_unrealized_profit(self) -> Decimal:
+        """Calculate current unrealized profit/loss from the open position."""
+        if self.position == 0 or self.entry_price == Decimal('0.0'):
+            return Decimal('0.0')
+        
+        current_price = money.to_decimal(self.data.loc[self.current_step, "close"])
+        
+        # Calculate price change based on position direction
+        if self.position == 1:  # Long position
+            price_change = current_price - self.entry_price
+        else:  # Short position (position == -1)
+            price_change = self.entry_price - current_price
+        
+        # For NQ futures, each point is $20
+        point_value = money.to_decimal(20.0)
+        unrealized_profit = price_change * point_value * money.to_decimal(self.position_size)
+        
+        # Update bounds for normalization
+        self.max_unrealized_profit = max(self.max_unrealized_profit, unrealized_profit)
+        self.min_unrealized_profit = min(self.min_unrealized_profit, unrealized_profit)
+        
+        return unrealized_profit
+    
+    def _normalize_unrealized_profit(self, unrealized_profit: Decimal) -> float:
+        """Normalize unrealized profit to [-1, 1] range."""
+        if self.max_unrealized_profit == self.min_unrealized_profit:
+            return 0.0
+        
+        # Convert to float for normalization calculation
+        unrealized_float = float(unrealized_profit)
+        min_float = float(self.min_unrealized_profit)
+        max_float = float(self.max_unrealized_profit)
+        
+        # Normalize to [-1, 1] range
+        range_size = max_float - min_float
+        normalized = 2.0 * (unrealized_float - min_float) / range_size - 1.0
+        
+        return float(np.clip(normalized, -1.0, 1.0))
+    
+    def _calculate_sharpe_ratio(self) -> float:
+        """Calculate Sharpe ratio from returns history."""
+        if len(self.returns_history) < 5:  # Need minimum returns for meaningful calculation
+            return 0.0
+        
+        returns_array = np.array(self.returns_history)
+        
+        # Handle edge cases
+        if len(returns_array) == 0:
+            return 0.0
+        
+        # Remove any NaN or infinite values
+        returns_array = returns_array[np.isfinite(returns_array)]
+        
+        if len(returns_array) == 0:
+            return 0.0
+        
+        mean_return = np.mean(returns_array)
+        std_return = np.std(returns_array)
+        
+        # Check for NaN values in calculations
+        if not np.isfinite(mean_return) or not np.isfinite(std_return):
+            return -10.0  # Large negative reward for invalid calculations
+        
+        if std_return == 0:
+            return 0.0 if mean_return == self.risk_free_rate else np.sign(mean_return - self.risk_free_rate)
+        
+        sharpe = (mean_return - self.risk_free_rate) / std_return
+        
+        # Ensure the result is finite
+        if not np.isfinite(sharpe):
+            return -10.0
+        
+        # Clip to reasonable bounds to prevent extreme values
+        return float(np.clip(sharpe, -10.0, 10.0))
 
     def seed(self, seed=None):
         """Set random seed for reproducibility."""
@@ -162,6 +250,14 @@ class TradingEnv(gym.Env):
         self.entry_price = Decimal('0.0')
         self.net_worth = self.initial_balance
         self.previous_net_worth = self.initial_balance  # Reset previous net worth for reward calculation
+        
+        # Reset Sharpe ratio tracking
+        self.returns_history.clear()
+        
+        # Reset unrealized profit bounds
+        self.max_unrealized_profit = Decimal('0.0')
+        self.min_unrealized_profit = Decimal('0.0')
+        
         obs = self._get_obs()
         return obs, {}
 
@@ -170,7 +266,7 @@ class TradingEnv(gym.Env):
         Constructs the observation at the current time step.
 
         Returns:
-            np.ndarray: Array with [close_norm, technical_indicators..., position].
+            np.ndarray: Array with [close_norm, technical_indicators..., position, unrealized_profit_norm].
         """
         # Get close_norm value
         close_norm = self.data.loc[self.current_step, "close_norm"]
@@ -212,16 +308,23 @@ class TradingEnv(gym.Env):
         # Add position
         position = float(self.position)
         
+        # Calculate and normalize unrealized profit
+        unrealized_profit = self._calculate_unrealized_profit()
+        unrealized_profit_norm = self._normalize_unrealized_profit(unrealized_profit)
+        
         # DEBUGGING: Print details about observation vector construction
         logger = logging.getLogger(__name__)
     
         
         observation_elements = ["close_norm"]
         observation_elements.extend(self.technical_indicators)
-        observation_elements.append("position")
+        observation_elements.extend(["position", "unrealized_profit_norm"])
         
         # Combine all features
-        obs = np.array([close_norm] + indicators + [position], dtype=np.float32)
+        obs = np.array([close_norm] + indicators + [position, unrealized_profit_norm], dtype=np.float32)
+        
+        # Replace any NaN or infinite values with 0
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # Ensure observation is within bounds
         obs = np.clip(obs, self.observation_space.low, self.observation_space.high)
@@ -233,7 +336,10 @@ class TradingEnv(gym.Env):
         Apply an action, update the portfolio, and return the next observation.
 
         Args:
-            action (int): Action to execute (0: long/buy, 1: short/sell, 2: hold).
+            action (int): Action to execute (0: buy, 1: sell, 2: hold).
+                         Buy: Open long if neutral, close short if short, hold if already long
+                         Sell: Open short if neutral, close long if long, hold if already short
+                         Hold: Stay in current position
 
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
@@ -248,25 +354,27 @@ class TradingEnv(gym.Env):
         
         # Track old position to detect changes for transaction cost
         old_position = self.position
-
+        
         # Update position based on action
-        if action == 0:  # Go long
-            # If already long (position == 1), maintain position
-            # Otherwise, set position to long
-            if self.position != 1:
+        if action == 0:  # Buy action
+            if self.position == 0:  # Currently neutral - go long
                 self.position = 1
                 self.entry_price = current_price
-            else:
-                pass  # Already long, no change
+            elif self.position == -1:  # Currently short - close position
+                self.position = 0
+                self.entry_price = Decimal('0.0')
+            else:  # Already long (position == 1) - maintain position
+                pass
                 
-        elif action == 1:  # Go short
-            # If already short (position == -1), maintain position
-            # Otherwise, set position to short
-            if self.position != -1:
+        elif action == 1:  # Sell action
+            if self.position == 0:  # Currently neutral - go short
                 self.position = -1
                 self.entry_price = current_price
-            else:
-                pass  # Already short, no change
+            elif self.position == 1:  # Currently long - close position
+                self.position = 0
+                self.entry_price = Decimal('0.0')
+            else:  # Already short (position == -1) - maintain position
+                pass
                 
         elif action == 2:  # Hold current position
             pass  # No change to position
@@ -296,30 +404,44 @@ class TradingEnv(gym.Env):
                 # Update portfolio value
                 self.net_worth += dollar_change
         
-        # Ensure net_worth doesn't go below a minimum threshold (e.g., 1% of initial balance)
-        min_balance = self.initial_balance * Decimal('0.01')
-        if self.net_worth < min_balance:
-            self.net_worth = min_balance
-            info["hit_minimum_balance"] = True
+        # Check if portfolio has hit zero or below - stop trading immediately
+        if self.net_worth <= Decimal('0.0'):
+            self.net_worth = Decimal('0.0')
+            terminated = True
+            truncated = False
+            info["portfolio_bankrupted"] = True
+            info["final_return"] = -100.0  # Record -100% loss
+        else:
+            terminated = self.current_step >= self.total_steps
+            truncated = False
 
-        terminated = self.current_step >= self.total_steps
-        truncated = False
-
-        if terminated:
+        if terminated and not info.get("portfolio_bankrupted", False):
             self.current_step = self.total_steps  # Clamp to last valid index
         
-        # Calculate reward based on logarithmic return
-        if self.previous_net_worth > Decimal('0.0'):
-            reward = float(np.log(float(self.net_worth / self.previous_net_worth)))
+        # Calculate period return and add to history
+        if self.previous_net_worth > Decimal('0.0') and self.net_worth > Decimal('0.0'):
+            period_return = float(np.log(float(self.net_worth / self.previous_net_worth)))
+            self.returns_history.append(period_return)
+        elif self.net_worth <= Decimal('0.0'):
+            # Portfolio went bankrupt - use a large negative return instead of undefined
+            period_return = -10.0  # Large negative return representing bankruptcy
+            self.returns_history.append(period_return)
         else:
-            reward = 0.0
+            period_return = 0.0
+            self.returns_history.append(period_return)
+        
+        # Calculate Sharpe ratio as reward
+        reward = self._calculate_sharpe_ratio()
         
         obs = self._get_obs()
         
         # Add info about current state
         info["position"] = self.position
-        info["reward"] = float(reward)  # Convert Decimal to float for compatibility
-        info["net_worth"] = float(self.net_worth)  # Convert Decimal to float for compatibility
+        info["reward"] = float(reward)
+        info["period_return"] = float(period_return)
+        info["net_worth"] = float(self.net_worth)
         info["position_size"] = self.position_size
+        info["unrealized_profit"] = float(self._calculate_unrealized_profit())
+        info["sharpe_ratio"] = reward
         
         return obs, float(reward), terminated, truncated, info

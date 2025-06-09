@@ -597,7 +597,8 @@ def trade_with_risk_management(
     env = TradingEnv(
         data=test_data,
         initial_balance=initial_balance,
-        transaction_cost=transaction_cost
+        transaction_cost=transaction_cost,
+        returns_window=30
     )
     
     # Get initial observation

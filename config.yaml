@@ -1,7 +1,7 @@
 seed: 42 #Global RNG seed
 
 training:
-  total_timesteps: 120000
+  total_timesteps: 250000
   fee_rate: 0.0
   # New parameters for iterative training
   max_iterations: 100
@@ -12,6 +12,41 @@ training:
   # Evaluation metric configuration
   evaluation:
     metric: "return"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
+  
+  # Data augmentation configuration for creating multiple synthetic training datasets
+  data_augmentation:
+    enabled: true  # Enable/disable data augmentation
+    config:
+      # Jittering: Add noise to data
+      jittering:
+        enabled: true
+        num_datasets: 2  # Number of jittered datasets to create
+        config:
+          price_noise_std: 0.0003  # Standard deviation of noise for price columns (0.03%)
+          indicator_noise_std: 0.008  # Standard deviation of noise for indicator columns (0.8%)
+          volume_noise_std: 0.02  # Standard deviation of noise for volume columns (2%)
+      
+      # Cut-and-paste: Rearrange segments of data
+      cutpaste:
+        enabled: true
+        num_datasets: 2  # Number of cut-paste datasets to create
+        config:
+          segment_size_range: [30, 120]  # Min and max size of segments to cut/paste
+          num_operations: 1  # Number of cut-paste operations per dataset
+          preserve_trend: true  # Try to preserve overall price trend when pasting
+      
+      # Bootstrap sampling: Sample with replacement
+      bootstrap:
+        enabled: false  # Disabled by default as it can be disruptive to time series
+        num_datasets: 1  # Number of bootstrap datasets to create
+        sample_ratio: 0.9  # Ratio of original data to sample
+      
+      # Sliding window: Create overlapping windows
+      sliding_window:
+        enabled: false  # Disabled by default as it's resource intensive
+        num_datasets: 2
+        window_size: null  # Auto-calculate (half of data length)
+        step_size: null  # Auto-calculate (25% of window size)
 
 data:
   train_ratio: 0.6
@@ -97,9 +132,10 @@ indicators:
     random_seed: 42   # Random seed for reproducibility
 
 environment:
-  initial_balance: 10000.0
+  initial_balance: 100000.0
   position_size: 1  # Number of NQ futures contracts to trade (default: 1)
   transaction_cost: 0.0  # Transaction cost as percentage
+  returns_window: 30  # Window size for Sharpe ratio calculation (number of period returns)
 
 model:
   ent_coef: 0.00011640494075069245
@@ -158,7 +194,7 @@ walk_forward:
 
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
-  enabled: false
+  enabled: true
   n_trials: 30
   parallel_processing:
     enabled: false  # Disable parallel processing for hyperparameter tuning

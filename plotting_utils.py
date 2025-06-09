@@ -16,8 +16,9 @@ def plot_training_progress(training_history: List[Dict], save_path: str = None) 
     iterations = list(range(len(training_history)))
     returns = [result.get("total_return_pct", 0) for result in training_history]
     hit_rates = [result.get("hit_rate", 0) for result in training_history]
+    sharpe_ratios = [result.get("sharpe_ratio", 0) for result in training_history]
     
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12))
     
     # Plot returns
     ax1.plot(iterations, returns, 'b-o', label='Return %')
@@ -26,13 +27,20 @@ def plot_training_progress(training_history: List[Dict], save_path: str = None) 
     ax1.grid(True, alpha=0.3)
     ax1.legend()
     
-    # Plot hit rates
-    ax2.plot(iterations, hit_rates, 'g-s', label='Hit Rate %')
-    ax2.set_xlabel('Iteration')
-    ax2.set_ylabel('Hit Rate (%)')
-    ax2.set_title('Training Progress: Hit Rate')
+    # Plot Sharpe ratios
+    ax2.plot(iterations, sharpe_ratios, 'r-^', label='Sharpe Ratio')
+    ax2.set_ylabel('Sharpe Ratio')
+    ax2.set_title('Training Progress: Sharpe Ratio')
     ax2.grid(True, alpha=0.3)
     ax2.legend()
+    
+    # Plot hit rates
+    ax3.plot(iterations, hit_rates, 'g-s', label='Hit Rate %')
+    ax3.set_xlabel('Iteration')
+    ax3.set_ylabel('Hit Rate (%)')
+    ax3.set_title('Training Progress: Hit Rate')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
     
     plt.tight_layout()
     
@@ -98,10 +106,11 @@ def plot_walk_forward_results(results: List[Dict], save_path: str = None) -> Non
     
     windows = [r.get('window', i+1) for i, r in enumerate(results)]
     returns = [r.get('return', 0) for r in results]
+    sharpe_ratios = [r.get('sharpe_ratio', 0) for r in results]
     portfolio_values = [r.get('portfolio_value', 0) for r in results]
     trade_counts = [r.get('trade_count', 0) for r in results]
     
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+    fig, axes = plt.subplots(4, 1, figsize=(12, 14))
     
     # Plot returns
     axes[0].bar(windows, returns, color='blue', alpha=0.7)
@@ -113,18 +122,28 @@ def plot_walk_forward_results(results: List[Dict], save_path: str = None) -> Non
     for i, (w, r) in enumerate(zip(windows, returns)):
         axes[0].text(w, r, f'{r:.1f}%', ha='center', va='bottom' if r >= 0 else 'top')
     
-    # Plot portfolio values
-    axes[1].bar(windows, portfolio_values, color='green', alpha=0.7)
-    axes[1].set_ylabel('Final Portfolio Value ($)')
-    axes[1].set_title('Final Portfolio Values by Window')
+    # Plot Sharpe ratios
+    axes[1].bar(windows, sharpe_ratios, color='red', alpha=0.7)
+    axes[1].set_ylabel('Sharpe Ratio')
+    axes[1].set_title('Sharpe Ratios by Walk-Forward Window')
     axes[1].grid(True, alpha=0.3)
     
-    # Plot trade counts
-    axes[2].bar(windows, trade_counts, color='red', alpha=0.7)
-    axes[2].set_xlabel('Walk-Forward Window')
-    axes[2].set_ylabel('Trade Count')
-    axes[2].set_title('Trade Counts by Window')
+    # Add Sharpe ratio values as text
+    for i, (w, s) in enumerate(zip(windows, sharpe_ratios)):
+        axes[1].text(w, s, f'{s:.2f}', ha='center', va='bottom' if s >= 0 else 'top')
+    
+    # Plot portfolio values
+    axes[2].bar(windows, portfolio_values, color='green', alpha=0.7)
+    axes[2].set_ylabel('Final Portfolio Value ($)')
+    axes[2].set_title('Final Portfolio Values by Window')
     axes[2].grid(True, alpha=0.3)
+    
+    # Plot trade counts
+    axes[3].bar(windows, trade_counts, color='orange', alpha=0.7)
+    axes[3].set_xlabel('Walk-Forward Window')
+    axes[3].set_ylabel('Trade Count')
+    axes[3].set_title('Trade Counts by Window')
+    axes[3].grid(True, alpha=0.3)
     
     plt.tight_layout()
     
@@ -178,6 +197,12 @@ def create_summary_report(results: Dict, save_path: str = None) -> str:
     report.append(f"  Number of Windows: {results.get('num_windows', 0)}")
     report.append(f"  Average Return: {results.get('avg_return', 0):.2f}%")
     report.append(f"  Standard Deviation: {results.get('std_return', 0):.2f}%")
+    
+    # Add Sharpe ratio statistics if available
+    if 'avg_sharpe_ratio' in results:
+        report.append(f"  Average Sharpe Ratio: {results.get('avg_sharpe_ratio', 0):.2f}")
+        report.append(f"  Sharpe Ratio Std Dev: {results.get('std_sharpe_ratio', 0):.2f}")
+    
     report.append(f"  Average Portfolio Value: ${results.get('avg_portfolio', 0):.2f}")
     report.append(f"  Average Trades per Window: {results.get('avg_trades', 0):.1f}")
     report.append("")
@@ -189,20 +214,26 @@ def create_summary_report(results: Dict, save_path: str = None) -> str:
     if 'avg_prediction_accuracy' in results:
         report.append(f"  Average Prediction Accuracy: {results.get('avg_prediction_accuracy', 0):.2f}%")
     
+    # Bankruptcy statistics if available
+    if 'bankrupted_windows' in results:
+        report.append(f"  Bankrupted Windows: {results.get('bankrupted_windows', 0)}")
+        report.append(f"  Bankruptcy Rate: {results.get('bankruptcy_rate', 0):.1f}%")
+    
     report.append("")
     
     # Window-by-window breakdown
     if 'all_window_results' in results and results['all_window_results']:
         report.append("WINDOW-BY-WINDOW BREAKDOWN:")
-        report.append("-" * 40)
+        report.append("-" * 80)
         
         for window_result in results['all_window_results']:
             window = window_result.get('window', 0)
             ret = window_result.get('return', 0)
+            sharpe = window_result.get('sharpe_ratio', 0)
             portfolio = window_result.get('portfolio_value', 0)
             trades = window_result.get('trade_count', 0)
             
-            report.append(f"  Window {window:2d}: {ret:6.2f}% return, ${portfolio:8.2f} portfolio, {trades:3d} trades")
+            report.append(f"  Window {window:2d}: {ret:6.2f}% return, {sharpe:6.2f} Sharpe, ${portfolio:8.2f} portfolio, {trades:3d} trades")
     
     report.append("")
     report.append("="*60)

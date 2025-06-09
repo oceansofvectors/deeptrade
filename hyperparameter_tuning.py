@@ -84,7 +84,8 @@ def objective_func(
         train_data,
         initial_balance=config["environment"]["initial_balance"],
         transaction_cost=0.0,
-        position_size=config["environment"].get("position_size", 1)
+        position_size=config["environment"].get("position_size", 1),
+        returns_window=config["environment"].get("returns_window", 30)
     )
     seed_value = config.get('seed', 42)
     
