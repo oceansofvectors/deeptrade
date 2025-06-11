@@ -22,7 +22,9 @@ import money
 from utils.seeding import seed_worker
 from normalization import scale_window, get_standardized_column_names
 from plotting_utils import (plot_walk_forward_results, plot_cumulative_performance, 
-                           create_summary_report, plot_training_progress)
+                           create_summary_report, plot_training_progress, plot_sharpe_comparison,
+                           plot_hyperparameter_tuning_summary)
+from hyperparameter_tuning import objective_func
 
 # Setup logging
 os.makedirs('models/logs', exist_ok=True)
@@ -110,14 +112,17 @@ class WalkForwardTester:
         else:
             results = self._process_windows_sequential(window_configs)
         
+        # Aggregate results first
+        summary = self._aggregate_results(results, session_folder)
+        
         # Generate plots and reports
         if results:
             plot_walk_forward_results(results, f'{session_folder}/reports')
             plot_cumulative_performance(results, f'{session_folder}/reports')
-            create_summary_report(self._aggregate_results(results, session_folder), f'{session_folder}/reports')
+            plot_sharpe_comparison(summary, f'{session_folder}/reports')
+            plot_hyperparameter_tuning_summary(summary, f'{session_folder}/reports')
+            create_summary_report(summary, f'{session_folder}/reports')
         
-        # Aggregate results
-        summary = self._aggregate_results(results, session_folder)
         return summary
     
     def _prepare_windows(self, num_windows: int, window_size: int, step_size: int,
@@ -202,7 +207,7 @@ class WalkForwardTester:
         return results
     
     def _process_single_window(self, config: Dict) -> Dict:
-        """Process a single walk-forward window."""
+        """Process a single walk-forward window with hyperparameter tuning."""
         window_idx = config['window_idx']
         train_data = config['train_data']
         validation_data = config['validation_data']
@@ -219,7 +224,36 @@ class WalkForwardTester:
             sigmoid_k=2.0  # Use sigmoid transformation only
         )
         
-        # Train model
+        # Check if hyperparameter tuning is enabled for walk-forward
+        hp_config = self.config.get("hyperparameter_tuning", {})
+        wf_hp_enabled = hp_config.get("walk_forward_enabled", True)
+        
+        best_params = None
+        if wf_hp_enabled:
+            logger.info(f"Starting hyperparameter tuning for window {window_idx}")
+            
+            # Run hyperparameter optimization for this window
+            tuning_results = self._run_window_hyperparameter_tuning(
+                train_data, validation_data, window_folder, window_idx
+            )
+            
+            if tuning_results and 'best_params' in tuning_results:
+                best_params = tuning_results['best_params']
+                logger.info(f"Window {window_idx} - Best hyperparameters: {best_params}")
+                
+                # Save hyperparameter results for this window
+                with open(f'{window_folder}/hyperparameter_results.json', 'w') as f:
+                    json.dump({
+                        'best_params': best_params,
+                        'best_value': tuning_results.get('best_value', 0),
+                        'n_trials': tuning_results.get('n_trials', 0)
+                    }, f, indent=4, default=str)
+            else:
+                logger.warning(f"Window {window_idx} - Hyperparameter tuning failed, using default parameters")
+        else:
+            logger.info(f"Window {window_idx} - Hyperparameter tuning disabled, using default parameters")
+        
+        # Train model with best parameters (or defaults if tuning disabled/failed)
         trainer = ModelTrainer(train_data, validation_data)
         training_config = self.config.get("training", {})
         
@@ -236,6 +270,7 @@ class WalkForwardTester:
                 max_iterations=training_config.get("max_iterations", 10),
                 patience=training_config.get("n_stagnant_loops", 3),
                 improvement_threshold=training_config.get("improvement_threshold", 0.1),
+                model_params=best_params,  # Use optimized hyperparameters
                 save_path=window_folder,
                 use_data_augmentation=True,
                 augmentation_config=augmentation_config
@@ -248,6 +283,7 @@ class WalkForwardTester:
                 max_iterations=training_config.get("max_iterations", 10),
                 patience=training_config.get("n_stagnant_loops", 3),
                 improvement_threshold=training_config.get("improvement_threshold", 0.1),
+                model_params=best_params,  # Use optimized hyperparameters
                 save_path=window_folder
             )
         
@@ -257,7 +293,10 @@ class WalkForwardTester:
         
         # Evaluate on test data
         evaluator = ModelEvaluator()
-        test_results = evaluator.evaluate(model, test_data, verbose=0)
+        
+        # Get reward type from training config
+        reward_type = self.config.get("training", {}).get("evaluation", {}).get("reward_type", "hybrid")
+        test_results = evaluator.evaluate(model, test_data, verbose=0, reward_type=reward_type)
         
         # Save results
         with open(f'{window_folder}/test_results.json', 'w') as f:
@@ -267,14 +306,207 @@ class WalkForwardTester:
             'window': window_idx,
             'return': test_results['total_return_pct'],
             'sharpe_ratio': test_results.get('sharpe_ratio', 0),
+            'enhanced_sharpe_ratio': test_results.get('enhanced_sharpe_ratio', 0),
+            'volatility': test_results.get('volatility', 0),
+            'max_drawdown': test_results.get('max_drawdown', 0),
+            'calmar_ratio': test_results.get('calmar_ratio', 0),
             'portfolio_value': test_results['final_portfolio_value'],
             'trade_count': test_results['trade_count'],
             'hit_rate': test_results.get('hit_rate', 0),
             'prediction_accuracy': test_results.get('prediction_accuracy', 0),
             'portfolio_bankrupted': test_results.get('portfolio_bankrupted', False),
-            'window_folder': window_folder
+            'portfolio_history': test_results.get('portfolio_history', []),  # Include portfolio history for pooled Sharpe calculation
+            'reward_type': test_results.get('reward_type', reward_type),
+            'window_folder': window_folder,
+            'best_hyperparameters': best_params  # Include the optimized hyperparameters
         }
     
+    def _run_window_hyperparameter_tuning(self, train_data: pd.DataFrame, validation_data: pd.DataFrame, 
+                                         window_folder: str, window_idx: int) -> Dict:
+        """Run hyperparameter tuning for a single window with early stopping."""
+        hp_config = self.config.get("hyperparameter_tuning", {})
+        
+        # Get tuning parameters
+        n_trials = hp_config.get("n_trials", 30)
+        eval_metric = hp_config.get("eval_metric", "return")
+        
+        # Configure pruning for early stopping of underperforming trials
+        pruner_config = hp_config.get("pruning", {})
+        use_pruning = pruner_config.get("enabled", True)
+        
+        if use_pruning:
+            # Set up pruner for early stopping
+            pruner_type = pruner_config.get("type", "median")
+            
+            if pruner_type == "median":
+                pruner = optuna.pruners.MedianPruner(
+                    n_startup_trials=pruner_config.get("n_startup_trials", 5),
+                    n_warmup_steps=pruner_config.get("n_warmup_steps", 3),
+                    interval_steps=pruner_config.get("interval_steps", 1)
+                )
+            elif pruner_type == "percentile":
+                pruner = optuna.pruners.PercentilePruner(
+                    percentile=pruner_config.get("percentile", 25.0),
+                    n_startup_trials=pruner_config.get("n_startup_trials", 5),
+                    n_warmup_steps=pruner_config.get("n_warmup_steps", 3),
+                    interval_steps=pruner_config.get("interval_steps", 1)
+                )
+            elif pruner_type == "successive_halving":
+                pruner = optuna.pruners.SuccessiveHalvingPruner(
+                    min_resource=pruner_config.get("min_resource", 1),
+                    reduction_factor=pruner_config.get("reduction_factor", 4),
+                    min_early_stopping_rate=pruner_config.get("min_early_stopping_rate", 0)
+                )
+            else:
+                # Default to median pruner
+                pruner = optuna.pruners.MedianPruner()
+        else:
+            pruner = optuna.pruners.NopPruner()  # No pruning
+        
+        try:
+            # Create study with pruning
+            study_name = f"window_{window_idx}_hp_tuning"
+            sampler = optuna.samplers.TPESampler(seed=self.config.get("seed", 42))
+            
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=sampler,
+                pruner=pruner,
+                study_name=study_name
+            )
+            
+            # Create objective function with intermediate reporting for pruning
+            def pruning_objective(trial):
+                try:
+                    # Call the main objective function
+                    result = objective_func(
+                        trial=trial,
+                        train_data=train_data,
+                        validation_data=validation_data,
+                        eval_metric=eval_metric,
+                        hit_rate_min_trades=hp_config.get("hit_rate_min_trades", 5),
+                        min_predictions=hp_config.get("min_predictions", 10)
+                    )
+                    
+                    # Report intermediate result for pruning (if applicable)
+                    if use_pruning:
+                        trial.report(result, step=0)
+                        
+                        # Check if trial should be pruned
+                        if trial.should_prune():
+                            logger.info(f"Window {window_idx} - Trial {trial.number} pruned with result {result:.2f}")
+                            raise optuna.TrialPruned()
+                    
+                    return result
+                    
+                except optuna.TrialPruned:
+                    raise
+                except Exception as e:
+                    logger.error(f"Window {window_idx} - Trial {trial.number} failed: {e}")
+                    # Return a very bad score for failed trials
+                    return -1000.0
+            
+            # Run optimization
+            logger.info(f"Window {window_idx} - Starting {n_trials} trials with {pruner_type} pruning")
+            study.optimize(pruning_objective, n_trials=n_trials, timeout=hp_config.get("timeout", None))
+            
+            # Get results
+            best_params = study.best_params
+            best_value = study.best_value
+            n_completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+            n_pruned_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
+            
+            logger.info(f"Window {window_idx} - Hyperparameter tuning completed:")
+            logger.info(f"  Best {eval_metric}: {best_value:.2f}")
+            logger.info(f"  Completed trials: {n_completed_trials}/{n_trials}")
+            logger.info(f"  Pruned trials: {n_pruned_trials}")
+            logger.info(f"  Best parameters: {best_params}")
+            
+            # Save optimization plots if possible
+            try:
+                tuning_plots_folder = f'{window_folder}/tuning_plots'
+                os.makedirs(tuning_plots_folder, exist_ok=True)
+                
+                # Save optimization history
+                fig1 = optuna.visualization.plot_optimization_history(study)
+                fig1.write_image(f'{tuning_plots_folder}/optimization_history.png')
+                
+                # Save parameter importance (if we have enough trials)
+                if n_completed_trials >= 3:
+                    fig2 = optuna.visualization.plot_param_importances(study)
+                    fig2.write_image(f'{tuning_plots_folder}/param_importances.png')
+                
+            except ImportError:
+                logger.warning("Plotly not available for saving optimization plots")
+            except Exception as e:
+                logger.warning(f"Could not save optimization plots: {e}")
+            
+            return {
+                "best_params": best_params,
+                "best_value": best_value,
+                "study": study,
+                "n_trials": n_trials,
+                "n_completed_trials": n_completed_trials,
+                "n_pruned_trials": n_pruned_trials
+            }
+            
+        except Exception as e:
+            logger.error(f"Window {window_idx} - Hyperparameter tuning failed: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return None
+    
+    def _calculate_pooled_sharpe_ratio(self, results: List[Dict], risk_free_rate: float = 0.0) -> float:
+        """Calculate Sharpe ratio from pooled returns across all windows."""
+        all_returns = []
+        
+        # Pool all period returns from all windows
+        for result in results:
+            portfolio_history = result.get('portfolio_history', [])
+            if len(portfolio_history) < 2:
+                continue
+                
+            # Calculate period returns for this window
+            window_returns = []
+            for i in range(1, len(portfolio_history)):
+                if portfolio_history[i-1] > 0:
+                    period_return = (portfolio_history[i] - portfolio_history[i-1]) / portfolio_history[i-1]
+                    window_returns.append(period_return)
+            
+            all_returns.extend(window_returns)
+        
+        if len(all_returns) == 0:
+            return 0.0
+        
+        # Convert to pandas Series for calculations
+        returns_series = pd.Series(all_returns)
+        
+        # Remove any NaN or infinite values
+        returns_series = returns_series[np.isfinite(returns_series)]
+        
+        if len(returns_series) == 0:
+            return 0.0
+        
+        # Calculate mean return and standard deviation
+        mean_return = returns_series.mean()
+        std_return = returns_series.std()
+        
+        # Handle edge cases
+        if pd.isna(mean_return) or pd.isna(std_return) or std_return == 0:
+            return 0.0
+        
+        # Calculate Sharpe ratio
+        sharpe_ratio = (mean_return - risk_free_rate) / std_return
+        
+        # Annualize the Sharpe ratio (assuming the data frequency)
+        # For intraday data, this might need adjustment based on your data frequency
+        sharpe_ratio_annualized = sharpe_ratio * np.sqrt(252)  # 252 trading days per year
+        
+        logger.info(f"Pooled Sharpe calculation: {len(all_returns)} total returns from {len(results)} windows")
+        logger.info(f"Mean return: {mean_return:.6f}, Std return: {std_return:.6f}")
+        
+        return sharpe_ratio_annualized
+
     def _aggregate_results(self, results: List[Dict], session_folder: str) -> Dict:
         """Aggregate results from all windows."""
         if not results:
@@ -282,6 +514,10 @@ class WalkForwardTester:
         
         returns = [r['return'] for r in results]
         sharpe_ratios = [r.get('sharpe_ratio', 0) for r in results]
+        enhanced_sharpe_ratios = [r.get('enhanced_sharpe_ratio', 0) for r in results]
+        volatilities = [r.get('volatility', 0) for r in results]
+        max_drawdowns = [r.get('max_drawdown', 0) for r in results]
+        calmar_ratios = [r.get('calmar_ratio', 0) for r in results if np.isfinite(r.get('calmar_ratio', 0))]
         portfolio_values = [r['portfolio_value'] for r in results]
         trade_counts = [r['trade_count'] for r in results]
         hit_rates = [r.get('hit_rate', 0) for r in results]
@@ -291,18 +527,28 @@ class WalkForwardTester:
         # Count bankrupted windows
         bankrupted_windows = sum(bankruptcies)
         
+        # Calculate pooled Sharpe ratio from all windows
+        pooled_sharpe_ratio = self._calculate_pooled_sharpe_ratio(results)
+        
         summary = {
             'num_windows': len(results),
             'avg_return': np.mean(returns),
             'std_return': np.std(returns),
-            'avg_sharpe_ratio': np.mean(sharpe_ratios),
+            'avg_sharpe_ratio': np.mean(sharpe_ratios),  # Keep individual average for comparison
             'std_sharpe_ratio': np.std(sharpe_ratios),
+            'avg_enhanced_sharpe_ratio': np.mean(enhanced_sharpe_ratios),
+            'std_enhanced_sharpe_ratio': np.std(enhanced_sharpe_ratios),
+            'pooled_sharpe_ratio': pooled_sharpe_ratio,  # Add pooled Sharpe ratio
+            'avg_volatility': np.mean(volatilities),
+            'avg_max_drawdown': np.mean(max_drawdowns),
+            'avg_calmar_ratio': np.mean(calmar_ratios) if calmar_ratios else 0,
             'avg_portfolio': np.mean(portfolio_values),
             'avg_trades': np.mean(trade_counts),
             'avg_hit_rate': np.mean(hit_rates),
             'avg_prediction_accuracy': np.mean(prediction_accuracies),
             'bankrupted_windows': bankrupted_windows,
             'bankruptcy_rate': (bankrupted_windows / len(results)) * 100 if results else 0,
+            'reward_type': results[0].get('reward_type', 'unknown') if results else 'unknown',
             'all_window_results': results,
             'timestamp': timestamp
         }
@@ -315,6 +561,11 @@ class WalkForwardTester:
         
         logger.info(f"Walk-forward testing complete. Average return: {summary['avg_return']:.2f}%")
         logger.info(f"Average Sharpe ratio: {summary['avg_sharpe_ratio']:.2f}")
+        logger.info(f"Average Enhanced Sharpe ratio: {summary['avg_enhanced_sharpe_ratio']:.2f}")
+        logger.info(f"Pooled Sharpe ratio: {summary['pooled_sharpe_ratio']:.2f}")
+        logger.info(f"Average Volatility: {summary['avg_volatility']:.2f}%")
+        logger.info(f"Average Max Drawdown: {summary['avg_max_drawdown']:.2f}%")
+        logger.info(f"Reward Type: {summary['reward_type']}")
         if summary['bankrupted_windows'] > 0:
             logger.warning(f"Bankruptcy Alert: {summary['bankrupted_windows']} windows ({summary['bankruptcy_rate']:.1f}%) resulted in portfolio bankruptcy")
         return summary
@@ -380,6 +631,12 @@ def load_tradingview_data(csv_filepath: str) -> pd.DataFrame:
 def main():
     """Main walk-forward testing function."""
     
+    # Force CPU usage - disable CUDA
+    import torch
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    torch.set_default_device("cpu")
+    logger.info("Forcing CPU usage - CUDA disabled")
+    
     # Load data
     data = load_tradingview_data("data/NQ_2024_unix.csv")
     if data is None or len(data) == 0:
@@ -412,6 +669,7 @@ def main():
         print(f"Number of windows: {results['num_windows']}")
         print(f"Average return: {results['avg_return']:.2f}% ± {results['std_return']:.2f}%")
         print(f"Average Sharpe ratio: {results['avg_sharpe_ratio']:.2f} ± {results['std_sharpe_ratio']:.2f}")
+        print(f"Pooled Sharpe ratio: {results['pooled_sharpe_ratio']:.2f} (computed from all {results['num_windows']} windows)")
         print(f"Average portfolio value: ${results['avg_portfolio']:.2f}")
         print(f"Average trades per window: {results['avg_trades']:.1f}")
         if results.get('bankrupted_windows', 0) > 0:

@@ -16,7 +16,7 @@ class TradingEnv(gym.Env):
     """
     Custom Gymnasium environment for trading with multiple technical indicators.
 
-    Observation Space: [close_norm, technical_indicators..., position, unrealized_profit_norm]
+    Observation Space: [close_norm, technical_indicators..., position, unrealized_profit_norm, steps_since_last_trade_norm]
     Action Space:
         0: Buy (Open long if neutral, Close short if short, Hold if already long)
         1: Sell (Open short if neutral, Close long if long, Hold if already short)
@@ -25,7 +25,7 @@ class TradingEnv(gym.Env):
 
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None, returns_window: int = 30):
+    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None, returns_window: int = 30, reward_type: str = "hybrid"):
         """
         Initialize the trading environment.
 
@@ -41,6 +41,7 @@ class TradingEnv(gym.Env):
             position_size (int): Number of contracts to trade (default: 1).
             enabled_indicators (list): List of enabled indicators to use in the observation space.
             returns_window (int): Window size for calculating Sharpe ratio (default: 30).
+            reward_type (str): Type of reward function to use: "returns", "sharpe", "hybrid", "risk_adjusted"
         """
         super(TradingEnv, self).__init__()
         self.data = data.reset_index(drop=True)
@@ -113,8 +114,8 @@ class TradingEnv(gym.Env):
             if 'ZScore' in self.data.columns:
                 self.technical_indicators.append('ZScore')
             
-        # Calculate observation space size: close_norm + all technical indicators + position + unrealized_profit_norm
-        obs_size = 1 + len(self.technical_indicators) + 1 + 1
+        # Calculate observation space size: close_norm + all technical indicators + position + unrealized_profit_norm + steps_since_last_trade_norm
+        obs_size = 1 + len(self.technical_indicators) + 1 + 1 + 1
         
         # Create observation space with appropriate bounds
         # Most indicators are normalized between -1 and 1 or 0 and 1
@@ -141,14 +142,26 @@ class TradingEnv(gym.Env):
         # Position sizing
         self.position_size = position_size
         
-        # Sharpe ratio calculation
+        # Reward and Sharpe ratio calculation
+        self.reward_type = reward_type
         self.returns_window = returns_window
         self.returns_history = deque(maxlen=returns_window)
         self.risk_free_rate = 0.02 / 252  # Assume 2% annual risk-free rate, daily
         
+        # Enhanced tracking for better Sharpe calculation
+        self.portfolio_history = deque(maxlen=returns_window * 2)  # Keep more history
+        self.running_sharpe = 0.0
+        self.sharpe_ema_alpha = 0.1  # Exponential moving average weight for Sharpe
+        
         # Track unrealized profit normalization bounds
         self.max_unrealized_profit = Decimal('0.0')
         self.min_unrealized_profit = Decimal('0.0')
+        
+        # Trade timing and overtrading tracking
+        self.steps_since_last_trade = 0
+        self.total_trades = 0
+        self.trade_frequency_penalty = 0.001  # Penalty per trade above optimal frequency
+        self.min_steps_between_trades = 5  # Minimum recommended steps between trades
 
     def _calculate_unrealized_profit(self) -> Decimal:
         """Calculate current unrealized profit/loss from the open position."""
@@ -190,8 +203,10 @@ class TradingEnv(gym.Env):
         return float(np.clip(normalized, -1.0, 1.0))
     
     def _calculate_sharpe_ratio(self) -> float:
-        """Calculate Sharpe ratio from returns history."""
-        if len(self.returns_history) < 5:  # Need minimum returns for meaningful calculation
+        """Calculate Sharpe ratio from returns history with improved stability."""
+        min_observations = max(5, self.returns_window // 6)  # Require at least 5 or 1/6 of window
+        
+        if len(self.returns_history) < min_observations:
             return 0.0
         
         returns_array = np.array(self.returns_history)
@@ -203,27 +218,113 @@ class TradingEnv(gym.Env):
         # Remove any NaN or infinite values
         returns_array = returns_array[np.isfinite(returns_array)]
         
-        if len(returns_array) == 0:
+        if len(returns_array) < min_observations:
             return 0.0
         
+        # Use robust statistics for better stability
         mean_return = np.mean(returns_array)
-        std_return = np.std(returns_array)
+        std_return = np.std(returns_array, ddof=1)  # Use sample standard deviation
         
         # Check for NaN values in calculations
         if not np.isfinite(mean_return) or not np.isfinite(std_return):
             return -10.0  # Large negative reward for invalid calculations
         
+        # Handle zero volatility case
         if std_return == 0:
-            return 0.0 if mean_return == self.risk_free_rate else np.sign(mean_return - self.risk_free_rate)
+            if mean_return > self.risk_free_rate:
+                return 5.0  # Positive Sharpe for positive returns with no volatility
+            elif mean_return < self.risk_free_rate:
+                return -5.0  # Negative Sharpe for negative returns with no volatility
+            else:
+                return 0.0
         
+        # Calculate Sharpe ratio
         sharpe = (mean_return - self.risk_free_rate) / std_return
         
         # Ensure the result is finite
         if not np.isfinite(sharpe):
             return -10.0
         
-        # Clip to reasonable bounds to prevent extreme values
-        return float(np.clip(sharpe, -10.0, 10.0))
+        # Apply reasonable bounds to prevent extreme values
+        sharpe_clipped = np.clip(sharpe, -15.0, 15.0)
+        
+        return float(sharpe_clipped)
+    
+    def _calculate_rolling_sharpe_ratio(self) -> float:
+        """Calculate rolling Sharpe ratio using exponential moving average for smoother updates."""
+        current_sharpe = self._calculate_sharpe_ratio()
+        
+        # Update running Sharpe using exponential moving average
+        if len(self.returns_history) >= 5:
+            self.running_sharpe = (1 - self.sharpe_ema_alpha) * self.running_sharpe + self.sharpe_ema_alpha * current_sharpe
+        else:
+            self.running_sharpe = current_sharpe
+            
+        return self.running_sharpe
+    
+    def _calculate_risk_adjusted_return(self) -> float:
+        """Calculate risk-adjusted return incorporating both return and volatility."""
+        if len(self.returns_history) < 5:
+            return 0.0
+            
+        returns_array = np.array(self.returns_history)
+        returns_array = returns_array[np.isfinite(returns_array)]
+        
+        if len(returns_array) == 0:
+            return 0.0
+            
+        # Calculate return and volatility
+        mean_return = np.mean(returns_array)
+        std_return = np.std(returns_array, ddof=1)
+        
+        if not np.isfinite(mean_return) or not np.isfinite(std_return):
+            return -10.0
+        
+        # Risk-adjusted return: return - penalty for volatility
+        volatility_penalty = 0.5 * std_return  # Penalty factor for high volatility
+        risk_adjusted = mean_return - volatility_penalty
+        
+        return float(np.clip(risk_adjusted, -10.0, 10.0))
+    
+    def _calculate_overtrading_penalty(self) -> float:
+        """
+        Calculate penalty for overtrading based on trade frequency.
+        
+        Returns:
+            float: Penalty value (always non-positive)
+        """
+        if self.total_trades == 0:
+            return 0.0
+            
+        # Calculate optimal trade frequency (trades per step)
+        # For most strategies, trading every 10-20 steps is reasonable
+        current_steps = max(1, self.current_step - self.initial_index)
+        optimal_trades = current_steps / 15.0  # Assume optimal frequency is 1 trade per 15 steps
+        
+        # Calculate overtrading ratio
+        excess_trades = max(0, self.total_trades - optimal_trades)
+        
+        # Apply progressive penalty for excess trades
+        if excess_trades > 0:
+            penalty = -self.trade_frequency_penalty * (excess_trades ** 1.2)  # Exponential penalty
+            return max(penalty, -0.1)  # Cap maximum penalty per step
+        
+        return 0.0
+    
+    def _calculate_hybrid_reward(self, period_return: float) -> float:
+        """Calculate hybrid reward combining returns and Sharpe ratio."""
+        # Weight factors
+        return_weight = 0.7
+        sharpe_weight = 0.3
+        
+        # Get current Sharpe ratio (normalized)
+        current_sharpe = self._calculate_rolling_sharpe_ratio()
+        sharpe_normalized = np.tanh(current_sharpe / 5.0)  # Normalize Sharpe to [-1, 1] range
+        
+        # Combine return and Sharpe components
+        hybrid_reward = return_weight * period_return + sharpe_weight * sharpe_normalized
+        
+        return float(np.clip(hybrid_reward, -10.0, 10.0))
 
     def seed(self, seed=None):
         """Set random seed for reproducibility."""
@@ -253,10 +354,17 @@ class TradingEnv(gym.Env):
         
         # Reset Sharpe ratio tracking
         self.returns_history.clear()
+        self.portfolio_history.clear()
+        self.portfolio_history.append(float(self.net_worth))
+        self.running_sharpe = 0.0
         
         # Reset unrealized profit bounds
         self.max_unrealized_profit = Decimal('0.0')
         self.min_unrealized_profit = Decimal('0.0')
+        
+        # Reset trade timing tracking
+        self.steps_since_last_trade = 0
+        self.total_trades = 0
         
         obs = self._get_obs()
         return obs, {}
@@ -266,7 +374,7 @@ class TradingEnv(gym.Env):
         Constructs the observation at the current time step.
 
         Returns:
-            np.ndarray: Array with [close_norm, technical_indicators..., position, unrealized_profit_norm].
+            np.ndarray: Array with [close_norm, technical_indicators..., position, unrealized_profit_norm, steps_since_last_trade_norm].
         """
         # Get close_norm value
         close_norm = self.data.loc[self.current_step, "close_norm"]
@@ -312,16 +420,19 @@ class TradingEnv(gym.Env):
         unrealized_profit = self._calculate_unrealized_profit()
         unrealized_profit_norm = self._normalize_unrealized_profit(unrealized_profit)
         
+        # Normalize steps since last trade (cap at 50 steps for normalization)
+        steps_since_last_trade_norm = min(self.steps_since_last_trade / 50.0, 1.0)
+        
         # DEBUGGING: Print details about observation vector construction
         logger = logging.getLogger(__name__)
     
         
         observation_elements = ["close_norm"]
         observation_elements.extend(self.technical_indicators)
-        observation_elements.extend(["position", "unrealized_profit_norm"])
+        observation_elements.extend(["position", "unrealized_profit_norm", "steps_since_last_trade_norm"])
         
         # Combine all features
-        obs = np.array([close_norm] + indicators + [position, unrealized_profit_norm], dtype=np.float32)
+        obs = np.array([close_norm] + indicators + [position, unrealized_profit_norm, steps_since_last_trade_norm], dtype=np.float32)
         
         # Replace any NaN or infinite values with 0
         obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -343,6 +454,9 @@ class TradingEnv(gym.Env):
 
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
+            
+        NOTE: The reward is now based on raw period returns (log returns) rather than Sharpe ratio.
+        This provides more direct feedback to the agent about portfolio performance.
         """
         info = {}
         
@@ -352,17 +466,20 @@ class TradingEnv(gym.Env):
         # Current price
         current_price = money.to_decimal(self.data.loc[self.current_step, "close"])
         
-        # Track old position to detect changes for transaction cost
+        # Track old position to detect trades
         old_position = self.position
+        trade_occurred = False
         
         # Update position based on action
         if action == 0:  # Buy action
             if self.position == 0:  # Currently neutral - go long
                 self.position = 1
                 self.entry_price = current_price
+                trade_occurred = True
             elif self.position == -1:  # Currently short - close position
                 self.position = 0
                 self.entry_price = Decimal('0.0')
+                trade_occurred = True
             else:  # Already long (position == 1) - maintain position
                 pass
                 
@@ -370,14 +487,23 @@ class TradingEnv(gym.Env):
             if self.position == 0:  # Currently neutral - go short
                 self.position = -1
                 self.entry_price = current_price
+                trade_occurred = True
             elif self.position == 1:  # Currently long - close position
                 self.position = 0
                 self.entry_price = Decimal('0.0')
+                trade_occurred = True
             else:  # Already short (position == -1) - maintain position
                 pass
                 
         elif action == 2:  # Hold current position
             pass  # No change to position
+            
+        # Update trade tracking
+        if trade_occurred:
+            self.total_trades += 1
+            self.steps_since_last_trade = 0
+        else:
+            self.steps_since_last_trade += 1
             
         # Advance to next step
         self.current_step += 1
@@ -430,18 +556,44 @@ class TradingEnv(gym.Env):
             period_return = 0.0
             self.returns_history.append(period_return)
         
-        # Calculate Sharpe ratio as reward
-        reward = self._calculate_sharpe_ratio()
+        # Update portfolio history for Sharpe calculation
+        self.portfolio_history.append(float(self.net_worth))
+        
+        # Calculate base reward based on selected reward type
+        if self.reward_type == "returns":
+            base_reward = period_return
+        elif self.reward_type == "sharpe":
+            # Use Sharpe ratio as reward (scaled appropriately)
+            current_sharpe = self._calculate_rolling_sharpe_ratio()
+            base_reward = current_sharpe * 0.1  # Scale down Sharpe for reward range
+        elif self.reward_type == "hybrid":
+            base_reward = self._calculate_hybrid_reward(period_return)
+        elif self.reward_type == "risk_adjusted":
+            base_reward = self._calculate_risk_adjusted_return()
+        else:
+            # Default to returns
+            base_reward = period_return
+            
+        # Apply overtrading penalty
+        overtrading_penalty = self._calculate_overtrading_penalty()
+        reward = base_reward + overtrading_penalty
         
         obs = self._get_obs()
         
         # Add info about current state
         info["position"] = self.position
         info["reward"] = float(reward)
+        info["base_reward"] = float(base_reward)
+        info["overtrading_penalty"] = float(overtrading_penalty)
         info["period_return"] = float(period_return)
         info["net_worth"] = float(self.net_worth)
         info["position_size"] = self.position_size
         info["unrealized_profit"] = float(self._calculate_unrealized_profit())
-        info["sharpe_ratio"] = reward
+        info["sharpe_ratio"] = self._calculate_sharpe_ratio()  # Standard Sharpe for tracking
+        info["rolling_sharpe_ratio"] = self._calculate_rolling_sharpe_ratio()  # Rolling Sharpe for tracking
+        info["reward_type"] = self.reward_type
+        info["total_trades"] = self.total_trades
+        info["steps_since_last_trade"] = self.steps_since_last_trade
+        info["trade_occurred"] = trade_occurred
         
         return obs, float(reward), terminated, truncated, info

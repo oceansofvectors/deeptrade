@@ -1,45 +1,47 @@
 seed: 42 #Global RNG seed
 
 training:
-  total_timesteps: 250000
+  total_timesteps: 120000
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 100
-  improvement_threshold: 0.20
-  additional_timesteps: 1000
-  n_stagnant_loops: 20
-  verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
+  max_iterations: 10
+  improvement_threshold: 0.1
+  additional_timesteps: 5000
+  n_stagnant_loops: 3
+  verbose: 1  # 0 for minimal output, 1 for normal, 2 for detailed
+  use_validation: true
   # Evaluation metric configuration
   evaluation:
-    metric: "return"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
+    metric: "composite_score"  # Options: "total_return_pct", "sharpe_ratio", "composite_score", "risk_adjusted_score", "hit_rate", "prediction_accuracy"
+    reward_type: "hybrid"  # Options: "returns", "sharpe", "hybrid", "risk_adjusted"
   
   # Data augmentation configuration for creating multiple synthetic training datasets
   data_augmentation:
-    enabled: true  # Enable/disable data augmentation
+    enabled: false  # Enable/disable data augmentation during training
     config:
       # Jittering: Add noise to data
       jittering:
         enabled: true
-        num_datasets: 2  # Number of jittered datasets to create
+        num_datasets: 2
         config:
-          price_noise_std: 0.0003  # Standard deviation of noise for price columns (0.03%)
-          indicator_noise_std: 0.008  # Standard deviation of noise for indicator columns (0.8%)
-          volume_noise_std: 0.02  # Standard deviation of noise for volume columns (2%)
+          price_noise_std: 0.0005
+          indicator_noise_std: 0.01
+          volume_noise_std: 0.03
       
       # Cut-and-paste: Rearrange segments of data
       cutpaste:
         enabled: true
-        num_datasets: 2  # Number of cut-paste datasets to create
+        num_datasets: 1
         config:
-          segment_size_range: [30, 120]  # Min and max size of segments to cut/paste
-          num_operations: 1  # Number of cut-paste operations per dataset
-          preserve_trend: true  # Try to preserve overall price trend when pasting
+          segment_size_range: [30, 100]
+          num_operations: 1
+          preserve_trend: true
       
       # Bootstrap sampling: Sample with replacement
       bootstrap:
-        enabled: false  # Disabled by default as it can be disruptive to time series
-        num_datasets: 1  # Number of bootstrap datasets to create
-        sample_ratio: 0.9  # Ratio of original data to sample
+        enabled: false
+        num_datasets: 1
+        sample_ratio: 0.9
       
       # Sliding window: Create overlapping windows
       sliding_window:
@@ -136,6 +138,7 @@ environment:
   position_size: 1  # Number of NQ futures contracts to trade (default: 1)
   transaction_cost: 0.0  # Transaction cost as percentage
   returns_window: 30  # Window size for Sharpe ratio calculation (number of period returns)
+  reward_type: "returns"  # Default reward type: "returns", "sharpe", "hybrid", "risk_adjusted"
 
 model:
   ent_coef: 0.00011640494075069245
@@ -159,14 +162,14 @@ risk_management:
   
   # Stop loss configuration
   stop_loss:
-    enabled: false 
+    enabled: true 
     mode: "percentage"  # Options: "percentage", "atr"
-    percentage: 17  # Stop loss as percentage of portfolio value (used when mode="percentage")
+    percentage: 1  # Stop loss as percentage of portfolio value (used when mode="percentage")
     atr_multiplier: 5.0  # Stop loss as multiple of ATR (used when mode="atr")
   
   # Take profit configuration
   take_profit:
-    enabled: true 
+    enabled: false 
     mode: "percentage"  # Options: "percentage", "atr"
     percentage: 20  # Take profit as percentage of portfolio value (used when mode="percentage")
     atr_multiplier: 5.0  # Take profit as multiple of ATR (used when mode="atr")
@@ -185,8 +188,8 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true
-  window_size: 120
-  step_size: 30
+  window_size: 90
+  step_size: 7
   parallel_processing:
     enabled: true   # Enable parallel processing for walk-forward windows
     n_processes: 0  # Auto-detect number of CPU cores
@@ -195,10 +198,35 @@ walk_forward:
 # Hyperparameter tuning configuration
 hyperparameter_tuning:
   enabled: true
+  walk_forward_enabled: true  # Enable hyperparameter tuning for each walk-forward window
   n_trials: 30
+  eval_metric: "return"  # Metric to optimize: "return", "hit_rate", "prediction_accuracy"
+  timeout: null  # Maximum time in seconds for tuning (null = no timeout)
+  hit_rate_min_trades: 5  # Minimum trades required for hit rate evaluation
+  min_predictions: 10  # Minimum predictions required for prediction accuracy evaluation
+  
+  # Early stopping configuration for underperforming trials
+  pruning:
+    enabled: true  # Enable pruning to stop underperforming trials early
+    type: "median"  # Options: "median", "percentile", "successive_halving"
+    
+    # Median pruner settings (used when type="median")
+    n_startup_trials: 5  # Number of trials before pruning starts
+    n_warmup_steps: 3  # Number of steps before pruning evaluation
+    interval_steps: 1  # Interval between pruning evaluations
+    
+    # Percentile pruner settings (used when type="percentile")
+    percentile: 25.0  # Percentile threshold for pruning (trials below this are pruned)
+    
+    # Successive halving pruner settings (used when type="successive_halving")
+    min_resource: 1  # Minimum resource allocation
+    reduction_factor: 4  # Factor by which to reduce resources
+    min_early_stopping_rate: 0  # Minimum early stopping rate
+  
   parallel_processing:
     enabled: false  # Disable parallel processing for hyperparameter tuning
     n_jobs: 1      # Use single process for tuning
+    
   # Parameters to tune (these are the search spaces)
   parameters:
     learning_rate: 

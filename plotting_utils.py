@@ -183,6 +183,107 @@ def plot_cumulative_performance(results: List[Dict], save_path: str = None) -> N
     
     plt.close()
 
+def plot_sharpe_comparison(results: Dict, save_path: str = None) -> None:
+    """Plot comparison between individual window Sharpe ratios and pooled Sharpe ratio."""
+    if not results or 'all_window_results' not in results:
+        return
+    
+    window_results = results['all_window_results']
+    if not window_results:
+        return
+        
+    windows = [r.get('window', i+1) for i, r in enumerate(window_results)]
+    sharpe_ratios = [r.get('sharpe_ratio', 0) for r in window_results]
+    avg_sharpe = results.get('avg_sharpe_ratio', 0)
+    pooled_sharpe = results.get('pooled_sharpe_ratio', 0)
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Plot individual window Sharpe ratios
+    plt.bar(windows, sharpe_ratios, alpha=0.7, color='lightblue', 
+            label=f'Individual Windows (avg: {avg_sharpe:.2f})')
+    
+    # Add horizontal lines for average and pooled Sharpe ratios
+    plt.axhline(y=avg_sharpe, color='blue', linestyle='--', linewidth=2, 
+                label=f'Average Sharpe: {avg_sharpe:.2f}')
+    plt.axhline(y=pooled_sharpe, color='red', linestyle='-', linewidth=2, 
+                label=f'Pooled Sharpe: {pooled_sharpe:.2f}')
+    
+    plt.xlabel('Walk-Forward Window')
+    plt.ylabel('Sharpe Ratio')
+    plt.title('Sharpe Ratio Comparison: Individual vs Pooled')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Add text annotation explaining the difference
+    y_range = max(sharpe_ratios) - min(sharpe_ratios) if sharpe_ratios else 1
+    plt.text(0.02, 0.98, 
+             f'Pooled Sharpe uses all {sum(len(r.get("portfolio_history", [])) for r in window_results)} returns\n'
+             f'from {len(window_results)} windows combined into one calculation',
+             transform=plt.gca().transAxes, fontsize=10,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(f'{save_path}/sharpe_comparison.png', dpi=150, bbox_inches='tight')
+    
+    plt.close()
+
+def plot_hyperparameter_tuning_summary(results: Dict, save_path: str = None) -> None:
+    """Plot summary of hyperparameter tuning results across windows."""
+    if not results or 'all_window_results' not in results:
+        return
+    
+    window_results = results['all_window_results']
+    tuned_windows = [r for r in window_results if r.get('best_hyperparameters') is not None]
+    
+    if not tuned_windows:
+        return
+    
+    # Extract hyperparameter values
+    windows = [r.get('window', i+1) for i, r in enumerate(tuned_windows)]
+    learning_rates = [r.get('best_hyperparameters', {}).get('learning_rate', 0) for r in tuned_windows]
+    n_steps = [r.get('best_hyperparameters', {}).get('n_steps', 0) for r in tuned_windows]
+    ent_coefs = [r.get('best_hyperparameters', {}).get('ent_coef', 0) for r in tuned_windows]
+    batch_sizes = [r.get('best_hyperparameters', {}).get('batch_size', 0) for r in tuned_windows]
+    
+    fig, axes = plt.subplots(4, 1, figsize=(12, 16))
+    
+    # Plot learning rates
+    axes[0].plot(windows, learning_rates, 'o-', color='blue', linewidth=2, markersize=6)
+    axes[0].set_ylabel('Learning Rate')
+    axes[0].set_title('Optimal Learning Rates by Window')
+    axes[0].set_yscale('log')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Plot n_steps
+    axes[1].plot(windows, n_steps, 'o-', color='green', linewidth=2, markersize=6)
+    axes[1].set_ylabel('N Steps')
+    axes[1].set_title('Optimal N Steps by Window')
+    axes[1].grid(True, alpha=0.3)
+    
+    # Plot entropy coefficients
+    axes[2].plot(windows, ent_coefs, 'o-', color='red', linewidth=2, markersize=6)
+    axes[2].set_ylabel('Entropy Coefficient')
+    axes[2].set_title('Optimal Entropy Coefficients by Window')
+    axes[2].set_yscale('log')
+    axes[2].grid(True, alpha=0.3)
+    
+    # Plot batch sizes
+    axes[3].plot(windows, batch_sizes, 'o-', color='purple', linewidth=2, markersize=6)
+    axes[3].set_xlabel('Walk-Forward Window')
+    axes[3].set_ylabel('Batch Size')
+    axes[3].set_title('Optimal Batch Sizes by Window')
+    axes[3].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(f'{save_path}/hyperparameter_tuning_summary.png', dpi=150, bbox_inches='tight')
+    
+    plt.close()
+
 def create_summary_report(results: Dict, save_path: str = None) -> str:
     """Create a text summary report of results."""
     
@@ -202,6 +303,10 @@ def create_summary_report(results: Dict, save_path: str = None) -> str:
     if 'avg_sharpe_ratio' in results:
         report.append(f"  Average Sharpe Ratio: {results.get('avg_sharpe_ratio', 0):.2f}")
         report.append(f"  Sharpe Ratio Std Dev: {results.get('std_sharpe_ratio', 0):.2f}")
+        
+    # Add pooled Sharpe ratio if available
+    if 'pooled_sharpe_ratio' in results:
+        report.append(f"  Pooled Sharpe Ratio: {results.get('pooled_sharpe_ratio', 0):.2f} (from all pooled returns)")
     
     report.append(f"  Average Portfolio Value: ${results.get('avg_portfolio', 0):.2f}")
     report.append(f"  Average Trades per Window: {results.get('avg_trades', 0):.1f}")
@@ -219,6 +324,26 @@ def create_summary_report(results: Dict, save_path: str = None) -> str:
         report.append(f"  Bankrupted Windows: {results.get('bankrupted_windows', 0)}")
         report.append(f"  Bankruptcy Rate: {results.get('bankruptcy_rate', 0):.1f}%")
     
+    # Hyperparameter tuning statistics
+    if 'all_window_results' in results and results['all_window_results']:
+        tuned_windows = [r for r in results['all_window_results'] if r.get('best_hyperparameters') is not None]
+        if tuned_windows:
+            report.append("")
+            report.append("HYPERPARAMETER TUNING SUMMARY:")
+            report.append(f"  Windows with Hyperparameter Tuning: {len(tuned_windows)}/{results.get('num_windows', 0)}")
+            
+            # Calculate average hyperparameters
+            if tuned_windows:
+                avg_lr = np.mean([r.get('best_hyperparameters', {}).get('learning_rate', 0) for r in tuned_windows])
+                avg_n_steps = np.mean([r.get('best_hyperparameters', {}).get('n_steps', 0) for r in tuned_windows])
+                avg_ent_coef = np.mean([r.get('best_hyperparameters', {}).get('ent_coef', 0) for r in tuned_windows])
+                avg_batch_size = np.mean([r.get('best_hyperparameters', {}).get('batch_size', 0) for r in tuned_windows])
+                
+                report.append(f"  Average Optimal Learning Rate: {avg_lr:.6f}")
+                report.append(f"  Average Optimal N Steps: {avg_n_steps:.0f}")
+                report.append(f"  Average Optimal Entropy Coef: {avg_ent_coef:.6f}")
+                report.append(f"  Average Optimal Batch Size: {avg_batch_size:.0f}")
+    
     report.append("")
     
     # Window-by-window breakdown
@@ -232,8 +357,10 @@ def create_summary_report(results: Dict, save_path: str = None) -> str:
             sharpe = window_result.get('sharpe_ratio', 0)
             portfolio = window_result.get('portfolio_value', 0)
             trades = window_result.get('trade_count', 0)
+            has_hp_tuning = window_result.get('best_hyperparameters') is not None
             
-            report.append(f"  Window {window:2d}: {ret:6.2f}% return, {sharpe:6.2f} Sharpe, ${portfolio:8.2f} portfolio, {trades:3d} trades")
+            hp_indicator = " [HP]" if has_hp_tuning else ""
+            report.append(f"  Window {window:2d}: {ret:6.2f}% return, {sharpe:6.2f} Sharpe, ${portfolio:8.2f} portfolio, {trades:3d} trades{hp_indicator}")
     
     report.append("")
     report.append("="*60)

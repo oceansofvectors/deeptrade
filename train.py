@@ -55,7 +55,8 @@ class ModelTrainer:
             batch_size=model_params.get("batch_size", 64),
             gamma=model_params.get("gamma", 0.99),
             gae_lambda=model_params.get("gae_lambda", 0.95),
-            seed=self.config.get('seed')
+            seed=self.config.get('seed'),
+            device="cpu"  # Force CPU usage
         )
         
         return model
@@ -192,13 +193,15 @@ class ModelTrainer:
                 returns_window=self.config["environment"].get("returns_window", 30)
             )
             
-            # Update model environment - this ensures fresh episodes start from beginning
-            # of each dataset rather than continuing from previous dataset's final state
+            # Update model environment and force episode reset for new dataset
             model.set_env(env)
             
-            # Train on the new dataset - PPO will handle episode resets internally
-            # reset_num_timesteps=False keeps the global timestep counter continuous
-            model.learn(total_timesteps=additional_timesteps, reset_num_timesteps=False)
+            # Force environment reset to start fresh episode with new dataset
+            env.reset()
+            
+            # Train on the new dataset with episode reset
+            # reset_num_timesteps=True ensures proper episode boundaries between datasets
+            model.learn(total_timesteps=additional_timesteps, reset_num_timesteps=True)
             
             # Evaluate on validation data
             results = evaluator.evaluate(model, self.validation_data)
@@ -287,8 +290,11 @@ class ModelTrainer:
         return best_model, {"best_results": best_results, "history": training_history}
     
     def _get_metric_value(self, results: Dict) -> float:
-        """Extract the metric value based on config."""
-        metric = self.config.get("training", {}).get("evaluation", {}).get("metric", "sharpe_ratio")
+        """Extract the metric value based on config.
+        
+        Enhanced to support composite metrics that balance returns and risk.
+        """
+        metric = self.config.get("training", {}).get("evaluation", {}).get("metric", "composite_score")
         
         if metric == "hit_rate":
             return results.get("hit_rate", 0)
@@ -296,14 +302,66 @@ class ModelTrainer:
             return results.get("prediction_accuracy", 0)
         elif metric == "sharpe_ratio":
             return results.get("sharpe_ratio", 0)
+        elif metric == "total_return_pct":
+            return results.get("total_return_pct", 0)
+        elif metric == "composite_score":
+            return self._calculate_composite_score(results)
+        elif metric == "risk_adjusted_score":
+            return self._calculate_risk_adjusted_score(results)
         else:
             return results.get("total_return_pct", 0)
+    
+    def _calculate_composite_score(self, results: Dict) -> float:
+        """Calculate composite score balancing returns, Sharpe ratio, and other metrics."""
+        total_return = results.get("total_return_pct", 0)
+        sharpe_ratio = results.get("sharpe_ratio", 0)
+        hit_rate = results.get("hit_rate", 0) / 100.0  # Convert to decimal
+        portfolio_bankrupted = results.get("portfolio_bankrupted", False)
+        
+        # Severe penalty for bankruptcy
+        if portfolio_bankrupted:
+            return -1000.0
+        
+        # Weights for different components
+        return_weight = 0.4
+        sharpe_weight = 0.4
+        hit_rate_weight = 0.2
+        
+        # Normalize Sharpe ratio to similar scale as returns
+        sharpe_normalized = np.tanh(sharpe_ratio / 3.0) * 20  # Scale to ~±20 range
+        
+        # Calculate composite score
+        composite = (return_weight * total_return + 
+                    sharpe_weight * sharpe_normalized + 
+                    hit_rate_weight * (hit_rate - 0.5) * 40)  # Hit rate bonus/penalty
+        
+        return float(composite)
+    
+    def _calculate_risk_adjusted_score(self, results: Dict) -> float:
+        """Calculate risk-adjusted score emphasizing consistent performance."""
+        total_return = results.get("total_return_pct", 0)
+        sharpe_ratio = results.get("sharpe_ratio", 0)
+        portfolio_bankrupted = results.get("portfolio_bankrupted", False)
+        
+        # Severe penalty for bankruptcy
+        if portfolio_bankrupted:
+            return -1000.0
+        
+        # For risk-adjusted scoring, prioritize Sharpe ratio over raw returns
+        if sharpe_ratio > 0:
+            # Reward positive Sharpe with bonus for high values
+            risk_adjusted = total_return * (1 + min(sharpe_ratio / 2.0, 2.0))
+        else:
+            # Penalize negative Sharpe by reducing the return score
+            risk_adjusted = total_return * max(0.1, 1 + sharpe_ratio / 5.0)
+        
+        return float(risk_adjusted)
 
 class ModelEvaluator:
     """Handles model evaluation with different metrics."""
     
     def evaluate(self, model: PPO, test_data: pd.DataFrame, 
-                 deterministic: bool = True, verbose: int = 0) -> Dict:
+                 deterministic: bool = True, verbose: int = 0, reward_type: str = "hybrid") -> Dict:
         """Evaluate model and return comprehensive results."""
         
         # Ensure close_norm column exists
@@ -316,7 +374,8 @@ class ModelEvaluator:
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 0.0),
             position_size=config["environment"].get("position_size", 1),
-            returns_window=config["environment"].get("returns_window", 30)
+            returns_window=config["environment"].get("returns_window", 30),
+            reward_type=reward_type
         )
         
         # Run evaluation
@@ -325,6 +384,8 @@ class ModelEvaluator:
         
         portfolio_history = [float(env.net_worth)]
         action_history = []
+        reward_history = []
+        sharpe_history = []
         portfolio_bankrupted = False
         
         done = False
@@ -336,6 +397,10 @@ class ModelEvaluator:
             
             obs, reward, terminated, truncated, info = env.step(int(action))
             done = terminated or truncated
+            
+            # Track additional metrics
+            reward_history.append(reward)
+            sharpe_history.append(info.get("rolling_sharpe_ratio", 0))
             
             # Check if portfolio was bankrupted
             if info.get("portfolio_bankrupted", False):
@@ -352,22 +417,38 @@ class ModelEvaluator:
         if portfolio_bankrupted:
             total_return_pct = -100.0
             sharpe_ratio = -999.0  # Very negative Sharpe for bankruptcy
+            enhanced_sharpe_ratio = -999.0
         else:
             total_return_pct = money.calculate_return_pct(final_balance, initial_balance)
             sharpe_ratio = self._calculate_sharpe_ratio(portfolio_history)
+            enhanced_sharpe_ratio = self._calculate_enhanced_sharpe_ratio(portfolio_history)
         
-        return {
+        # Calculate additional performance metrics
+        volatility = self._calculate_volatility(portfolio_history)
+        max_drawdown = self._calculate_max_drawdown(portfolio_history)
+        calmar_ratio = self._calculate_calmar_ratio(total_return_pct, max_drawdown)
+        
+        results = {
             "final_portfolio_value": float(final_balance),
             "total_return_pct": float(total_return_pct),
             "sharpe_ratio": float(sharpe_ratio),
+            "enhanced_sharpe_ratio": float(enhanced_sharpe_ratio),
+            "volatility": float(volatility),
+            "max_drawdown": float(max_drawdown),
+            "calmar_ratio": float(calmar_ratio),
             "trade_count": step_count,
             "hit_rate": self._calculate_hit_rate(action_history, test_data),
             "prediction_accuracy": self._calculate_prediction_accuracy(action_history, test_data),
             "portfolio_history": portfolio_history,
             "action_history": action_history,
+            "reward_history": reward_history,
+            "sharpe_history": sharpe_history,
             "final_position": env.position,
-            "portfolio_bankrupted": portfolio_bankrupted
+            "portfolio_bankrupted": portfolio_bankrupted,
+            "reward_type": reward_type
         }
+        
+        return results
     
     def _get_close_column(self, data: pd.DataFrame) -> str:
         """Get the appropriate close price column name."""
@@ -434,6 +515,93 @@ class ModelEvaluator:
         sharpe_ratio_annualized = sharpe_ratio * np.sqrt(252)  # 252 trading days per year
         
         return sharpe_ratio_annualized
+    
+    def _calculate_enhanced_sharpe_ratio(self, portfolio_history: List[float], risk_free_rate: float = 0.0) -> float:
+        """Calculate enhanced Sharpe ratio with better handling of edge cases."""
+        if len(portfolio_history) < 2:
+            return 0.0
+        
+        # Calculate period returns using log returns for better properties
+        returns = []
+        for i in range(1, len(portfolio_history)):
+            if portfolio_history[i-1] > 0:
+                log_return = np.log(portfolio_history[i] / portfolio_history[i-1])
+                returns.append(log_return)
+        
+        if len(returns) < 2:
+            return 0.0
+        
+        returns = pd.Series(returns)
+        
+        # Remove outliers using IQR method for more robust calculation
+        Q1 = returns.quantile(0.25)
+        Q3 = returns.quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        # Filter out outliers
+        filtered_returns = returns[(returns >= lower_bound) & (returns <= upper_bound)]
+        
+        if len(filtered_returns) < 2:
+            filtered_returns = returns  # Use original if too many outliers
+        
+        # Calculate mean return and standard deviation
+        mean_return = filtered_returns.mean()
+        std_return = filtered_returns.std(ddof=1)
+        
+        # Handle edge cases
+        if pd.isna(mean_return) or pd.isna(std_return) or std_return == 0:
+            return 0.0
+        
+        # Calculate Sharpe ratio
+        sharpe_ratio = (mean_return - risk_free_rate) / std_return
+        
+        # Annualize the Sharpe ratio
+        sharpe_ratio_annualized = sharpe_ratio * np.sqrt(252)
+        
+        return sharpe_ratio_annualized
+    
+    def _calculate_volatility(self, portfolio_history: List[float]) -> float:
+        """Calculate annualized volatility of portfolio returns."""
+        if len(portfolio_history) < 2:
+            return 0.0
+        
+        returns = []
+        for i in range(1, len(portfolio_history)):
+            if portfolio_history[i-1] > 0:
+                period_return = (portfolio_history[i] - portfolio_history[i-1]) / portfolio_history[i-1]
+                returns.append(period_return)
+        
+        if len(returns) < 2:
+            return 0.0
+        
+        returns_series = pd.Series(returns)
+        volatility = returns_series.std(ddof=1) * np.sqrt(252)  # Annualized
+        
+        return volatility if pd.notna(volatility) else 0.0
+    
+    def _calculate_max_drawdown(self, portfolio_history: List[float]) -> float:
+        """Calculate maximum drawdown as a percentage."""
+        if len(portfolio_history) < 2:
+            return 0.0
+        
+        portfolio_series = pd.Series(portfolio_history)
+        rolling_max = portfolio_series.expanding().max()
+        drawdown = (portfolio_series - rolling_max) / rolling_max * 100
+        max_drawdown = drawdown.min()
+        
+        return abs(max_drawdown) if pd.notna(max_drawdown) else 0.0
+    
+    def _calculate_calmar_ratio(self, total_return_pct: float, max_drawdown: float) -> float:
+        """Calculate Calmar ratio (annual return / max drawdown)."""
+        if max_drawdown == 0:
+            return 0.0 if total_return_pct <= 0 else float('inf')
+        
+        # Annualize the return (assuming the evaluation period represents the annualized return)
+        calmar = total_return_pct / max_drawdown
+        
+        return calmar if pd.notna(calmar) else 0.0
 
 def save_trade_history(trade_history: List[Dict], filename: str = "trade_history.csv"):
     """Save trade history to CSV file."""
@@ -444,12 +612,19 @@ def save_trade_history(trade_history: List[Dict], filename: str = "trade_history
 
 def main():
     """Main training function."""
-    # Set up deterministic training
+    # Force CPU usage - disable CUDA
     import torch
+    torch.device("cpu")
+    torch.set_default_device("cpu")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    
+    # Set up deterministic training
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
     set_global_seed(config["seed"])
+    
+    logger.info("Forcing CPU usage - CUDA disabled")
     
     # Load data
     train_data, validation_data, test_data = get_data(
@@ -487,7 +662,8 @@ def main():
     
     # Final evaluation on test data
     logger.info("Evaluating on test data")
-    test_results = evaluator.evaluate(model, test_data, verbose=1)
+    reward_type = training_config.get("evaluation", {}).get("reward_type", "hybrid")
+    test_results = evaluator.evaluate(model, test_data, verbose=1, reward_type=reward_type)
     
     # Log results
     logger.info("="*60)
@@ -496,8 +672,20 @@ def main():
     logger.info(f"Final Portfolio Value: ${test_results['final_portfolio_value']:.2f}")
     logger.info(f"Total Return: {test_results['total_return_pct']:.2f}%")
     logger.info(f"Sharpe Ratio: {test_results['sharpe_ratio']:.2f}")
+    logger.info(f"Enhanced Sharpe Ratio: {test_results['enhanced_sharpe_ratio']:.2f}")
+    logger.info(f"Volatility: {test_results['volatility']:.2f}%")
+    logger.info(f"Max Drawdown: {test_results['max_drawdown']:.2f}%")
+    logger.info(f"Calmar Ratio: {test_results['calmar_ratio']:.2f}")
     logger.info(f"Hit Rate: {test_results['hit_rate']:.2f}%")
     logger.info(f"Prediction Accuracy: {test_results['prediction_accuracy']:.2f}%")
+    logger.info(f"Reward Type Used: {test_results['reward_type']}")
+    
+    # Calculate and log composite scores
+    trainer_instance = ModelTrainer(train_data, validation_data)
+    composite_score = trainer_instance._calculate_composite_score(test_results)
+    risk_adjusted_score = trainer_instance._calculate_risk_adjusted_score(test_results)
+    logger.info(f"Composite Score: {composite_score:.2f}")
+    logger.info(f"Risk-Adjusted Score: {risk_adjusted_score:.2f}")
     
     # Save model and results
     os.makedirs("models", exist_ok=True)
@@ -506,7 +694,9 @@ def main():
     with open("models/final_results.json", "w") as f:
         json.dump({
             "test_results": test_results,
-            "validation_results": best_results if use_validation else None
+            "validation_results": best_results if use_validation else None,
+            "composite_score": composite_score,
+            "risk_adjusted_score": risk_adjusted_score
         }, f, indent=4, default=str)
     
     logger.info("Model and results saved to models/")

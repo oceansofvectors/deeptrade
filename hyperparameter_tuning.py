@@ -11,7 +11,7 @@ from stable_baselines3 import PPO
 from environment import TradingEnv
 from config import config
 from trade import trade_with_risk_management
-from walk_forward import calculate_hit_rate_from_trade_results, evaluate_agent_prediction_accuracy
+from train import ModelEvaluator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -23,10 +23,11 @@ def objective_func(
     validation_data: pd.DataFrame,
     eval_metric: str = "return",
     hit_rate_min_trades: int = 5,
-    min_predictions: int = 10
+    min_predictions: int = 10,
+    report_intermediate: bool = False
 ) -> float:
     """
-    Objective function for hyperparameter optimization.
+    Objective function for hyperparameter optimization with pruning support.
     
     Args:
         trial: Optuna trial
@@ -35,6 +36,7 @@ def objective_func(
         eval_metric: Evaluation metric (return, hit_rate, prediction_accuracy)
         hit_rate_min_trades: Minimum number of trades required for hit rate
         min_predictions: Minimum number of predictions for prediction accuracy
+        report_intermediate: Whether to report intermediate values for pruning
         
     Returns:
         float: Value to maximize
@@ -144,83 +146,110 @@ def objective_func(
             position_size = position_sizing_config.get("size_multiplier", 1.0)
             max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 2.0)
     
-    # Evaluate on validation data based on the chosen metric
-    if eval_metric == "prediction_accuracy":
-        # Use prediction accuracy evaluation
-        results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=0, deterministic=True)
-    elif eval_metric == "hit_rate":
-        # Save the model temporarily for evaluation with risk management
-        temp_model_path = f"models/trials/temp_model_trial_{trial.number}"
-        model.save(temp_model_path)
-        
-        # Evaluate with risk management
-        results = trade_with_risk_management(
-            model_path=temp_model_path,
-            test_data=validation_data,
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-            trailing_stop_pct=trailing_stop_pct,
-            position_size=position_size,
-            max_risk_per_trade_pct=max_risk_per_trade_pct,
-            initial_balance=config["environment"]["initial_balance"],
-            transaction_cost=config["environment"].get("transaction_cost", 0.0),
-            verbose=0,
-            deterministic=True,
-            close_at_end_of_day=True
-        )
-        
-        # Clean up temporary model file
-        if os.path.exists(f"{temp_model_path}.zip"):
-            os.remove(f"{temp_model_path}.zip")
+    # Evaluate on validation data using ModelEvaluator
+    evaluator = ModelEvaluator()
+    
+    # For hyperparameter tuning, use simple evaluation without risk management for speed
+    if eval_metric in ["prediction_accuracy", "hit_rate"]:
+        # Use ModelEvaluator for prediction accuracy and hit rate
+        results = evaluator.evaluate(model, validation_data, verbose=0, deterministic=True)
+    else:  # Default to return - can use either method
+        if risk_enabled:
+            # Use risk management evaluation if enabled
+            temp_model_path = f"models/trials/temp_model_trial_{trial.number}"
+            model.save(temp_model_path)
             
-        # Calculate hit rate from trade results
-        results = calculate_hit_rate_from_trade_results(results)
-    else:  # Default to return
-        # Save the model temporarily for evaluation
-        temp_model_path = f"models/trials/temp_model_trial_{trial.number}"
-        model.save(temp_model_path)
-        
-        # Evaluate with risk management
-        results = trade_with_risk_management(
-            model_path=temp_model_path,
-            test_data=validation_data,
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-            trailing_stop_pct=trailing_stop_pct,
-            position_size=position_size,
-            max_risk_per_trade_pct=max_risk_per_trade_pct,
-            initial_balance=config["environment"]["initial_balance"],
-            transaction_cost=config["environment"].get("transaction_cost", 0.0),
-            verbose=0,
-            deterministic=True,
-            close_at_end_of_day=True
-        )
-        
-        # Clean up temporary model file
-        if os.path.exists(f"{temp_model_path}.zip"):
-            os.remove(f"{temp_model_path}.zip")
+            # Evaluate with risk management
+            results = trade_with_risk_management(
+                model_path=temp_model_path,
+                test_data=validation_data,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                trailing_stop_pct=trailing_stop_pct,
+                position_size=position_size,
+                max_risk_per_trade_pct=max_risk_per_trade_pct,
+                initial_balance=config["environment"]["initial_balance"],
+                transaction_cost=config["environment"].get("transaction_cost", 0.0),
+                verbose=0,
+                deterministic=True,
+                close_at_end_of_day=True
+            )
+            
+            # Clean up temporary model file
+            if os.path.exists(f"{temp_model_path}.zip"):
+                os.remove(f"{temp_model_path}.zip")
+        else:
+            # Use simple evaluation for speed
+            results = evaluator.evaluate(model, validation_data, verbose=0, deterministic=True)
     
     # Determine metric value to optimize
-    if eval_metric == "hit_rate" and results["trade_count"] >= hit_rate_min_trades:
+    if eval_metric == "hit_rate" and results.get("trade_count", 0) >= hit_rate_min_trades:
         metric_value = results["hit_rate"]
-        logger.info(f"Trial {trial.number}: Hit Rate = {metric_value:.2f}% ({results.get('profitable_trades', 0)}/{results['trade_count']} trades)")
-    elif eval_metric == "prediction_accuracy" and results.get("total_predictions", 0) >= min_predictions:
+        logger.info(f"Trial {trial.number}: Hit Rate = {metric_value:.2f}% (trades: {results.get('trade_count', 0)})")
+    elif eval_metric == "prediction_accuracy" and results.get("trade_count", 0) >= min_predictions:
         metric_value = results["prediction_accuracy"]
-        logger.info(f"Trial {trial.number}: Prediction Accuracy = {metric_value:.2f}% ({results.get('correct_predictions', 0)}/{results.get('total_predictions', 0)} predictions)")
+        logger.info(f"Trial {trial.number}: Prediction Accuracy = {metric_value:.2f}% (predictions: {results.get('trade_count', 0)})")
     else:
         metric_value = results["total_return_pct"]
         logger.info(f"Trial {trial.number}: Return = {metric_value:.2f}%")
         
-        if eval_metric == "hit_rate" and results["trade_count"] < hit_rate_min_trades:
-            logger.warning(f"Not enough trades ({results['trade_count']}) for hit rate metric. Using return instead.")
-        elif eval_metric == "prediction_accuracy" and results.get("total_predictions", 0) < min_predictions:
-            logger.warning(f"Not enough predictions ({results.get('total_predictions', 0)}) for prediction accuracy metric. Using return instead.")
+        if eval_metric == "hit_rate" and results.get("trade_count", 0) < hit_rate_min_trades:
+            logger.warning(f"Not enough trades ({results.get('trade_count', 0)}) for hit rate metric. Using return instead.")
+        elif eval_metric == "prediction_accuracy" and results.get("trade_count", 0) < min_predictions:
+            logger.warning(f"Not enough predictions ({results.get('trade_count', 0)}) for prediction accuracy metric. Using return instead.")
     
     # Log all hyperparameters
     logger.info(f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, ent_coef={ent_coef:.6f}, "
                f"batch_size={batch_size}, gamma={gamma:.4f}, gae_lambda={gae_lambda:.4f}")
     
+    # Report intermediate result for pruning if enabled
+    if report_intermediate:
+        trial.report(metric_value, step=0)
+        
+        # Check if trial should be pruned
+        if trial.should_prune():
+            logger.info(f"Trial {trial.number} pruned with metric {metric_value:.2f}")
+            raise optuna.TrialPruned()
+    
     return metric_value
+
+def create_pruning_objective(train_data: pd.DataFrame, 
+                           validation_data: pd.DataFrame,
+                           eval_metric: str = "return",
+                           hit_rate_min_trades: int = 5,
+                           min_predictions: int = 10) -> callable:
+    """
+    Create a pruning-enabled objective function for hyperparameter optimization.
+    
+    Args:
+        train_data: Training data
+        validation_data: Validation data
+        eval_metric: Evaluation metric
+        hit_rate_min_trades: Minimum trades required for hit rate
+        min_predictions: Minimum predictions required for prediction accuracy
+    
+    Returns:
+        callable: Objective function with pruning support
+    """
+    def pruning_objective(trial):
+        try:
+            return objective_func(
+                trial=trial,
+                train_data=train_data,
+                validation_data=validation_data,
+                eval_metric=eval_metric,
+                hit_rate_min_trades=hit_rate_min_trades,
+                min_predictions=min_predictions,
+                report_intermediate=True
+            )
+        except optuna.TrialPruned:
+            raise
+        except Exception as e:
+            logger.error(f"Trial {trial.number} failed: {e}")
+            # Return a very bad score for failed trials
+            return -1000.0
+    
+    return pruning_objective
 
 def parallel_hyperparameter_tuning(
     train_data: pd.DataFrame,
