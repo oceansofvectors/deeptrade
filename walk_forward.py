@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import json
+import yaml
 from datetime import datetime, time, timedelta
 import pytz
 from typing import List, Dict, Tuple
@@ -74,6 +75,57 @@ def save_json(data, filepath):
     """Save data to JSON file with custom encoder for timestamps."""
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
+
+def save_best_hyperparameters_to_config(best_params: Dict, config_path: str = "config.yaml"):
+    """
+    Save the best hyperparameters to config.yaml for reuse in future runs.
+
+    Updates the model section with tuned values for: learning_rate, n_steps,
+    batch_size, gamma, gae_lambda, ent_coef, and LSTM params if present.
+
+    Args:
+        best_params: Dictionary of best hyperparameters from tuning
+        config_path: Path to the config.yaml file
+    """
+    try:
+        # Read the current config
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+
+        # Update model section with tuned hyperparameters
+        if 'model' not in config_data:
+            config_data['model'] = {}
+
+        # Map tuned params to config locations
+        model_params = ['learning_rate', 'n_steps', 'batch_size', 'gamma', 'gae_lambda', 'ent_coef']
+        for param in model_params:
+            if param in best_params:
+                config_data['model'][param] = float(best_params[param])
+
+        # Update sequence_model section for LSTM params
+        if 'sequence_model' not in config_data:
+            config_data['sequence_model'] = {}
+
+        lstm_params = ['lstm_hidden_size', 'n_lstm_layers']
+        for param in lstm_params:
+            if param in best_params:
+                config_data['sequence_model'][param] = int(best_params[param])
+
+        # Update environment section for dsr_eta
+        if 'dsr_eta' in best_params:
+            if 'environment' not in config_data:
+                config_data['environment'] = {}
+            config_data['environment']['dsr_eta'] = float(best_params['dsr_eta'])
+
+        # Write back to config
+        with open(config_path, 'w') as f:
+            yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+
+        logger.info(f"Saved best hyperparameters to {config_path}")
+        logger.info(f"Updated params: {list(best_params.keys())}")
+
+    except Exception as e:
+        logger.error(f"Failed to save hyperparameters to config: {e}")
 
 def load_tradingview_data(csv_filepath: str = "data/data/NQ_2024_unix.csv") -> pd.DataFrame:
     """
@@ -280,11 +332,11 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
     else:
         close_col = 'close'
         
-    # Create evaluation environment
+    # Create evaluation environment with realistic transaction costs
     env = TradingEnv(
         test_data,
         initial_balance=config["environment"]["initial_balance"],
-        transaction_cost=config["environment"].get("transaction_cost", 0.0),
+        transaction_cost=config["environment"].get("transaction_cost", 2.50),
         position_size=config["environment"].get("position_size", 1)
     )
     
@@ -298,11 +350,12 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
     
     # Position tracking
     current_position = 0  # 0 = no position, 1 = long, -1 = short
-    
+    entry_price = Decimal('0')  # Track entry price for P&L calculation
+
     # Trade tracking
     trade_history = []
     trade_count = 0
-    
+
     # Track action history for plotting
     action_history = []
     portfolio_history = [float(initial_balance)]
@@ -324,11 +377,13 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
         action, _ = model.predict(obs, deterministic=deterministic)
         action_history.append(int(action))
         
-        # Convert action to position (0 = long/buy, 1 = short/sell, 2 = hold)
+        # Convert action to position (0 = long/buy, 1 = short/sell, 2 = hold, 3 = flat)
         if action == 0:  # Long
             new_position = 1
         elif action == 1:  # Short
             new_position = -1
+        elif action == 3:  # Flat - close position
+            new_position = 0
         else:  # Hold - maintain current position
             new_position = current_position
         
@@ -346,7 +401,16 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
                 prediction_correct = price_change > 0
             elif action == 1:  # Short - prediction is correct if price goes down
                 prediction_correct = price_change < 0
-            elif action == 2:  # Hold - prediction is correct if price doesn't change much
+            elif action == 3:  # Flat - prediction is correct if avoiding losses (price moves against previous position)
+                # Flat is correct if we avoided a losing move
+                if current_position == 1:  # Was long, flat is correct if price went down
+                    prediction_correct = price_change < 0
+                elif current_position == -1:  # Was short, flat is correct if price went up
+                    prediction_correct = price_change > 0
+                else:  # Already flat, correct if price doesn't move much
+                    threshold = current_price * money.to_decimal(0.001)
+                    prediction_correct = abs(price_change) <= threshold
+            else:  # Hold (action == 2) - prediction is correct if price doesn't change much
                 # For hold, we'll define "correct" as the price not changing significantly
                 # Using a threshold of 0.1% of the current price
                 threshold = current_price * money.to_decimal(0.001)
@@ -362,41 +426,64 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
                 accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
                 logger.info(f"Step {current_step}: Predictions so far - {correct_predictions}/{total_predictions} correct ({accuracy:.2f}%)")
         
-        # Record every action, including HOLD actions
-        trade_count += 1
-        trade_info = {
-            "step": current_step,
-            "action": "BUY" if action == 0 else "SELL" if action == 1 else "HOLD",
-            "price": float(current_price),
-            "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step]),
-            "position_change": new_position != current_position
-        }
-        trade_history.append(trade_info)
-        
-        # Update position
-        current_position = new_position
+        # Only record actual position changes (not every step)
+        position_changed = new_position != current_position
+        if position_changed:
+            trade_count += 1
+
+            # Calculate P&L for exiting trades
+            is_profitable = False
+            trade_pnl = Decimal('0')
+            if current_position != 0 and entry_price > 0:
+                if current_position == 1:  # Was long
+                    trade_pnl = current_price - entry_price
+                    is_profitable = trade_pnl > 0
+                elif current_position == -1:  # Was short
+                    trade_pnl = entry_price - current_price
+                    is_profitable = trade_pnl > 0
+
+            action_names = {0: "LONG", 1: "SHORT", 2: "HOLD", 3: "FLAT"}
+            trade_info = {
+                "step": current_step,
+                "action": action_names.get(int(action), "UNKNOWN"),
+                "price": float(current_price),
+                "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step]),
+                "old_position": current_position,
+                "new_position": new_position,
+                "entry_price": float(entry_price) if entry_price > 0 else None,
+                "trade_pnl_points": float(trade_pnl),
+                "profitable": is_profitable
+            }
+            trade_history.append(trade_info)
+
+            # Update entry price for new positions
+            if new_position != 0:
+                entry_price = current_price
+            else:
+                entry_price = Decimal('0')
+
+            current_position = new_position
         
         # Take step in environment
         new_obs, reward, done, truncated, info = env.step(action)
         obs = new_obs
         done = done or truncated
-        
+
         # Update portfolio from environment
         current_portfolio = env.net_worth
-        portfolio_history.append(float(current_portfolio))
+        # Sample portfolio history (every 10 steps or on position change) to reduce memory
+        if position_changed or len(portfolio_history) == 0 or current_step % 10 == 0:
+            portfolio_history.append(float(current_portfolio))
     
     # Calculate final metrics
     prediction_accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
     total_return_pct = money.calculate_return_pct(current_portfolio, initial_balance)
     
-    # Calculate hit rate (percentage of profitable trades)
-    hit_rate = 0
-    profitable_trades = 0
-    if trade_count > 0:
-        # For simplicity, estimate profitable trades based on overall performance
-        # In a more detailed implementation, we'd track each trade's profitability
-        profitable_trades = int(trade_count * (prediction_accuracy / 100))
-        hit_rate = (profitable_trades / trade_count) * 100
+    # Calculate hit rate (percentage of profitable trades) from actual trade P&L
+    profitable_trades = sum(1 for t in trade_history if t.get("profitable", False))
+    # Only count trades that exited a position (have entry_price)
+    completed_trades = sum(1 for t in trade_history if t.get("entry_price") is not None)
+    hit_rate = (profitable_trades / completed_trades * 100) if completed_trades > 0 else 0
     
     # Create results dictionary
     results = {
@@ -527,7 +614,17 @@ def process_single_window(
         window_folder=window_folder,
         scaler_type=scaler_type
     )
-    
+
+    # Drop redundant columns (raw versions that have normalized equivalents, unused OHLC)
+    cols_to_drop = ['open', 'high', 'low', 'volume', 'Volume', 'SMA', 'EMA',
+                    'VWAP', 'PSAR', 'OBV', 'VOLUME_NORM', 'DOW', 'position']
+    for df in [train_data, validation_data, test_data]:
+        cols_present = [c for c in cols_to_drop if c in df.columns]
+        if cols_present:
+            df.drop(columns=cols_present, inplace=True)
+
+    logger.info(f"Model input columns ({len(train_data.columns)}): {train_data.columns.tolist()}")
+
     # Training the model with the scaled data
     model, training_stats = train_walk_forward_model(
         train_data=train_data,
@@ -667,7 +764,11 @@ def process_single_window(
         window_result["correct_predictions"] = test_results.get("correct_predictions", 0)
         window_result["total_predictions"] = test_results.get("total_predictions", 0)
     
-    logger.info(f"Window {window_idx}: Return={test_results['total_return_pct']:.2f}%, Portfolio=${test_results['final_portfolio_value']:.2f}")
+    max_dd = test_results.get('max_drawdown', 0.0)
+    calmar = test_results.get('calmar_ratio', 0.0)
+    window_result["max_drawdown"] = max_dd
+    window_result["calmar_ratio"] = calmar
+    logger.info(f"Window {window_idx}: Return={test_results['total_return_pct']:.2f}%, MaxDD={max_dd:.2f}%, Calmar={calmar:.2f}, Portfolio=${test_results['final_portfolio_value']:.2f}")
 
     if "trade_history" in test_results:
         window_result["has_trade_history"] = True
@@ -687,6 +788,7 @@ def walk_forward_testing(
     step_size: int,
     train_ratio: float = 0.7,
     validation_ratio: float = 0.15,
+    embargo_days: int = 0,
     initial_timesteps: int = 10000,
     additional_timesteps: int = 5000,
     max_iterations: int = 10,
@@ -861,17 +963,34 @@ def walk_forward_testing(
         else:
             window_data.index = window_data.index.tz_convert('UTC')
         
-        # Split window into train, validation, and test sets
+        # Split window into train, validation, and test sets with embargo gap
         train_idx = int(len(window_data) * train_ratio)
         validation_idx = train_idx + int(len(window_data) * validation_ratio)
-        
+
+        # Calculate embargo in bars (approximately 78 bars per day for market hours, 288 for 24h)
+        # Use a rough estimate of bars per day based on data frequency
+        if len(window_data) > 1:
+            time_diff = (window_data.index[1] - window_data.index[0]).total_seconds()
+            bars_per_day = int(24 * 60 * 60 / time_diff) if time_diff > 0 else 288
+        else:
+            bars_per_day = 288
+        embargo_bars = embargo_days * bars_per_day
+
         train_data = window_data.iloc[:train_idx].copy()
         validation_data = window_data.iloc[train_idx:validation_idx].copy()
-        test_data = window_data.iloc[validation_idx:].copy()
-        
-        logger.info(f"Window {i+1} - Train period: {train_data.index[0]} to {train_data.index[-1]}")
-        logger.info(f"Window {i+1} - Validation period: {validation_data.index[0]} to {validation_data.index[-1]}")
-        logger.info(f"Window {i+1} - Test period: {test_data.index[0]} to {test_data.index[-1]}")
+
+        # Apply embargo: skip embargo_bars between validation and test
+        test_start_idx = validation_idx + embargo_bars
+        if test_start_idx >= len(window_data):
+            test_start_idx = validation_idx  # Fall back if embargo is too large
+            logger.warning(f"Window {i+1} - Embargo too large, skipping embargo gap")
+        test_data = window_data.iloc[test_start_idx:].copy()
+
+        logger.info(f"Window {i+1} - Train: {train_data.index[0]} to {train_data.index[-1]} ({len(train_data)} bars)")
+        logger.info(f"Window {i+1} - Val: {validation_data.index[0]} to {validation_data.index[-1]} ({len(validation_data)} bars)")
+        if embargo_bars > 0 and test_start_idx > validation_idx:
+            logger.info(f"Window {i+1} - Embargo: {embargo_bars} bars ({embargo_days} days)")
+        logger.info(f"Window {i+1} - Test: {test_data.index[0]} to {test_data.index[-1]} ({len(test_data)} bars)")
         
         # Store window data
         window_data_list.append({
@@ -895,9 +1014,12 @@ def walk_forward_testing(
             eval_metric=eval_metric
         )["best_params"]
         
-        # Save the best hyperparameters
+        # Save the best hyperparameters to JSON report
         save_json(best_hyperparameters, f'{session_folder}/reports/best_hyperparameters.json')
         logger.info(f"Best hyperparameters found: {best_hyperparameters}")
+
+        # Save best hyperparameters to config.yaml for reuse in future runs
+        save_best_hyperparameters_to_config(best_hyperparameters)
     
     # Process windows - either in parallel or sequentially
     if use_parallel and num_windows > 1:
@@ -1195,9 +1317,41 @@ def hyperparameter_tuning(
             log=batch_size_cfg.get("log", True)
         )
 
-        # Use fixed values for gamma and gae_lambda from config
-        gamma = hp_config.get("gamma", 0.995)
-        gae_lambda = hp_config.get("gae_lambda", 0.95)
+        # Tune gamma (discount factor) - controls how much future rewards matter
+        gamma_cfg = hp_config.get("gamma", {})
+        if isinstance(gamma_cfg, dict) and "min" in gamma_cfg and "max" in gamma_cfg:
+            gamma = trial.suggest_float(
+                "gamma",
+                gamma_cfg.get("min", 0.95),
+                gamma_cfg.get("max", 0.999),
+                log=gamma_cfg.get("log", False)
+            )
+        else:
+            gamma = gamma_cfg if isinstance(gamma_cfg, (int, float)) else 0.995
+
+        # Tune gae_lambda (GAE bias-variance tradeoff)
+        gae_lambda_cfg = hp_config.get("gae_lambda", {})
+        if isinstance(gae_lambda_cfg, dict) and "min" in gae_lambda_cfg and "max" in gae_lambda_cfg:
+            gae_lambda = trial.suggest_float(
+                "gae_lambda",
+                gae_lambda_cfg.get("min", 0.9),
+                gae_lambda_cfg.get("max", 0.99),
+                log=gae_lambda_cfg.get("log", False)
+            )
+        else:
+            gae_lambda = gae_lambda_cfg if isinstance(gae_lambda_cfg, (int, float)) else 0.95
+
+        # Tune dsr_eta (Differential Sharpe Ratio decay rate for reward)
+        dsr_eta_cfg = hp_config.get("dsr_eta", {})
+        if isinstance(dsr_eta_cfg, dict) and "min" in dsr_eta_cfg and "max" in dsr_eta_cfg:
+            dsr_eta = trial.suggest_float(
+                "dsr_eta",
+                dsr_eta_cfg.get("min", 0.001),
+                dsr_eta_cfg.get("max", 0.1),
+                log=dsr_eta_cfg.get("log", True)
+            )
+        else:
+            dsr_eta = dsr_eta_cfg if isinstance(dsr_eta_cfg, (int, float)) else 0.01
 
         # LSTM hyperparameters (only tuned when RecurrentPPO is enabled)
         lstm_hidden_size = seq_config.get("lstm_hidden_size", 256)
@@ -1212,12 +1366,13 @@ def hyperparameter_tuning(
             if "min" in n_lstm_cfg and "max" in n_lstm_cfg:
                 n_lstm_layers = trial.suggest_int("n_lstm_layers", n_lstm_cfg["min"], n_lstm_cfg["max"])
 
-        # Create environment with realistic transaction costs
+        # Create environment with realistic transaction costs and tuned dsr_eta
         train_env = TradingEnv(
             train_data,
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 2.50),
-            position_size=config["environment"].get("position_size", 1)
+            position_size=config["environment"].get("position_size", 1),
+            dsr_eta=dsr_eta
         )
 
         # Get device (use CPU for recurrent models due to MPS LSTM bugs)
@@ -1261,9 +1416,9 @@ def hyperparameter_tuning(
                 device=device,
             )
 
-        # Train the model
-        total_timesteps = config["training"].get("total_timesteps", 10000)
-        model.learn(total_timesteps=total_timesteps)
+        # Train the model (use tuning_timesteps for faster hyperparameter search)
+        tuning_timesteps = config.get("hyperparameter_tuning", {}).get("tuning_timesteps", 20000)
+        model.learn(total_timesteps=tuning_timesteps)
 
         # Evaluate on validation data based on the chosen metric
         if eval_metric == "prediction_accuracy":
@@ -1279,7 +1434,8 @@ def hyperparameter_tuning(
         # Log trial results
         log_msg = f"Trial {trial.number}: {eval_metric} = {metric_value:.2f}%, "
         log_msg += f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, "
-        log_msg += f"ent_coef={ent_coef:.6f}, batch_size={batch_size}"
+        log_msg += f"ent_coef={ent_coef:.6f}, batch_size={batch_size}, "
+        log_msg += f"gamma={gamma:.4f}, gae_lambda={gae_lambda:.3f}, dsr_eta={dsr_eta:.4f}"
         if use_recurrent:
             log_msg += f", lstm_hidden={lstm_hidden_size}, n_lstm_layers={n_lstm_layers}"
         logger.info(log_msg)
@@ -1755,8 +1911,9 @@ def main():
         data=full_data,
         window_size=window_size,
         step_size=step_size,
-        train_ratio=config["data"].get("train_ratio", 0.7),
-        validation_ratio=config["data"].get("validation_ratio", 0.15),
+        train_ratio=config["data"].get("train_ratio", 0.75),
+        validation_ratio=config["data"].get("validation_ratio", 0.05),
+        embargo_days=config["data"].get("embargo_days", 0),
         initial_timesteps=config["training"].get("total_timesteps", 10000),
         additional_timesteps=config["training"].get("additional_timesteps", 5000),
         max_iterations=config["training"].get("max_iterations", 10),

@@ -202,6 +202,30 @@ def scale_window(train_data: pd.DataFrame,
                 window_folder=window_folder
             )
 
+    # Create normalized versions of indicators that the model expects
+    # Apply to all three datasets
+    for df in [train, val, test]:
+        # SMA_NORM from SMA
+        if 'SMA' in df.columns and 'SMA_NORM' not in df.columns:
+            df['SMA_NORM'] = df['SMA']
+        # EMA_NORM from EMA
+        if 'EMA' in df.columns and 'EMA_NORM' not in df.columns:
+            df['EMA_NORM'] = df['EMA']
+        # VOLUME_MA from VOLUME_NORM or volume
+        if 'VOLUME_NORM' in df.columns and 'VOLUME_MA' not in df.columns:
+            df['VOLUME_MA'] = df['VOLUME_NORM']
+        # VWAP_NORM from VWAP
+        if 'VWAP' in df.columns and 'VWAP_NORM' not in df.columns:
+            df['VWAP_NORM'] = df['VWAP']
+        # PSAR_NORM from PSAR
+        if 'PSAR' in df.columns and 'PSAR_NORM' not in df.columns:
+            df['PSAR_NORM'] = df['PSAR']
+        # OBV_NORM from OBV
+        if 'OBV' in df.columns and 'OBV_NORM' not in df.columns:
+            df['OBV_NORM'] = df['OBV']
+
+    logger.debug("Created normalized indicator columns (SMA_NORM, EMA_NORM, VOLUME_MA, VWAP_NORM, PSAR_NORM, OBV_NORM)")
+
     return scaler, train, val, test
 
 def normalize_data(data: pd.DataFrame, 

@@ -1,27 +1,28 @@
 seed: 42 #Global RNG seed
 
 training:
-  total_timesteps: 10000
+  total_timesteps: 50000
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 10
-  improvement_threshold: 0.20
-  additional_timesteps: 1000
+  max_iterations: 20
+  improvement_threshold: 0.01
+  additional_timesteps: 5000
   n_stagnant_loops: 10
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
   evaluation:
-    metric: "return"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
+    metric: "calmar"  # Options: "return", "hit_rate", "prediction_accuracy", "calmar" (return/max_drawdown - rewards stable returns)
   # Early stopping based on loss convergence (more stable than profit-based)
   early_stopping:
     enabled: true           # Use loss-based early stopping (recommended)
-    patience: 5             # Stop if no loss improvement for N iterations
+    patience: 20            # Stop if no loss improvement for N iterations
     min_delta: 0.001        # Minimum loss decrease to count as improvement
 
 data:
-  train_ratio: 0.6
-  validation_ratio: 0.2
-  test_ratio: 0.2
+  train_ratio: 0.60
+  validation_ratio: 0.20
+  test_ratio: 0.20
+  embargo_days: 1  # Gap between train/val and test to prevent leakage from indicators
   market_hours_only: false  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
 
 normalization:
@@ -34,7 +35,7 @@ indicators:
   supertrend:
     enabled: true
     length: 20
-    multiplier: 4
+    multiplier: 3
     smooth_periods: 3
     lookback_periods: 2
   rsi:
@@ -44,20 +45,20 @@ indicators:
     enabled: true
     length: 20
   adx:
-    enabled: true
+    enabled: true  # Keep ADX (trend strength)
     length: 14
   adx_pos:
-    enabled: true
+    enabled: false  # Redundant with ADX
   adx_neg:
-    enabled: true
+    enabled: false  # Redundant with ADX
   stoch_k:
     enabled: true
     length: 14
   stoch_d:
-    enabled: true
+    enabled: false  # Redundant - just smoothed STOCH_K
     length: 3
   macd:
-    enabled: true
+    enabled: false  # Keep only MACD_HIST
     fast: 12
     slow: 26
     signal: 9
@@ -65,10 +66,10 @@ indicators:
     enabled: true
     length: 10
   williams_r:
-    enabled: true
+    enabled: false  # Redundant with RSI
     length: 14
   sma:
-    enabled: true
+    enabled: false  # Redundant with EMA
     length: 20
   ema:
     enabled: true
@@ -87,11 +88,12 @@ indicators:
     enabled: true
     af: 0.02
     max_af: 0.2
+    include_norm: false  # Only use PSAR_DIR, not PSAR_NORM
   volume:
     enabled: true
     ma_length: 20
   vwap:
-    enabled: true
+    enabled: false  # Less useful for futures
   day_of_week:
     enabled: true
   minutes_since_open:
@@ -108,28 +110,29 @@ indicators:
     random_seed: 42   # Random seed for reproducibility
 
 environment:
-  initial_balance: 10000.0
+  initial_balance: 100000.0
   position_size: 1  # Number of NQ futures contracts to trade (default: 1)
   transaction_cost: 2.50  # Transaction cost per contract per side in dollars (realistic: $2-3 for futures)
+  dsr_eta: 0.00713  # Tuned (trial 11) - Differential Sharpe Ratio decay rate
 
 model:
-  ent_coef: 0.01  # Increased from 0.0001 for better exploration (recommended: 0.01-0.1)
+  ent_coef: 0.0001167  # Tuned (trial 11)
   ent_coef_decay: true  # Enable entropy decay during training
-  final_ent_coef: 0.001  # Final entropy coefficient after decay
-  learning_rate: 0.0029977835304081614
-  n_steps: 562
-  batch_size: 22
-  gamma: 0.95
-  gae_lambda: 0.95
+  final_ent_coef: 0.00001  # Final entropy coefficient after decay
+  learning_rate: 0.000231  # Tuned (trial 11)
+  n_steps: 1663  # Tuned (trial 11)
+  batch_size: 22  # Tuned (trial 11)
+  gamma: 0.9555  # Tuned (trial 11)
+  gae_lambda: 0.9758  # Tuned (trial 11)
   use_lr_decay: true
 
 # Sequence model configuration (LSTM for temporal context)
 sequence_model:
   enabled: true  # Use RecurrentPPO with LSTM instead of standard PPO
-  lstm_hidden_size: 128  # Size of LSTM hidden state
-  n_lstm_layers: 1  # Number of LSTM layers (1-2 recommended)
-  shared_lstm: true  # Whether actor and critic share the LSTM
-  reset_on_new_day: false  # Reset LSTM state at start of each trading day
+  lstm_hidden_size: 128  # Tuned (trial 11)
+  n_lstm_layers: 2  # Tuned (trial 11)
+  shared_lstm: false  # Whether actor and critic share the LSTM
+  reset_on_new_day: false  # Keep state across sessions for 24h data
   device: "auto"  # Device for training: "auto", "cuda", "mps", or "cpu"
 
 # Risk management configuration for trade.py
@@ -171,8 +174,8 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true
-  window_size: 240
-  step_size: 30
+  window_size: 120
+  step_size: 24  # Matches test_ratio (20% of 120 days) for non-overlapping test periods
   parallel_processing:
     enabled: false  # Disabled - MPS doesn't work well with multiprocessing
     n_processes: 0  # Auto-detect number of CPU cores
@@ -182,9 +185,10 @@ walk_forward:
 hyperparameter_tuning:
   enabled: false
   n_trials: 30
+  tuning_timesteps: 20000  # Reduced timesteps for faster tuning (finds relative differences)
   parallel_processing:
     enabled: false  # Disable parallel processing for hyperparameter tuning
-    n_jobs: 1      # Use single process for tuning
+    n_jobs: 5      # Use single process for tuning
   # Parameters to tune (these are the search spaces)
   parameters:
     learning_rate: 
@@ -203,9 +207,20 @@ hyperparameter_tuning:
       min: 8
       max: 128
       log: true
-    # Fixed values for gamma and gae_lambda
-    gamma: 0.995  # Fixed value instead of search range
-    gae_lambda: 0.95  # Fixed value instead of search range
+    # Gamma and GAE lambda (tunable for RL temporal credit assignment)
+    gamma:
+      min: 0.95
+      max: 0.999
+      log: false
+    gae_lambda:
+      min: 0.9
+      max: 0.99
+      log: false
+    # Differential Sharpe Ratio eta (reward decay rate)
+    dsr_eta:
+      min: 0.001
+      max: 0.1
+      log: true
     # LSTM hyperparameters (only used when sequence_model.enabled is true)
     lstm_hidden_size:
       choices: [64, 128, 256, 512]

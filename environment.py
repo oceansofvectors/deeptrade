@@ -29,7 +29,7 @@ class TradingEnv(gym.Env):
 
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None):
+    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None, dsr_eta: float = 0.01):
         """
         Initialize the trading environment.
 
@@ -114,7 +114,7 @@ class TradingEnv(gym.Env):
             if 'MSO_COS' in self.data.columns:
                 self.technical_indicators.append('MSO_COS')
             if 'ZScore' in self.data.columns:
-                self.technical_indicators.append('MSO_COS')
+                self.technical_indicators.append('ZScore')
             
         # Calculate observation space size: close_norm + all technical indicators + position + unrealized_pnl + time_in_position
         obs_size = 1 + len(self.technical_indicators) + 3  # +3 for position, unrealized_pnl, time_in_position
@@ -150,6 +150,9 @@ class TradingEnv(gym.Env):
         # Position sizing
         self.position_size = position_size
 
+        # Differential Sharpe Ratio decay rate
+        self.dsr_eta = dsr_eta
+
     def seed(self, seed=None):
         """Set random seed for reproducibility."""
         self.np_random, seed = seeding.np_random(seed)
@@ -179,6 +182,10 @@ class TradingEnv(gym.Env):
         self.trade_count = 0  # Reset trade count
         self.returns_history = []  # Reset returns history for volatility calculation
         self.max_net_worth = self.initial_balance  # Reset peak for drawdown
+        # Reset Differential Sharpe Ratio tracking
+        self._dsr_A = 0.0
+        self._dsr_B = 0.0001
+        self._prev_sharpe = 0.0
         obs = self._get_obs()
         return obs, {}
 
@@ -367,15 +374,17 @@ class TradingEnv(gym.Env):
         self.current_step += 1
 
         # Calculate portfolio value change based on position and price change
+        # IMPORTANT: Use old_position for P&L calculation, not the new position!
+        # This handles the case where we exit a position (P&L should be calculated on the old position)
         if self.current_step < self.total_steps:
             next_price = self._get_current_price()
 
-            # Calculate P&L if we have an active position
-            if self.position != 0:
-                # Calculate price change - matching RiskManager logic
-                if self.position == 1:  # Long position
+            # Calculate P&L if we HAD an active position (use old_position)
+            if old_position != 0:
+                # Calculate price change based on the position we WERE in
+                if old_position == 1:  # Was long position
                     price_change = next_price - current_price
-                else:  # Short position
+                else:  # Was short position (old_position == -1)
                     price_change = current_price - next_price
 
                 # For NQ futures, each point is $20
@@ -428,53 +437,46 @@ class TradingEnv(gym.Env):
 
     def _calculate_risk_adjusted_reward(self, position_changed: bool, transaction_cost_applied: float, is_redundant_action: bool) -> float:
         """
-        Calculate a risk-adjusted reward that encourages profitable, stable trading.
+        Calculate reward using Differential Sharpe Ratio.
 
-        Components:
-        1. Base return (log return) - primary signal
-        2. Transaction cost penalty - discourages excessive trading
-        3. Redundant action penalty - penalizes no-op trades
-        4. Volatility penalty - penalizes erratic equity curves
-        5. Drawdown penalty - penalizes losses from peak
+        Rewards improvement in risk-adjusted performance, not just raw returns.
+        This encourages consistent returns over volatile swings.
 
         Returns:
-            float: Risk-adjusted reward value
+            float: Differential Sharpe reward
         """
-        # 1. Base return (log return)
         if self.previous_net_worth > Decimal('0.0'):
             base_return = float(np.log(float(self.net_worth / self.previous_net_worth)))
         else:
             base_return = 0.0
 
-        # Track returns for volatility calculation
+        # Track returns for history
         self.returns_history.append(base_return)
 
-        # 2. Transaction cost penalty (already deducted from net worth, but add small penalty to discourage churn)
-        trade_penalty = 0.0
-        if position_changed:
-            trade_penalty = -0.0001  # Small penalty for each trade to discourage overtrading
+        # Differential Sharpe Ratio calculation
+        # Uses exponential moving averages for A (mean return) and B (mean squared return)
+        eta = self.dsr_eta  # Decay rate for EMA (smaller = longer memory)
 
-        # 3. Redundant action penalty
-        redundant_penalty = 0.0
-        if is_redundant_action:
-            redundant_penalty = -0.00005  # Small penalty for redundant actions
+        # Initialize tracking variables on first call
+        if not hasattr(self, '_dsr_A'):
+            self._dsr_A = 0.0  # EMA of returns
+            self._dsr_B = 0.0001  # EMA of squared returns (small init to avoid div by 0)
+            self._prev_sharpe = 0.0
 
-        # 4. Volatility penalty (rolling volatility of returns)
-        volatility_penalty = 0.0
-        if len(self.returns_history) >= 20:
-            recent_returns = self.returns_history[-20:]
-            volatility = float(np.std(recent_returns))
-            # Penalize high volatility (scale factor: volatility of 0.01 -> penalty of ~0.0001)
-            volatility_penalty = -0.01 * volatility
+        # Update EMAs
+        self._dsr_A = self._dsr_A + eta * (base_return - self._dsr_A)
+        self._dsr_B = self._dsr_B + eta * (base_return ** 2 - self._dsr_B)
 
-        # 5. Drawdown penalty
-        drawdown_penalty = 0.0
-        if self.max_net_worth > Decimal('0.0'):
-            drawdown = float((self.max_net_worth - self.net_worth) / self.max_net_worth)
-            if drawdown > 0.05:  # Only penalize drawdowns > 5%
-                drawdown_penalty = -0.001 * drawdown
+        # Calculate current Sharpe-like ratio: A / sqrt(B - A²)
+        variance = self._dsr_B - self._dsr_A ** 2
+        if variance > 1e-10:
+            current_sharpe = self._dsr_A / np.sqrt(variance)
+        else:
+            current_sharpe = self._dsr_A * 100  # High Sharpe if no variance
 
-        # Combine all components
-        reward = base_return + trade_penalty + redundant_penalty + volatility_penalty + drawdown_penalty
+        # Differential Sharpe = change in Sharpe ratio
+        diff_sharpe = current_sharpe - self._prev_sharpe
+        self._prev_sharpe = current_sharpe
 
-        return reward
+        # Scale for stronger learning signal
+        return diff_sharpe * 100.0

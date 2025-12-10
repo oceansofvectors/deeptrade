@@ -205,12 +205,19 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     Returns:
         tuple: (best_model, best_results, all_results)
     """
+    # Get dsr_eta from model_params (if tuned), environment config, or use default
+    if model_params and "dsr_eta" in model_params:
+        dsr_eta = model_params["dsr_eta"]
+    else:
+        dsr_eta = config.get("environment", {}).get("dsr_eta", 0.01)
+
     # Initialize training environment with realistic transaction costs
     train_env = TradingEnv(
         train_data,
         initial_balance=config["environment"]["initial_balance"],
         transaction_cost=config["environment"].get("transaction_cost", 2.50),
-        position_size=config["environment"].get("position_size", 1)
+        position_size=config["environment"].get("position_size", 1),
+        dsr_eta=dsr_eta
     )
     
     check_env(train_env, skip_render_check=True)
@@ -315,16 +322,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             device=device,
         )
     
-    # Get early stopping config
-    early_stop_config = config.get("training", {}).get("early_stopping", {})
-    use_loss_early_stop = early_stop_config.get("enabled", True)
-    loss_patience = early_stop_config.get("patience", 5)
-    loss_min_delta = early_stop_config.get("min_delta", 0.001)
-
-    # Create loss tracking callback
+    # Create loss tracking callback for early stopping
     loss_callback = LossTrackingCallback(verbose=verbose_level)
-
-    # Track loss history across iterations
     loss_history = []
     best_loss = float('inf')
     loss_stagnant_counter = 0
@@ -336,11 +335,9 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Get initial loss values
     initial_losses = loss_callback.get_latest_losses()
     if initial_losses["value_loss"] is not None:
-        current_loss = initial_losses["value_loss"]
-        best_loss = current_loss
         loss_history.append(initial_losses)
-        logger.info(f"Iter 0 - Loss: {current_loss:.4f} (policy={initial_losses['policy_loss']:.4f}, "
-                   f"value={initial_losses['value_loss']:.4f}, entropy={initial_losses['entropy_loss']:.4f})")
+        best_loss = initial_losses["value_loss"]
+        logger.info(f"Iter 0 - Loss: {best_loss:.4f}")
 
     # Evaluate initial model on validation data using the specified metric
     if verbose_level > 0:
@@ -357,6 +354,10 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
         best_metric_value = results["hit_rate"]
         metric_name = "hit_rate"
+    elif evaluation_metric == "calmar":
+        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+        best_metric_value = results["calmar_ratio"]
+        metric_name = "calmar"
     else:  # Default to "return"
         results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
         best_metric_value = results["total_return_pct"]
@@ -378,10 +379,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     
     # Add metric information to results
     results["metric_used"] = metric_name
-    
-    # Counter for consecutive iterations without significant improvement
-    stagnant_counter = 0
-    
+
     # Continue training until max_iterations or loss plateau
     for iteration in range(1, max_iterations + 1):
         # Reset callback for this iteration
@@ -392,23 +390,9 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
 
         # Get loss values for this iteration
         iter_losses = loss_callback.get_latest_losses()
-        current_loss = iter_losses["value_loss"] if iter_losses["value_loss"] is not None else best_loss
-
-        # Check for loss improvement
-        loss_improved = False
-        if current_loss < best_loss - loss_min_delta:
-            loss_improved = True
-            best_loss = current_loss
-            loss_stagnant_counter = 0
-        else:
-            loss_stagnant_counter += 1
-
-        # Log loss info
-        loss_status = "[improved]" if loss_improved else f"[stagnant {loss_stagnant_counter}/{loss_patience}]"
+        current_loss = iter_losses["value_loss"] if iter_losses["value_loss"] is not None else float('inf')
         if iter_losses["value_loss"] is not None:
             loss_history.append(iter_losses)
-            logger.info(f"Iter {iteration} - Loss: {current_loss:.4f} (policy={iter_losses['policy_loss']:.4f}, "
-                       f"value={iter_losses['value_loss']:.4f}, entropy={iter_losses['entropy_loss']:.4f}) {loss_status}")
 
         # Evaluate the model on validation data using the specified metric
         if evaluation_metric == "prediction_accuracy":
@@ -418,6 +402,9 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         elif evaluation_metric == "hit_rate":
             results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
             current_metric_value = results["hit_rate"]
+        elif evaluation_metric == "calmar":
+            results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+            current_metric_value = results["calmar_ratio"]
         else:  # Default to "return"
             results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
             current_metric_value = results["total_return_pct"]
@@ -429,41 +416,36 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
 
         all_results.append(results)
 
-        # Calculate improvement (for logging only, not for early stopping)
-        improvement = current_metric_value - best_metric_value
+        # Early stopping based on training loss plateau
+        if current_loss < best_loss:
+            best_loss = current_loss
+            loss_stagnant_counter = 0
+        else:
+            loss_stagnant_counter += 1
 
-        # Check if this is the best model so far based on validation performance (fallback selection)
-        if current_metric_value > best_metric_value + improvement_threshold:
+        # Model selection based on VALIDATION metric (higher is better for calmar/return)
+        if current_metric_value > best_metric_value:
             best_metric_value = current_metric_value
             best_model = model
             best_results = results
-            # Mark this result as the new best
             results["is_best"] = True
 
-            logger.info(f"New best model (return): {best_metric_value:.2f}%, Portfolio: ${best_results['final_portfolio_value']:.2f}")
+            logger.info(f"Iter {iteration} - New best (val {metric_name}={current_metric_value:.2f}): Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}")
 
             # Save the best model
             best_model.save(os.path.join(window_folder, "best_model"))
-
-            # Reset profit-based stagnant counter
-            stagnant_counter = 0
         else:
-            stagnant_counter += 1
+            logger.info(f"Iter {iteration} - Val {metric_name}={current_metric_value:.2f}, Train loss={current_loss:.4f} [loss stagnant {loss_stagnant_counter}/{n_stagnant_loops}]")
 
-        # Early stop based on LOSS plateau (primary criterion)
-        if use_loss_early_stop and loss_stagnant_counter >= loss_patience:
-            logger.info(f"Early stop: loss plateau ({loss_patience} iters without improvement > {loss_min_delta})")
+        # Early stopping based on training loss plateau
+        if loss_stagnant_counter >= n_stagnant_loops:
+            logger.info(f"Early stop: training loss plateau for {n_stagnant_loops} iterations")
             break
 
-        # Fallback: stop based on profit stagnation if loss early stop is disabled
-        if not use_loss_early_stop and stagnant_counter >= n_stagnant_loops:
-            logger.info(f"Stopping: {n_stagnant_loops} iters without profit improvement")
-            break
-    
     # Add loss history to best_results for saving
     best_results["loss_history"] = loss_history
 
-    logger.info(f"Training complete. Best return: {best_metric_value:.2f}%, Final loss: {best_loss:.4f}")
+    logger.info(f"Training complete. Best {metric_name}: {best_metric_value:.2f}, Best train loss: {best_loss:.4f}")
     return best_model, best_results, all_results
 
 def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False):
@@ -569,56 +551,81 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
             action, _ = model.predict(obs, deterministic=deterministic)
         action_history.append(action)
         
-        # Check if action has changed, which means a potential trade
-        if last_action is not None and action != last_action:
-            # Map action to trade type: 0=Long, 1=Short, 2=Hold, 3=Flat
-            action_to_type = {0: "Long", 1: "Short", 2: "Hold", 3: "Flat"}
-            trade_type = action_to_type.get(int(action), "Unknown")
-            # Record the trade when action changes
+        # Take action in environment
+        obs, reward, terminated, truncated, info = env.step(int(action))
+        done = terminated or truncated
+
+        # Get portfolio value AFTER the step
+        portfolio_value_after = float(money.format_money(env.net_worth, 2))
+        portfolio_history.append(portfolio_value_after)
+
+        # Track trade history based on position changes from the environment
+        old_position = current_position
+        new_position = env.position
+
+        if new_position != old_position:
+            trade_count += 1
+
+            # Determine trade type based on position change
+            if new_position == 1:
+                trade_type = "Long"
+            elif new_position == -1:
+                trade_type = "Short"
+            elif new_position == 0:
+                trade_type = "Flat"
+            else:
+                trade_type = "Unknown"
+
+            # Calculate if this trade was profitable (for exits)
+            is_profitable = False
+            if old_position != 0 and entry_price > 0:
+                # We had a position and are changing it - calculate P&L
+                if old_position == 1:  # Was long
+                    is_profitable = current_price > entry_price
+                elif old_position == -1:  # Was short
+                    is_profitable = current_price < entry_price
+
+            # For position_from/position_to:
+            # - Entry (Long/Short from Flat): position_from=0, position_to=entry_price
+            # - Exit (Flat from Long/Short): position_from=entry_price, position_to=0
+            # - Flip (Long to Short or vice versa): position_from=old_entry, position_to=new_entry
+            if old_position == 0:
+                # New entry from flat
+                pos_from = 0.0
+                pos_to = current_price
+            elif new_position == 0:
+                # Exit to flat
+                pos_from = float(entry_price) if entry_price > 0 else current_price
+                pos_to = 0.0
+            else:
+                # Flip position (long to short or short to long)
+                pos_from = float(entry_price) if entry_price > 0 else current_price
+                pos_to = current_price
+
             trade_history.append({
                 "date": test_data.index[current_step],
                 "trade_type": trade_type,
                 "price": current_price,
-                "portfolio_value": float(money.format_money(env.net_worth, 2)),
-                "profitable": True if current_position == 0 else float(env.net_worth) > float(entry_price),
-                "position_from": entry_price if entry_price > 0 else 0,
-                "position_to": current_price
+                "portfolio_value": portfolio_value_after,
+                "profitable": is_profitable,
+                "position_from": pos_from,
+                "position_to": pos_to,
+                "exit_reason": ""
             })
 
-            if action not in [2, 3]:  # If not hold or flat action, update entry info
+            # Update entry price for new positions
+            if new_position != 0:
                 entry_price = current_price
                 entry_step = current_step
-        
-        # Take action in environment
-        obs, reward, terminated, truncated, info = env.step(int(action))
-        done = terminated or truncated
-        
+            else:
+                # Flat - reset entry price
+                entry_price = 0
+                entry_step = -1
+
+            current_position = new_position
+
         # Update last action
         last_action = action
-        
-        # Update portfolio value
-        portfolio_history.append(float(money.format_money(env.net_worth, 2)))
-        
-        # Update trade history when position changes (original logic)
-        if env.position != current_position:
-            trade_count += 1
-            if current_position == 0:
-                # Entry point
-                entry_price = current_price
-                entry_step = current_step
-                current_position = env.position
-            else:
-                # Exit point
-                trade_history.append({
-                    "date": test_data.index[current_step],
-                    "trade_type": "Sell" if current_position == -1 else "Buy",
-                    "price": current_price,
-                    "portfolio_value": float(money.format_money(env.net_worth, 2)),
-                    "profitable": float(env.net_worth) > float(entry_price),
-                    "position_from": entry_price,
-                    "position_to": current_price
-                })
-                current_position = env.position
         
         # Update total reward
         total_reward += reward
@@ -634,10 +641,11 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     final_net_worth = env.net_worth
     return_pct = money.calculate_return_pct(final_net_worth, initial_net_worth)
     
-    # Calculate hit rate
+    # Calculate hit rate (percentage of profitable trades)
     hit_rate = 0
     if trade_count > 0:
-        hit_rate = (trade_count / step_count) * 100
+        profitable_count = sum(1 for t in trade_history if t.get("profitable", False))
+        hit_rate = (profitable_count / trade_count) * 100
     
     # Calculate portfolio value
     final_portfolio_value = float(money.format_money(env.net_worth, 2))
@@ -652,7 +660,21 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
     for action in action_history:
         action_counts[int(action)] += 1
-    
+
+    # Calculate max drawdown from portfolio history
+    portfolio_array = np.array(portfolio_history)
+    running_max = np.maximum.accumulate(portfolio_array)
+    drawdowns = (portfolio_array - running_max) / running_max * 100  # As percentage
+    max_drawdown = float(np.min(drawdowns))  # Most negative value (will be <= 0)
+
+    # Calculate Calmar ratio (return / |max_drawdown|)
+    # Higher is better - rewards high returns with low drawdowns
+    if max_drawdown == 0:
+        # No drawdown - use return as calmar (or a large value if positive return)
+        calmar_ratio = total_return_pct if total_return_pct > 0 else 0.0
+    else:
+        calmar_ratio = total_return_pct / abs(max_drawdown)
+
     # Prepare results
     results = {
         "final_portfolio_value": final_portfolio_value,
@@ -668,19 +690,21 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         "buy_prices": [],
         "sell_dates": [],
         "sell_prices": [],
-        "action_counts": action_counts
+        "action_counts": action_counts,
+        "max_drawdown": max_drawdown,
+        "calmar_ratio": calmar_ratio
     }
-    
+
     # Add additional information
     results["metric_used"] = "return"
     results["is_best"] = False
-    results["profitable_trades"] = trade_count
-    results["profitable"] = float(env.net_worth) > float(entry_price)
-    results["profitable_pct"] = (float(env.net_worth) - float(entry_price)) / float(entry_price) * 100 if trade_count > 0 else 0
-    results["profitable_trade_pct"] = results["profitable_pct"] / trade_count if trade_count > 0 else 0
-    results["profitable_trade_return"] = results["profitable_trade_pct"] * 100
-    results["profitable_trade_return_pct"] = results["profitable_trade_return"] / 100
-    results["profitable_trade_return_str"] = f"{results['profitable_trade_return_pct']:.2f}%"
+    results["profitable_trades"] = sum(1 for t in trade_history if t.get("profitable", False))
+    results["profitable"] = total_return_pct > 0
+    results["profitable_pct"] = total_return_pct
+    results["profitable_trade_pct"] = results["profitable_trades"] / trade_count * 100 if trade_count > 0 else 0
+    results["profitable_trade_return"] = results["profitable_trade_pct"]
+    results["profitable_trade_return_pct"] = results["profitable_trade_pct"]
+    results["profitable_trade_return_str"] = f"{results['profitable_trade_pct']:.2f}%"
     
     return results
 
