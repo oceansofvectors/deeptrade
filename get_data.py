@@ -1,49 +1,49 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
+# Standard library imports
+import logging
+import os
+from datetime import datetime, timedelta
 from typing import List
+
+# Third-party imports
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+import pytz
+import yfinance as yf
 
 # Monkey patch: set np.NaN to np.nan if it's missing
 if not hasattr(np, "NaN"):
     np.NaN = np.nan
 
-import pandas_ta as ta
-import logging
-import os
-from datetime import datetime, timedelta
-import pytz
+# Local application imports
+from config import config
+from normalization import get_standardized_column_names, normalize_data, scale_window
 
-# Import indicators
-from indicators.rsi import calculate_rsi
-from indicators.sma import calculate_sma
+# Indicator imports
+from indicators.adx import calculate_adx
+from indicators.atr import calculate_atr
+from indicators.cci import calculate_cci
+from indicators.cmf import calculate_cmf
+from indicators.day_of_week import calculate_day_of_week
+from indicators.disparity import calculate_disparity
 from indicators.ema import calculate_ema
 from indicators.macd import calculate_macd
-from indicators.atr import calculate_atr
-from indicators.supertrend import calculate_supertrend
-from indicators.stochastic import calculate_stochastic
-from indicators.adx import calculate_adx
-from indicators.cci import calculate_cci
-from indicators.roc import calculate_roc
-from indicators.williams_r import calculate_williams_r
-from indicators.obv import calculate_obv
-from indicators.cmf import calculate_cmf
-from indicators.psar import calculate_psar
-from indicators.vwap import calculate_vwap
-from indicators.disparity import calculate_disparity
-from indicators.volume import calculate_volume_indicator
-from indicators.day_of_week import calculate_day_of_week
 from indicators.minutes_since_open import calculate_minutes_since_open
+from indicators.obv import calculate_obv
+from indicators.psar import calculate_psar
+from indicators.roc import calculate_roc
 from indicators.rrcf_anomaly import calculate_rrcf_anomaly
+from indicators.rsi import calculate_rsi
+from indicators.sma import calculate_sma
+from indicators.stochastic import calculate_stochastic
+from indicators.supertrend import calculate_supertrend
+from indicators.vwap import calculate_vwap
+from indicators.volume import calculate_volume_indicator
+from indicators.williams_r import calculate_williams_r
 from indicators.z_score import calculate_zscore
-
-# Import normalization functions
-from normalization import get_standardized_column_names, normalize_data, scale_window
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# NEW: import YAML configuration
-from config import config
 
 # Helper function to ensure numeric values
 def ensure_numeric(df, columns):
@@ -65,15 +65,8 @@ def ensure_numeric(df, columns):
     df = df.dropna(subset=[col for col in columns if col in df.columns])
     return df
 
-# Import filter_market_hours from walk_forward module
-# We use try/except to handle circular import issue
-try:
-    from walk_forward import filter_market_hours
-except ImportError:
-    # Define a basic version if walk_forward isn't importable
-    def filter_market_hours(data):
-        logger.warning("Could not import filter_market_hours from walk_forward module. Using unfiltered data.")
-        return data
+# Import shared utilities to avoid circular dependencies
+from utils.data_utils import filter_market_hours
 
 def download_data(symbol: str = "NQ=F", period: str = "60d", interval: str = "5m") -> pd.DataFrame:
     """
@@ -322,11 +315,9 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         
         # Calculate Supertrend indicator
         if 'supertrend' in config["indicators"] and config["indicators"]["supertrend"]["enabled"]:
-            df = calculate_supertrend(df, 
+            df = calculate_supertrend(df,
                                      length=config["indicators"]["supertrend"]["length"],
                                      multiplier=config["indicators"]["supertrend"]["multiplier"],
-                                     smooth_periods=config["indicators"]["supertrend"].get("smooth_periods", 3),
-                                     lookback_periods=config["indicators"]["supertrend"].get("lookback_periods", 2),
                                      target_col='supertrend')
         
         # Add day of week indicator (needed for pattern detection)

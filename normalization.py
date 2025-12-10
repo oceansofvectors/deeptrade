@@ -4,7 +4,7 @@ import numpy as np
 import os
 import pickle
 from typing import List, Dict, Tuple, Optional, Union
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, QuantileTransformer
 
 def sigmoid_transform(train_data: pd.DataFrame, 
                      val_data: pd.DataFrame, 
@@ -71,17 +71,18 @@ def sigmoid_transform(train_data: pd.DataFrame,
     
     return transform_params, train, val, test
 
-def scale_window(train_data: pd.DataFrame, 
-                val_data: pd.DataFrame, 
-                test_data: pd.DataFrame, 
-                cols_to_scale: List[str], 
+def scale_window(train_data: pd.DataFrame,
+                val_data: pd.DataFrame,
+                test_data: pd.DataFrame,
+                cols_to_scale: List[str],
                 feature_range: Tuple[float, float] = (-1, 1),
                 window_folder: str = None,
                 use_sigmoid: bool = True,
-                sigmoid_k: float = 2.0) -> Tuple[MinMaxScaler, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                sigmoid_k: float = 2.0,
+                scaler_type: str = "robust") -> Tuple[Union[MinMaxScaler, RobustScaler, QuantileTransformer], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Scale technical indicators in each window to prevent data leakage.
-    
+
     Args:
         train_data: Training dataset
         val_data: Validation dataset
@@ -89,77 +90,118 @@ def scale_window(train_data: pd.DataFrame,
         cols_to_scale: List of columns to scale
         feature_range: Target range for scaled features, default (-1, 1)
         window_folder: Optional folder to save the scaler
-        use_sigmoid: Whether to apply sigmoid transformation after min-max scaling
+        use_sigmoid: Whether to apply sigmoid transformation after scaling (only for minmax)
         sigmoid_k: Steepness parameter for sigmoid if used
-        
+        scaler_type: Type of scaler to use: "minmax", "robust", or "quantile"
+            - "minmax": Standard min-max scaling (sensitive to outliers)
+            - "robust": Uses median and IQR, much better for outliers (recommended)
+            - "quantile": Maps to uniform/normal distribution, best for heavy-tailed data
+
     Returns:
         Tuple containing the scaler and the transformed datasets
     """
     logger = logging.getLogger(__name__)
-    
+
     # Make copies to avoid modifying the original data
     train = train_data.copy()
     val = val_data.copy()
     test = test_data.copy()
-    
+
     # Filter columns that actually exist in the data
     cols_to_scale = [col for col in cols_to_scale if col in train.columns]
-    
+
     if not cols_to_scale:
         logger.warning("No columns to scale found in the data")
         return None, train, val, test
-    
-    logger.info(f"Scaling {len(cols_to_scale)} indicator columns using data from {len(train)} training rows")
-    logger.info(f"Columns to scale: {cols_to_scale}")
-    
-    # Create and fit the scaler on training data only
-    scaler = MinMaxScaler(feature_range=feature_range)
-    
+
+    logger.debug(f"Scaling {len(cols_to_scale)} indicator columns using {scaler_type} scaler from {len(train)} training rows")
+    logger.debug(f"Columns to scale: {cols_to_scale}")
+
+    # Create the appropriate scaler
+    if scaler_type == "robust":
+        # RobustScaler uses median and IQR, making it robust to outliers
+        # We'll scale to approximately [-1, 1] by using quantile_range=(25, 75)
+        # and then clip/transform to ensure bounds
+        scaler = RobustScaler(quantile_range=(25.0, 75.0))
+        logger.debug("Using RobustScaler (median/IQR-based, robust to outliers)")
+    elif scaler_type == "quantile":
+        # QuantileTransformer maps data to a uniform or normal distribution
+        # output_distribution='uniform' maps to [0, 1], we'll rescale to [-1, 1]
+        scaler = QuantileTransformer(output_distribution='uniform', n_quantiles=min(1000, len(train)))
+        logger.debug("Using QuantileTransformer (maps to uniform distribution)")
+    else:
+        # Default to MinMaxScaler
+        scaler = MinMaxScaler(feature_range=feature_range)
+        logger.debug("Using MinMaxScaler (standard min-max scaling)")
+
     # Fit on training data
     scaler.fit(train[cols_to_scale])
-    
+
     # Transform training, validation, and test data
     train[cols_to_scale] = scaler.transform(train[cols_to_scale])
     val[cols_to_scale] = scaler.transform(val[cols_to_scale])
     test[cols_to_scale] = scaler.transform(test[cols_to_scale])
-    
+
+    # For robust and quantile scalers, rescale to [-1, 1] range
+    if scaler_type == "robust":
+        # RobustScaler centers at 0, but range can be larger than [-1, 1]
+        # Apply tanh-like soft clipping to keep most values in [-1, 1] while handling outliers
+        for col in cols_to_scale:
+            # Use tanh to smoothly map values to [-1, 1]
+            # Scale factor of 0.5 means values within ~2 IQR stay mostly linear
+            train[col] = np.tanh(train[col] * 0.5)
+            val[col] = np.tanh(val[col] * 0.5)
+            test[col] = np.tanh(test[col] * 0.5)
+    elif scaler_type == "quantile":
+        # QuantileTransformer outputs [0, 1], rescale to [-1, 1]
+        for col in cols_to_scale:
+            train[col] = train[col] * 2 - 1
+            val[col] = val[col] * 2 - 1
+            test[col] = test[col] * 2 - 1
+
     # Check if any test values fall outside the feature range
-    # This is evidence that the scaler never saw these rows (validation)
     min_vals = test[cols_to_scale].min()
     max_vals = test[cols_to_scale].max()
-    
+
     out_of_range_cols = []
     for col in cols_to_scale:
-        if min_vals[col] < feature_range[0] or max_vals[col] > feature_range[1]:
+        if min_vals[col] < feature_range[0] - 0.1 or max_vals[col] > feature_range[1] + 0.1:
             out_of_range_cols.append(col)
-            logger.info(f"Column {col} has test values outside of range {feature_range}: min={min_vals[col]}, max={max_vals[col]}")
-    
-    if not out_of_range_cols:
-        logger.warning("No test values found outside of the feature range. This might indicate transformation issues.")
-    
+            logger.info(f"Column {col} has test values outside of range {feature_range}: min={min_vals[col]:.4f}, max={max_vals[col]:.4f}")
+
+    if out_of_range_cols:
+        logger.debug(f"{len(out_of_range_cols)} columns have values slightly outside [-1, 1] (this is normal with robust scaling)")
+    else:
+        logger.debug("All test values within expected range [-1, 1]")
+
     # Save the scaler if a window folder is provided
     if window_folder:
         scaler_path = os.path.join(window_folder, "indicator_scaler.pkl")
+        scaler_info = {
+            'scaler': scaler,
+            'scaler_type': scaler_type,
+            'cols_to_scale': cols_to_scale
+        }
         with open(scaler_path, "wb") as f:
-            pickle.dump(scaler, f)
-        logger.info(f"Indicator scaler saved to {scaler_path}")
-    
-    # Apply sigmoid transformation if requested
-    if use_sigmoid:
+            pickle.dump(scaler_info, f)
+        logger.debug(f"Indicator scaler ({scaler_type}) saved to {scaler_path}")
+
+    # Apply sigmoid transformation if requested (only makes sense for minmax)
+    if use_sigmoid and scaler_type == "minmax":
         logger.info(f"Applying sigmoid transformation after min-max scaling")
         if out_of_range_cols:
             logger.info(f"Applying sigmoid to handle {len(out_of_range_cols)} columns with out-of-range values")
-            
+
             # Apply sigmoid transformation only to columns with out-of-range values
             sigmoid_params, train, val, test = sigmoid_transform(
-                train_data=train, 
+                train_data=train,
                 val_data=val,
                 test_data=test,
                 cols_to_transform=out_of_range_cols,
                 k=sigmoid_k,
                 window_folder=window_folder
             )
-            
+
     return scaler, train, val, test
 
 def normalize_data(data: pd.DataFrame, 

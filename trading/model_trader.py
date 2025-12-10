@@ -11,6 +11,13 @@ import pytz
 from stable_baselines3 import PPO
 from ib_insync import MarketOrder, Order, LimitOrder, StopOrder, BracketOrder # Future, Contract may not be needed directly if ib_instance handles it
 
+# RecurrentPPO for LSTM support
+try:
+    from sb3_contrib import RecurrentPPO
+    RECURRENT_PPO_AVAILABLE = True
+except ImportError:
+    RECURRENT_PPO_AVAILABLE = False
+
 from config import config
 from get_data import process_technical_indicators # ensure_numeric is a dependency of this
 from normalization import load_scaler, normalize_data, get_standardized_column_names
@@ -88,7 +95,12 @@ class ModelTrader:
         self.order_status = {}  # Track order statuses
         self.last_position_check = datetime.now()  # Last time positions were verified
         self.position_check_interval = 60  # Check positions every 60 seconds
-        
+
+        # LSTM state tracking for RecurrentPPO models
+        self.is_recurrent_model = False
+        self.lstm_states = None
+        self.episode_starts = np.ones((1,), dtype=bool)
+
         logger.info(f"ModelTrader initialized with {len(self.enabled_indicators)} indicators")
     
     def _initialize_risk_parameters(self):
@@ -274,20 +286,44 @@ class ModelTrader:
     def load_model(self):
         """Load the trained model from the specified path."""
         logger.info(f"Loading model from {self.model_path}")
-        
+
         try:
-            self.model = PPO.load(self.model_path)
-            logger.info(f"Model loaded successfully from {self.model_path}")
-            
+            # Try loading as RecurrentPPO first if available
+            if RECURRENT_PPO_AVAILABLE:
+                try:
+                    self.model = RecurrentPPO.load(self.model_path)
+                    self.is_recurrent_model = True
+                    logger.info(f"Loaded RecurrentPPO model (LSTM) from {self.model_path}")
+                except Exception:
+                    # Fall back to standard PPO
+                    self.model = PPO.load(self.model_path)
+                    self.is_recurrent_model = False
+                    logger.info(f"Loaded standard PPO model from {self.model_path}")
+            else:
+                self.model = PPO.load(self.model_path)
+                self.is_recurrent_model = False
+                logger.info(f"Loaded PPO model from {self.model_path} (RecurrentPPO not available)")
+
+            # Initialize LSTM states if recurrent model
+            if self.is_recurrent_model:
+                self.reset_lstm_state()
+                logger.info("Initialized LSTM hidden states for recurrent model")
+
             # Diagnose expected model features
             self.diagnose_model_features()
-            
+
             return True
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+    def reset_lstm_state(self):
+        """Reset LSTM hidden states. Call at start of trading day or after reconnection."""
+        self.lstm_states = None
+        self.episode_starts = np.ones((1,), dtype=bool)
+        logger.info("Reset LSTM hidden states")
     
     def diagnose_model_features(self):
         """
@@ -441,9 +477,25 @@ class ModelTrader:
     
     def save_state(self):
         """
-        Save the current state of the trader including bar history.
+        Save the current state of the trader including bar history and LSTM states.
         """
         try:
+            # Convert LSTM states to numpy for pickling (PyTorch tensors need special handling)
+            lstm_states_serializable = None
+            if self.lstm_states is not None:
+                try:
+                    # LSTM states are typically tuples of tensors
+                    import torch
+                    if isinstance(self.lstm_states, tuple):
+                        lstm_states_serializable = tuple(
+                            s.cpu().numpy() if isinstance(s, torch.Tensor) else s
+                            for s in self.lstm_states
+                        )
+                    else:
+                        lstm_states_serializable = self.lstm_states
+                except Exception as e:
+                    logger.warning(f"Could not serialize LSTM states: {e}")
+
             # Create a dictionary with the current state
             state = {
                 "bar_history": self.bar_history,
@@ -453,16 +505,22 @@ class ModelTrader:
                     "secType": self.contract.secType if self.contract else None,
                     "exchange": self.contract.exchange if self.contract else None,
                     "lastTradeDateOrContractMonth": self.contract.lastTradeDateOrContractMonth if self.contract else None,
-                }
+                },
+                # LSTM state persistence
+                "is_recurrent_model": self.is_recurrent_model,
+                "lstm_states": lstm_states_serializable,
+                "episode_starts": self.episode_starts.tolist(),
             }
-            
+
             # Save to a file
             with open(self.state_file_path, "wb") as f: # Use self.state_file_path
                 pickle.dump(state, f)
-                
+
             logger.info(f"State saved successfully with {len(self.bar_history)} bars to {self.state_file_path}")
+            if self.is_recurrent_model:
+                logger.info("LSTM states saved for recurrent model")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error saving state: {e}")
             return False
@@ -472,16 +530,38 @@ class ModelTrader:
         if not os.path.exists(self.state_file_path): # Use self.state_file_path
             logger.info(f"No saved state found at {self.state_file_path}")
             return False
-        
+
         try:
             with open(self.state_file_path, 'rb') as f: # Use self.state_file_path
                 state = pickle.load(f)
-                
+
             self.current_position = state.get('current_position', 0)
             self.expected_position = state.get('expected_position', 0)
             self.active_orders = state.get('active_orders', {})
             self.bar_history = state.get('bar_history', [])
-            
+
+            # Restore LSTM states if available and model is recurrent
+            if self.is_recurrent_model and 'lstm_states' in state and state['lstm_states'] is not None:
+                try:
+                    import torch
+                    # Convert numpy arrays back to tensors on the correct device
+                    device = next(self.model.policy.parameters()).device
+                    lstm_states_numpy = state['lstm_states']
+                    if isinstance(lstm_states_numpy, tuple):
+                        self.lstm_states = tuple(
+                            torch.from_numpy(s).to(device) if isinstance(s, np.ndarray) else s
+                            for s in lstm_states_numpy
+                        )
+                    else:
+                        self.lstm_states = lstm_states_numpy
+                    logger.info("Restored LSTM states from saved state")
+                except Exception as e:
+                    logger.warning(f"Could not restore LSTM states: {e}. Will use fresh states.")
+                    self.reset_lstm_state()
+
+            if 'episode_starts' in state:
+                self.episode_starts = np.array(state['episode_starts'])
+
             logger.info(f"Trading state loaded successfully from {self.state_file_path}: position={self.current_position}")
             return True
         except Exception as e:
@@ -1490,34 +1570,35 @@ class ModelTrader:
     def get_prediction(self, normalized_df):
         """
         Get a prediction from the model based on the normalized dataframe.
+        Handles both standard PPO and RecurrentPPO (LSTM) models.
         """
         try:
             if normalized_df is None or normalized_df.empty:
                 logger.error("Invalid input for prediction")
                 return None
-            
+
             # Ensure the input is in the correct format
             if 'close_norm' not in normalized_df.columns:
                 logger.error("Missing 'close_norm' column in input dataframe")
                 return None
-            
+
             # Debug: Log input data shape and columns
             logger.info(f"DEBUG: Prediction input shape: {normalized_df.shape}")
             logger.info(f"DEBUG: Prediction input columns: {normalized_df.columns.tolist()}")
-            
+
             # Debug: Compare with model's expected features
             expected_features = self.model.observation_space.shape[0]
             logger.info(f"DEBUG: Model expects {expected_features} features, input has {normalized_df.shape[1]} features")
-            
+
             # Get the prediction from the model
             prediction_input = normalized_df.values.reshape(1, -1)
-            
+
             # Debug: Log the input array shape
             logger.info(f"DEBUG: Reshaped prediction input shape: {prediction_input.shape}")
-            
+
             # Debug: Log the full NORMALIZED observation vector
             logger.info(f"DEBUG: Full NORMALIZED observation vector (values should be mostly in [-1,1] range): {prediction_input[0].tolist()}")
-            
+
             # Create a more human-readable version with column names
             readable_vector = {}
             columns = normalized_df.columns.tolist()
@@ -1525,29 +1606,44 @@ class ModelTrader:
             for i, column in enumerate(columns):
                 if i < len(values):
                     readable_vector[column] = values[i]
-            
+
             logger.info(f"DEBUG: NORMALIZED observation vector with feature names: {readable_vector}")
-            
+
             # Additional check to verify normalization worked correctly
             # Most values should be between -1 and 1 after normalization
             in_range_count = sum(1 for v in values if -1.1 <= v <= 1.1)  # Allow slight buffer outside [-1,1]
             pct_in_range = (in_range_count / len(values)) * 100 if values else 0
             logger.info(f"DEBUG: Normalization check: {in_range_count}/{len(values)} values ({pct_in_range:.1f}%) are within range [-1.1,1.1]")
-            
+
             # Assert correctness of dimensions before calling the policy
             assert prediction_input.shape[1] == self.model.observation_space.shape[0], \
                 f"vector:{prediction_input.shape[1]} obs:{self.model.observation_space.shape[0]}"
-            
+
             logger.info(f"Normalized observation vector: {prediction_input}")
-            prediction = self.model.predict(prediction_input)
-            
+
+            # Handle RecurrentPPO (LSTM) vs standard PPO prediction
+            if self.is_recurrent_model:
+                # RecurrentPPO requires LSTM states and episode_start flag
+                prediction, self.lstm_states = self.model.predict(
+                    prediction_input,
+                    state=self.lstm_states,
+                    episode_start=self.episode_starts,
+                    deterministic=True
+                )
+                # After first prediction, episode_start should be False
+                self.episode_starts = np.zeros((1,), dtype=bool)
+                logger.info("DEBUG: Using RecurrentPPO with LSTM state tracking")
+            else:
+                # Standard PPO prediction
+                prediction = self.model.predict(prediction_input, deterministic=True)
+
             # Convert the prediction to a readable format
-            readable_prediction = prediction[0]
-            
+            readable_prediction = prediction[0] if isinstance(prediction, tuple) else prediction
+
             # Debug: Log the prediction
             logger.info(f"DEBUG: Raw prediction output: {prediction}")
             logger.info(f"DEBUG: Readable prediction: {readable_prediction}")
-            
+
             return readable_prediction
         except Exception as e:
             logger.error(f"Error getting prediction: {e}")

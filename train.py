@@ -1,26 +1,94 @@
+# Standard library imports
+import json
 import logging
-import pandas as pd
+import os
+from decimal import Decimal
+
+# Third-party imports
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from decimal import Decimal
-import os
-import json
-
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.callbacks import BaseCallback
 
+# RecurrentPPO for LSTM support
+try:
+    from sb3_contrib import RecurrentPPO
+    RECURRENT_PPO_AVAILABLE = True
+except ImportError:
+    RECURRENT_PPO_AVAILABLE = False
+
+# Local application imports
+from config import config
 from environment import TradingEnv
 from get_data import get_data
-from config import config
-import money  # Import the new money module
-
 from utils.seeding import set_global_seed
+from utils.device import get_device
+import money
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FEE_RATE = 0.0  # No trading fees
+
+
+class LossTrackingCallback(BaseCallback):
+    """
+    Callback to track policy loss, value loss, and entropy loss during training.
+    Used for loss-based early stopping instead of profit-based model selection.
+    """
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.policy_losses = []
+        self.value_losses = []
+        self.entropy_losses = []
+        self.n_updates = 0
+
+    def _on_rollout_end(self):
+        """Called after each rollout collection, before training update."""
+        return True
+
+    def _on_step(self):
+        """Called after each training step."""
+        return True
+
+    def _on_training_end(self):
+        """Called at the end of training - extract final losses from logger."""
+        if hasattr(self.model, "logger") and self.model.logger is not None:
+            logs = self.model.logger.name_to_value
+            # SB3 stores losses with these keys
+            if "train/policy_gradient_loss" in logs:
+                self.policy_losses.append(logs["train/policy_gradient_loss"])
+            if "train/value_loss" in logs:
+                self.value_losses.append(logs["train/value_loss"])
+            if "train/entropy_loss" in logs:
+                self.entropy_losses.append(logs["train/entropy_loss"])
+            self.n_updates += 1
+
+    def get_latest_losses(self):
+        """Get the most recent loss values."""
+        return {
+            "policy_loss": self.policy_losses[-1] if self.policy_losses else None,
+            "value_loss": self.value_losses[-1] if self.value_losses else None,
+            "entropy_loss": self.entropy_losses[-1] if self.entropy_losses else None,
+        }
+
+    def get_avg_loss(self):
+        """Get average value loss (primary metric for early stopping)."""
+        if not self.value_losses:
+            return None
+        return sum(self.value_losses) / len(self.value_losses)
+
+    def reset(self):
+        """Reset for a new training iteration."""
+        self.policy_losses = []
+        self.value_losses = []
+        self.entropy_losses = []
+        self.n_updates = 0
 
 def train_agent(train_data, total_timesteps: int):
     """
@@ -31,36 +99,88 @@ def train_agent(train_data, total_timesteps: int):
         total_timesteps (int): Number of training timesteps.
 
     Returns:
-        model: Trained PPO model.
+        model: Trained PPO or RecurrentPPO model.
     """
     env = TradingEnv(
         train_data,
         initial_balance=config["environment"]["initial_balance"],
+        transaction_cost=config["environment"].get("transaction_cost", 2.50),
         position_size=config["environment"].get("position_size", 1)
     )
     check_env(env, skip_render_check=True)
-    
+
+    # Get sequence model config
+    seq_config = config.get("sequence_model", {})
+    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+
+    # Get device configuration (use CPU for recurrent models due to MPS LSTM bugs)
+    device_config = seq_config.get("device", "auto")
+    device = get_device(device_config, for_recurrent=use_recurrent)
+    logger.info(f"Using device: {device}")
+
     # Check for learning rate decay in config
     use_lr_decay = config["model"].get("use_lr_decay", False)
     if use_lr_decay:
         # Set up learning rate parameters
         initial_lr = config["model"].get("learning_rate", 0.0003)
         final_lr = config["model"].get("final_learning_rate", 1e-5)
-        
+
         # Create linear learning rate schedule
-        from stable_baselines3.common.utils import get_linear_fn
-        learning_rate = get_linear_fn(initial_lr, final_lr, total_timesteps)
-        logger.info(f"Using learning rate decay from {initial_lr} to {final_lr} over {total_timesteps} timesteps")
+        # LinearSchedule(start, end, end_fraction) - end_fraction=1.0 means decay over full training
+        from stable_baselines3.common.utils import LinearSchedule
+        learning_rate = LinearSchedule(initial_lr, final_lr, 1.0)
+        logger.debug(f"LR decay: {initial_lr} -> {final_lr}")
     else:
         # Use constant learning rate
         learning_rate = config["model"].get("learning_rate", 0.0003)
-        logger.info(f"Using constant learning rate: {learning_rate}")
-    
-    # Initialize model with configured learning rate
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=learning_rate, seed=config.get('seed'))
-    
+
+    # Check for entropy coefficient decay in config
+    # Note: RecurrentPPO doesn't support function-based ent_coef, so use constant for LSTM
+    use_ent_decay = config["model"].get("ent_coef_decay", False)
+    if use_ent_decay and not use_recurrent:
+        initial_ent = config["model"].get("ent_coef", 0.01)
+        final_ent = config["model"].get("final_ent_coef", 0.001)
+        # LinearSchedule(start, end, end_fraction) - end_fraction=1.0 means decay over full training
+        from stable_baselines3.common.utils import LinearSchedule
+        ent_coef = LinearSchedule(initial_ent, final_ent, 1.0)
+        logger.debug(f"Entropy decay: {initial_ent} -> {final_ent}")
+    else:
+        ent_coef = config["model"].get("ent_coef", 0.01)
+
+    # Initialize model with configured parameters
+    if use_recurrent:
+        logger.info("Using RecurrentPPO with LSTM policy for temporal sequence learning")
+        shared_lstm = seq_config.get("shared_lstm", False)
+        model = RecurrentPPO(
+            "MlpLstmPolicy",
+            env,
+            verbose=1,
+            learning_rate=learning_rate,
+            ent_coef=ent_coef,
+            seed=config.get('seed'),
+            device=device,
+            policy_kwargs={
+                "lstm_hidden_size": seq_config.get("lstm_hidden_size", 256),
+                "n_lstm_layers": seq_config.get("n_lstm_layers", 1),
+                "shared_lstm": shared_lstm,
+                "enable_critic_lstm": not shared_lstm,  # Can't have both shared and separate critic LSTM
+            }
+        )
+    else:
+        if seq_config.get("enabled", False) and not RECURRENT_PPO_AVAILABLE:
+            logger.warning("RecurrentPPO requested but sb3-contrib not installed. Falling back to standard PPO.")
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            learning_rate=learning_rate,
+            ent_coef=ent_coef,
+            seed=config.get('seed'),
+            device=device,
+        )
+
     logger.info("Starting training for %d timesteps", total_timesteps)
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, progress_bar=True)
     logger.info("Training completed")
     return model
 
@@ -85,27 +205,19 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     Returns:
         tuple: (best_model, best_results, all_results)
     """
-    # Initialize training environment
+    # Initialize training environment with realistic transaction costs
     train_env = TradingEnv(
         train_data,
         initial_balance=config["environment"]["initial_balance"],
-        transaction_cost=0.0,  # No transaction costs
+        transaction_cost=config["environment"].get("transaction_cost", 2.50),
         position_size=config["environment"].get("position_size", 1)
     )
     
     check_env(train_env, skip_render_check=True)
-    
-    # DEBUGGING: Print the observation space and actual features
-    logger.info(f"Observation space shape: {train_env.observation_space.shape}")
-    
-    # Check the observation vector from the reset
+
+    # Debug observation space info
     obs, _ = train_env.reset()
-    logger.info(f"Actual observation vector shape: {obs.shape}")
-    logger.info(f"First few values of observation: {obs[:5]}")
-    
-    # Check technical indicators in the environment
-    logger.info(f"Technical indicators used in environment: {train_env.technical_indicators}")
-    logger.info(f"Total observation components: close_norm + {len(train_env.technical_indicators)} indicators + position = {1 + len(train_env.technical_indicators) + 1}")
+    logger.debug(f"Observation space: {train_env.observation_space.shape}, indicators: {len(train_env.technical_indicators)}")
     
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
@@ -123,44 +235,113 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     
     # Get learning rate decay parameters from config or use defaults
     use_lr_decay = config["model"].get("use_lr_decay", False)
+    # Total timesteps for decay is initial + additional * max iterations
+    total_decay_timesteps = initial_timesteps + (additional_timesteps * max_iterations)
+
     if use_lr_decay:
         # Set up learning rate parameters
         initial_lr = model_params.get("learning_rate", 0.0003)
         final_lr = config["model"].get("final_learning_rate", 1e-5)
-        # Total timesteps for decay is initial + additional * max iterations
-        total_decay_timesteps = initial_timesteps + (additional_timesteps * max_iterations)
-        
+
         # Create linear learning rate schedule
-        from stable_baselines3.common.utils import get_linear_fn
-        learning_rate = get_linear_fn(
-            initial_lr, 
-            final_lr, 
-            total_decay_timesteps
-        )
-        logger.info(f"Using learning rate decay from {initial_lr} to {final_lr} over {total_decay_timesteps} timesteps")
+        # LinearSchedule(start, end, end_fraction) - end_fraction=1.0 means decay over full training
+        from stable_baselines3.common.utils import LinearSchedule
+        learning_rate = LinearSchedule(initial_lr, final_lr, 1.0)
     else:
         # Use constant learning rate
         learning_rate = model_params.get("learning_rate", 0.0003)
-        logger.info(f"Using constant learning rate: {learning_rate}")
+
+    # Get sequence model config (need this before entropy coef setup)
+    seq_config = config.get("sequence_model", {})
+    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+
+    # Get entropy coefficient decay parameters from config or use defaults
+    # Note: RecurrentPPO doesn't support function-based ent_coef, so use constant for LSTM
+    use_ent_decay = config["model"].get("ent_coef_decay", False)
+    if use_ent_decay and not use_recurrent:
+        initial_ent = model_params.get("ent_coef", 0.01)
+        final_ent = config["model"].get("final_ent_coef", 0.001)
+        # LinearSchedule(start, end, end_fraction) - end_fraction=1.0 means decay over full training
+        from stable_baselines3.common.utils import LinearSchedule
+        ent_coef = LinearSchedule(initial_ent, final_ent, 1.0)
+    else:
+        ent_coef = model_params.get("ent_coef", 0.01)
+
+    # Get device configuration (use CPU for recurrent models due to MPS LSTM bugs)
+    device_config = seq_config.get("device", "auto")
+    device = get_device(device_config, for_recurrent=use_recurrent)
+
+    # Initialize the model with the specified parameters
+    if use_recurrent:
+        logger.debug("Using RecurrentPPO with LSTM")
+        # Get LSTM params from model_params (if tuned) or from config
+        lstm_hidden_size = model_params.get("lstm_hidden_size", seq_config.get("lstm_hidden_size", 256))
+        n_lstm_layers = model_params.get("n_lstm_layers", seq_config.get("n_lstm_layers", 1))
+        shared_lstm = seq_config.get("shared_lstm", False)
+
+        model = RecurrentPPO(
+            "MlpLstmPolicy",
+            train_env,
+            verbose=verbose_level,
+            ent_coef=ent_coef,
+            learning_rate=learning_rate,
+            n_steps=model_params.get("n_steps", 2048),
+            batch_size=model_params.get("batch_size", 64),
+            gamma=model_params.get("gamma", 0.99),
+            seed=config.get('seed'),
+            gae_lambda=model_params.get("gae_lambda", 0.95),
+            device=device,
+            policy_kwargs={
+                "lstm_hidden_size": lstm_hidden_size,
+                "n_lstm_layers": n_lstm_layers,
+                "shared_lstm": shared_lstm,
+                "enable_critic_lstm": not shared_lstm,  # Can't have both shared and separate critic LSTM
+            }
+        )
+    else:
+        if seq_config.get("enabled", False) and not RECURRENT_PPO_AVAILABLE:
+            logger.warning("RecurrentPPO requested but sb3-contrib not installed. Falling back to standard PPO.")
+        model = PPO(
+            "MlpPolicy",
+            train_env,
+            verbose=verbose_level,
+            ent_coef=ent_coef,
+            learning_rate=learning_rate,
+            n_steps=model_params.get("n_steps", 2048),
+            batch_size=model_params.get("batch_size", 64),
+            gamma=model_params.get("gamma", 0.99),
+            seed=config.get('seed'),
+            gae_lambda=model_params.get("gae_lambda", 0.95),
+            device=device,
+        )
     
-    # Initialize the PPO model with the specified parameters
-    model = PPO(
-        "MlpPolicy", 
-        train_env, 
-        verbose=verbose_level,
-        ent_coef=model_params.get("ent_coef", 0.01),
-        learning_rate=learning_rate,
-        n_steps=model_params.get("n_steps", 2048),
-        batch_size=model_params.get("batch_size", 64),
-        gamma=model_params.get("gamma", 0.99),
-        seed=config.get('seed'),
-        gae_lambda=model_params.get("gae_lambda", 0.95),
-    )
-    
+    # Get early stopping config
+    early_stop_config = config.get("training", {}).get("early_stopping", {})
+    use_loss_early_stop = early_stop_config.get("enabled", True)
+    loss_patience = early_stop_config.get("patience", 5)
+    loss_min_delta = early_stop_config.get("min_delta", 0.001)
+
+    # Create loss tracking callback
+    loss_callback = LossTrackingCallback(verbose=verbose_level)
+
+    # Track loss history across iterations
+    loss_history = []
+    best_loss = float('inf')
+    loss_stagnant_counter = 0
+
     # Initial training
     logger.info(f"Starting initial training for {initial_timesteps} timesteps")
-    model.learn(total_timesteps=initial_timesteps)
-    
+    model.learn(total_timesteps=initial_timesteps, progress_bar=True, callback=loss_callback)
+
+    # Get initial loss values
+    initial_losses = loss_callback.get_latest_losses()
+    if initial_losses["value_loss"] is not None:
+        current_loss = initial_losses["value_loss"]
+        best_loss = current_loss
+        loss_history.append(initial_losses)
+        logger.info(f"Iter 0 - Loss: {current_loss:.4f} (policy={initial_losses['policy_loss']:.4f}, "
+                   f"value={initial_losses['value_loss']:.4f}, entropy={initial_losses['entropy_loss']:.4f})")
+
     # Evaluate initial model on validation data using the specified metric
     if verbose_level > 0:
         logger.info(f"Evaluating model on validation data with {evaluation_metric} metric")
@@ -201,13 +382,34 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Counter for consecutive iterations without significant improvement
     stagnant_counter = 0
     
-    # Continue training until max_iterations or n_stagnant_loops consecutive iterations without improvement
+    # Continue training until max_iterations or loss plateau
     for iteration in range(1, max_iterations + 1):
+        # Reset callback for this iteration
+        loss_callback.reset()
+
         # Train for additional timesteps
-        if verbose_level > 0:
-            logger.info(f"Starting iteration {iteration} training for {additional_timesteps} timesteps")
-        model.learn(total_timesteps=additional_timesteps)
-        
+        model.learn(total_timesteps=additional_timesteps, progress_bar=True, callback=loss_callback)
+
+        # Get loss values for this iteration
+        iter_losses = loss_callback.get_latest_losses()
+        current_loss = iter_losses["value_loss"] if iter_losses["value_loss"] is not None else best_loss
+
+        # Check for loss improvement
+        loss_improved = False
+        if current_loss < best_loss - loss_min_delta:
+            loss_improved = True
+            best_loss = current_loss
+            loss_stagnant_counter = 0
+        else:
+            loss_stagnant_counter += 1
+
+        # Log loss info
+        loss_status = "[improved]" if loss_improved else f"[stagnant {loss_stagnant_counter}/{loss_patience}]"
+        if iter_losses["value_loss"] is not None:
+            loss_history.append(iter_losses)
+            logger.info(f"Iter {iteration} - Loss: {current_loss:.4f} (policy={iter_losses['policy_loss']:.4f}, "
+                       f"value={iter_losses['value_loss']:.4f}, entropy={iter_losses['entropy_loss']:.4f}) {loss_status}")
+
         # Evaluate the model on validation data using the specified metric
         if evaluation_metric == "prediction_accuracy":
             from walk_forward import evaluate_agent_prediction_accuracy
@@ -219,61 +421,62 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         else:  # Default to "return"
             results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
             current_metric_value = results["total_return_pct"]
-        
-        # Add metric information to results
+
+        # Add metric and loss information to results
         results["metric_used"] = metric_name
         results["is_best"] = False  # Will update this if it becomes the best model
-        
+        results["loss_info"] = iter_losses
+
         all_results.append(results)
-        
-        # Calculate improvement
+
+        # Calculate improvement (for logging only, not for early stopping)
         improvement = current_metric_value - best_metric_value
-        logger.info(f"Iteration {iteration} - Validation {metric_name.replace('_', ' ').title()}: {current_metric_value:.2f}%, " 
-                   f"Validation Portfolio: ${results['final_portfolio_value']:.2f}, "
-                   f"Improvement: {improvement:.2f}%")
-        
-        # Check if this is the best model so far based on validation performance
+
+        # Check if this is the best model so far based on validation performance (fallback selection)
         if current_metric_value > best_metric_value + improvement_threshold:
             best_metric_value = current_metric_value
             best_model = model
             best_results = results
             # Mark this result as the new best
             results["is_best"] = True
-            
-            logger.info(f"New best model found! Validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, " 
-                       f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
-            
+
+            logger.info(f"New best model (return): {best_metric_value:.2f}%, Portfolio: ${best_results['final_portfolio_value']:.2f}")
+
             # Save the best model
             best_model.save(os.path.join(window_folder, "best_model"))
-            
-            # Reset stagnant counter since we found improvement
+
+            # Reset profit-based stagnant counter
             stagnant_counter = 0
         else:
-            # Increment stagnant counter if no significant improvement
             stagnant_counter += 1
-            if verbose_level > 0:
-                logger.info(f"No significant improvement. Stagnant iterations: {stagnant_counter}/{n_stagnant_loops}")
-        
-        # Stop if we've had n_stagnant_loops consecutive iterations without improvement
-        if stagnant_counter >= n_stagnant_loops:
-            logger.info(f"Stopping training after {n_stagnant_loops} consecutive iterations without significant improvement")
+
+        # Early stop based on LOSS plateau (primary criterion)
+        if use_loss_early_stop and loss_stagnant_counter >= loss_patience:
+            logger.info(f"Early stop: loss plateau ({loss_patience} iters without improvement > {loss_min_delta})")
+            break
+
+        # Fallback: stop based on profit stagnation if loss early stop is disabled
+        if not use_loss_early_stop and stagnant_counter >= n_stagnant_loops:
+            logger.info(f"Stopping: {n_stagnant_loops} iters without profit improvement")
             break
     
-    logger.info(f"Iterative training completed. Best validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, " 
-               f"Validation Portfolio: ${best_results['final_portfolio_value']:.2f}")
+    # Add loss history to best_results for saving
+    best_results["loss_history"] = loss_history
+
+    logger.info(f"Training complete. Best return: {best_metric_value:.2f}%, Final loss: {best_loss:.4f}")
     return best_model, best_results, all_results
 
 def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False):
     """
     Evaluate a trained agent on test data.
-    
+
     Args:
-        model: Trained model to evaluate
+        model: Trained model to evaluate (PPO or RecurrentPPO)
         test_data: Test data DataFrame
         verbose: Verbosity level (0=silent, 1=info)
         deterministic: Whether to make deterministic predictions
         render: Whether to render the environment during evaluation
-        
+
     Returns:
         Dict: Results including portfolio value, return, etc.
     """
@@ -284,41 +487,48 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
             close_col = 'Close'
         else:
             close_col = 'close'
-        
+
         # Calculate close_norm if missing
         test_data['close_norm'] = test_data[close_col].pct_change().fillna(0)
-    
-    # Create evaluation environment
+
+    # Create evaluation environment with realistic transaction costs
     env = TradingEnv(
         test_data,
         initial_balance=config["environment"]["initial_balance"],
-        transaction_cost=config["environment"].get("transaction_cost", 0.0),
+        transaction_cost=config["environment"].get("transaction_cost", 2.50),
         position_size=config["environment"].get("position_size", 1)
     )
-    
+
     # Reset environment and store initial net worth
     obs, _ = env.reset()
     initial_net_worth = env.net_worth  # STORE INITIAL NET WORTH HERE
-    
+
+    # Check if model is RecurrentPPO (has LSTM)
+    is_recurrent = hasattr(model, 'policy') and hasattr(model.policy, 'lstm')
+
+    # Initialize LSTM states for recurrent models
+    lstm_states = None
+    episode_starts = np.ones((1,), dtype=bool)
+
     # Track portfolio values and actions over time
     portfolio_history = [float(env.net_worth)]
     action_history = []
-    
+
     # Start evaluation
     done = False
     total_reward = 0
     step_count = 0
     trade_count = 0
-    
+
     # Track trading positions
     current_position = 0  # 0 = no position, 1 = long, -1 = short
-    
+
     # Track entry points for trades
     entry_price = 0
     entry_step = -1
     trade_history = []
     last_action = None  # Track the last action to record action changes
-    
+
     # Determine which case is used for price columns
     if 'Close' in test_data.columns:
         close_col = 'Close'
@@ -326,42 +536,56 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         close_col = 'CLOSE'
     else:
         close_col = 'close'
-    
+
     # Get initial price for reference
     current_price_initial = round(float(test_data.loc[test_data.index[env.current_step], close_col]), 2)
-    
+
     if verbose > 0:
         print(f"Starting evaluation with initial price: ${current_price_initial}")
-    
+        if is_recurrent:
+            print("Using RecurrentPPO with LSTM state tracking")
+
     # Main evaluation loop
     while not done:
         # Get current step information
         current_step = env.current_step
-        
+
         # Get current price
         if current_step < len(test_data):
             current_price = round(float(test_data.loc[test_data.index[current_step], close_col]), 2)
         else:
             current_price = current_price_initial  # Fallback if index out of bounds
-        
-        # Get current action
-        action, _ = model.predict(obs, deterministic=deterministic)
+
+        # Get current action (handle both recurrent and non-recurrent models)
+        if is_recurrent:
+            action, lstm_states = model.predict(
+                obs,
+                state=lstm_states,
+                episode_start=episode_starts,
+                deterministic=deterministic
+            )
+            episode_starts = np.array([done])
+        else:
+            action, _ = model.predict(obs, deterministic=deterministic)
         action_history.append(action)
         
         # Check if action has changed, which means a potential trade
         if last_action is not None and action != last_action:
+            # Map action to trade type: 0=Long, 1=Short, 2=Hold, 3=Flat
+            action_to_type = {0: "Long", 1: "Short", 2: "Hold", 3: "Flat"}
+            trade_type = action_to_type.get(int(action), "Unknown")
             # Record the trade when action changes
             trade_history.append({
                 "date": test_data.index[current_step],
-                "trade_type": "Buy" if action == 0 else "Sell" if action == 1 else "Hold",
+                "trade_type": trade_type,
                 "price": current_price,
                 "portfolio_value": float(money.format_money(env.net_worth, 2)),
                 "profitable": True if current_position == 0 else float(env.net_worth) > float(entry_price),
                 "position_from": entry_price if entry_price > 0 else 0,
                 "position_to": current_price
             })
-            
-            if action != 2:  # If not a hold action, update entry info
+
+            if action not in [2, 3]:  # If not hold or flat action, update entry info
                 entry_price = current_price
                 entry_step = current_step
         
@@ -424,8 +648,8 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     # Calculate trade history
     trade_history_df = pd.DataFrame(trade_history)
     
-    # Calculate action distribution
-    action_counts = {0: 0, 1: 0, 2: 0}
+    # Calculate action distribution (0=Long, 1=Short, 2=Hold, 3=Flat)
+    action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
     for action in action_history:
         action_counts[int(action)] += 1
     
@@ -626,26 +850,14 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     Returns:
         tuple: (trained_model, training_stats)
     """
-    # Log the start of training
-    logger.info(f"Starting model training with parameters:")
-    logger.info(f"- initial_timesteps: {initial_timesteps}")
-    logger.info(f"- additional_timesteps: {additional_timesteps}")
-    logger.info(f"- max_iterations: {max_iterations}")
-    logger.info(f"- n_stagnant_loops: {n_stagnant_loops}")
-    logger.info(f"- improvement_threshold: {improvement_threshold}")
-    
+    # Log the start of training (debug level for detailed params)
+    logger.debug(f"Training params: timesteps={initial_timesteps}, max_iter={max_iterations}, stagnant={n_stagnant_loops}")
+
     # Get learning rate decay configuration
     use_lr_decay = config["model"].get("use_lr_decay", False)
-    if use_lr_decay:
-        initial_lr = config["model"].get("learning_rate", 0.0003)
-        final_lr = config["model"].get("final_learning_rate", 1e-5)
-        logger.info(f"- learning rate decay: enabled (from {initial_lr} to {final_lr})")
-    else:
-        logger.info(f"- learning rate decay: disabled")
-    
+
     # Get the evaluation metric from config
     evaluation_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")
-    logger.info(f"Using {evaluation_metric} as the evaluation metric for model selection")
     
     # Perform hyperparameter tuning only if enabled AND no pre-tuned parameters provided
     if run_hyperparameter_tuning and model_params is None:
@@ -671,7 +883,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
             with open(os.path.join(tuning_folder, "best_params.json"), "w") as f:
                 json.dump(model_params, f, indent=4)
     elif model_params is not None:
-        logger.info(f"Using provided hyperparameters: {model_params}")
+        logger.debug(f"Using provided hyperparameters: {model_params}")
     else:
         # Use default parameters from config
         model_params = {
@@ -682,7 +894,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
             "gamma": config["model"].get("gamma", 0.99),
             "gae_lambda": config["model"].get("gae_lambda", 0.95),
         }
-        logger.info(f"Using default parameters from config: {model_params}")
+        logger.debug(f"Using default parameters from config")
     
     # Train the model iteratively
     model, validation_results, all_results = train_agent_iteratively(
@@ -732,15 +944,22 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
                 "hit_rate": result.get("hit_rate", 0),
                 "prediction_accuracy": result.get("prediction_accuracy", 0),
                 "is_best": result.get("is_best", False),
-                "metric_used": result.get("metric_used", evaluation_metric)
+                "metric_used": result.get("metric_used", evaluation_metric),
+                "loss_info": result.get("loss_info", {})
             }
             training_stats.append(entry)
-        
+
         # Save training stats
         with open(os.path.join(window_folder, "training_stats.json"), "w") as f:
             json.dump(training_stats, f, indent=4)
-    
-    return model, training_stats
+
+    # Return as dict with loss_history included
+    result_dict = {
+        "iterations": training_stats,
+        "loss_history": validation_results.get("loss_history", [])
+    }
+
+    return model, result_dict
 
 def main():
     import torch, os
@@ -763,15 +982,28 @@ def main():
     if "final_learning_rate" not in config["model"]:
         config["model"]["final_learning_rate"] = 1e-5  # Default final learning rate
     
-    # Load data using settings from YAML with three-way split and direct Yahoo Finance download
+    # Load data using settings from YAML with three-way split
     train_data, validation_data, test_data = get_data(
-        symbol=config["data"]["symbol"],
-        period=config["data"]["period"],
-        interval=config["data"]["interval"],
-        train_ratio=config["data"].get("train_ratio", 0.7),
-        validation_ratio=config["data"].get("validation_ratio", 0.15),
-        use_yfinance=True  # Use Yahoo Finance directly
+        symbol=config["data"].get("symbol", "NQ=F"),
+        period=config["data"].get("period", "60d"),
+        interval=config["data"].get("interval", "5m"),
+        train_ratio=config["data"].get("train_ratio", 0.6),
+        validation_ratio=config["data"].get("validation_ratio", 0.2),
+        use_yfinance=config["data"].get("use_yfinance", False)  # Default to local CSV
     )
+
+    # Normalize data to prevent look-ahead bias (fit scaler ONLY on train data)
+    from normalization import scale_window, get_standardized_column_names
+    cols_to_scale = get_standardized_column_names(train_data)
+    logger.info(f"Normalizing {len(cols_to_scale)} columns using train-only fitted scaler to prevent look-ahead bias")
+    scaler, train_data, validation_data, test_data = scale_window(
+        train_data=train_data,
+        val_data=validation_data,
+        test_data=test_data,
+        cols_to_scale=cols_to_scale,
+        feature_range=(-1, 1)
+    )
+    logger.info("Data normalization complete (scaler fitted only on training data)")
 
     # Use the iterative training approach with validation data for model selection
     initial_timesteps = config["training"].get("total_timesteps", 50000)

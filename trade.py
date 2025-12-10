@@ -13,7 +13,8 @@ from stable_baselines3 import PPO
 from environment import TradingEnv
 from get_data import get_data
 from config import config
-import money  # Import the new money module
+import money
+import constants
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ class RiskManager:
         """
         # Convert price to Decimal for precise calculations
         price = money.to_decimal(price)
-        point_value = money.to_decimal(20.0)  # NQ futures point value
+        point_value = money.to_decimal(constants.NQ_POINT_VALUE)
         
         # Calculate max contracts based on position sizing parameter
         # Use the full position_size percentage of the portfolio
@@ -256,7 +257,7 @@ class RiskManager:
         # Percentage-based checks (original implementation)
         elif self.stop_loss_mode == "percentage" or self.take_profit_mode == "percentage":
             # Point value for NQ futures ($20 per point)
-            point_value = money.to_decimal(20.0)
+            point_value = money.to_decimal(constants.NQ_POINT_VALUE)
             
             # Calculate unrealized P&L for different scenarios
             if self.position == 1:  # Long position
@@ -303,7 +304,7 @@ class RiskManager:
             else:  # Short position
                 current_pnl_points = self.entry_price - close_price
                 
-            point_value = money.to_decimal(20.0)
+            point_value = money.to_decimal(constants.NQ_POINT_VALUE)
             current_pnl_dollars = current_pnl_points * point_value * self.current_contracts
             current_pnl_pct = (current_pnl_dollars / self.entry_portfolio_value) * 100
             
@@ -343,7 +344,7 @@ class RiskManager:
             unrealized_pnl_points = self.entry_price - close_price
             
         # Convert to dollar value (each NQ point worth $20)
-        point_value = money.to_decimal(20.0)
+        point_value = money.to_decimal(constants.NQ_POINT_VALUE)
         unrealized_pnl_dollars = unrealized_pnl_points * point_value * self.current_contracts
         
         # Calculate as percentage of entry portfolio value
@@ -392,7 +393,7 @@ class RiskManager:
         # - Each full point is worth $20
         # - The minimum tick size is 0.25 points, worth $5
         # - Calculate contracts × points × $20/point
-        point_value = money.to_decimal(20.0)
+        point_value = money.to_decimal(constants.NQ_POINT_VALUE)
         
         # Calculate dollar change - this is where we apply the point value
         # We use the raw price difference multiplied by the point value
@@ -409,8 +410,8 @@ class RiskManager:
         # FAILSAFE: Ensure portfolio never goes negative
         if self.net_worth + net_profit < money.to_decimal(0):
             old_net_profit = net_profit
-            # Calculate the maximum loss we can take (leave $100 minimum)
-            net_profit = money.to_decimal(-1) * (self.net_worth - money.to_decimal(100))
+            # Calculate the maximum loss we can take (leave minimum balance)
+            net_profit = money.to_decimal(-1) * (self.net_worth - money.to_decimal(constants.MIN_BALANCE_REQUIRED))
             logger.warning(f"FAILSAFE: Limiting loss to ${float(net_profit):.2f} instead of ${float(old_net_profit):.2f} to prevent negative portfolio")
         
         # Update portfolio value
@@ -574,8 +575,8 @@ def trade_with_risk_management(
     
     # Track unrealistic profits
     unrealistic_profit_count = 0
-    unrealistic_profit_threshold = 10000.0  # $10,000
-    multiplier_threshold = 2.0  # Allow up to 2x expected max profit
+    unrealistic_profit_threshold = constants.UNREALISTIC_PROFIT_THRESHOLD
+    multiplier_threshold = constants.MULTIPLIER_THRESHOLD
     
     # Get the last trading day from the data
     last_trading_day = test_data.index[-1].date()
@@ -620,7 +621,7 @@ def trade_with_risk_management(
     dates = []
     price_history = []
     portfolio_history = []
-    action_counts = {0: 0, 1: 0, 2: 0}  # Action counts (0=long, 1=short, 2=hold)
+    action_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Action counts (0=long, 1=short, 2=hold, 3=flat)
     
     # Process each candle
     for i in range(len(test_data)):
@@ -676,7 +677,7 @@ def trade_with_risk_management(
             
             if exit_reason == "stop_loss":
                 # For futures, we need to work backwards from desired P&L to price
-                point_value = money.to_decimal(20.0)  # $20 per point for NQ
+                point_value = money.to_decimal(constants.NQ_POINT_VALUE)  # $20 per point for NQ
                 
                 # Calculate how many points we need to move to achieve exact stop loss
                 # stop_loss_pct is % of portfolio, so we convert to dollars first
@@ -694,7 +695,7 @@ def trade_with_risk_management(
                 logging.info(f"Stop loss at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}, points={float(target_loss_points)}")
             elif exit_reason == "take_profit":
                 # For futures, we need to work backwards from desired P&L to price
-                point_value = money.to_decimal(20.0)  # $20 per point for NQ
+                point_value = money.to_decimal(constants.NQ_POINT_VALUE)  # $20 per point for NQ
                 
                 # Calculate how many points we need to move to achieve exact take profit
                 # take_profit_pct is % of portfolio, so we convert to dollars first

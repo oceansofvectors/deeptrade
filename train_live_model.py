@@ -196,62 +196,6 @@ def normalize_window_data(data: pd.DataFrame, window_folder: str) -> pd.DataFram
     
     return normalized_data
 
-def get_risk_params():
-    """
-    Extract risk management parameters from config, respecting enabled/disabled settings.
-    
-    Returns:
-        dict: Risk management parameters with only enabled features
-    """
-    risk_params = {
-        "enabled": False,
-        "stop_loss": None,
-        "take_profit": None,
-        "trailing_stop": None,
-        "position_size": config["environment"].get("position_size", 1)
-    }
-    
-    # Check if risk management is enabled globally
-    risk_config = config.get("risk_management", {})
-    risk_enabled = risk_config.get("enabled", False)
-    
-    if not risk_enabled:
-        logger.info("Risk management is disabled globally")
-        return risk_params
-    
-    risk_params["enabled"] = True
-    
-    # Process stop loss if enabled
-    stop_loss_config = risk_config.get("stop_loss", {})
-    if stop_loss_config.get("enabled", False):
-        risk_params["stop_loss"] = stop_loss_config.get("percentage", 0)
-        logger.info(f"Stop loss enabled at {risk_params['stop_loss']}%")
-    else:
-        logger.info("Stop loss is disabled")
-    
-    # Process take profit if enabled
-    take_profit_config = risk_config.get("take_profit", {})
-    if take_profit_config.get("enabled", False):
-        risk_params["take_profit"] = take_profit_config.get("percentage", 0)
-        logger.info(f"Take profit enabled at {risk_params['take_profit']}%")
-    else:
-        logger.info("Take profit is disabled")
-    
-    # Process trailing stop if enabled
-    trailing_stop_config = risk_config.get("trailing_stop", {})
-    if trailing_stop_config.get("enabled", False):
-        risk_params["trailing_stop"] = trailing_stop_config.get("percentage", 0)
-        logger.info(f"Trailing stop enabled at {risk_params['trailing_stop']}%")
-    else:
-        logger.info("Trailing stop is disabled")
-    
-    # Process position sizing if enabled
-    position_sizing_config = risk_config.get("position_sizing", {})
-    if position_sizing_config.get("enabled", False):
-        risk_params["position_size"] = position_sizing_config.get("size_multiplier", 1.0)
-    
-    return risk_params
-
 def main():
     set_global_seed(config['seed'])
     # Create output directories
@@ -335,19 +279,12 @@ def main():
     # Save enabled indicators to model folder
     with open(os.path.join(model_folder, "enabled_indicators.json"), "w") as f:
         json.dump(enabled_indicators, f, indent=4)
-    
-    # Get risk management parameters
-    risk_params = get_risk_params()
-    
-    # Save risk parameters to model folder
-    with open(os.path.join(model_folder, "risk_params.json"), "w") as f:
-        json.dump(risk_params, f, indent=4)
-    
+
     # Log training parameters
     logger.info(f"Training parameters:")
     logger.info(f"- train_ratio: {train_ratio}")
     logger.info(f"- validation_ratio: {validation_ratio}")
-    logger.info(f"- risk_management: {risk_params['enabled']}")
+    logger.info(f"- risk_management: {config['risk_management']['enabled']}")
     logger.info(f"- enabled_indicators: {enabled_indicators}")
     
     # Load data from the live CSV file
@@ -460,7 +397,8 @@ def main():
             n_stagnant_loops=n_stagnant_loops,
             improvement_threshold=improvement_threshold,
             evaluation_metric=evaluation_metric,
-            model_params=model_params
+            model_params=model_params,
+            window_folder=model_folder
         )
         
         # Evaluate on test data
@@ -503,12 +441,7 @@ def main():
         
         with open(os.path.join(model_folder, "training_stats.json"), "w") as f:
             json.dump(training_stats, f, indent=4)
-        
-        # Save a copy of risk parameters in the root directory for live_trading.py
-        with open("risk_params.json", "w") as f:
-            json.dump(risk_params, f, indent=4)
-        logger.info("Risk parameters saved to risk_params.json for live trading")
-            
+
         logger.info(f"Training completed successfully. Model is ready for live trading.")
         
     except Exception as e:

@@ -16,6 +16,13 @@ from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
 import pickle
 
+# RecurrentPPO for LSTM support
+try:
+    from sb3_contrib import RecurrentPPO
+    RECURRENT_PPO_AVAILABLE = True
+except ImportError:
+    RECURRENT_PPO_AVAILABLE = False
+
 from environment import TradingEnv
 from get_data import get_data
 from train import evaluate_agent, plot_results, train_walk_forward_model
@@ -23,6 +30,7 @@ from trade import trade_with_risk_management, save_trade_history  # Import trade
 from config import config
 import money
 from utils.seeding import seed_worker  # Import the seed_worker function
+from utils.device import get_device  # Import device utility
 from normalization import scale_window, get_standardized_column_names  # Import both functions from normalization
 
 # Setup logging to save to file and console
@@ -66,7 +74,6 @@ def save_json(data, filepath):
     """Save data to JSON file with custom encoder for timestamps."""
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
-    logger.info(f"Saved JSON data to {filepath}")
 
 def load_tradingview_data(csv_filepath: str = "data/data/NQ_2024_unix.csv") -> pd.DataFrame:
     """
@@ -177,57 +184,8 @@ def load_tradingview_data(csv_filepath: str = "data/data/NQ_2024_unix.csv") -> p
         logger.error(traceback.format_exc())
         return None
 
-def filter_market_hours(data: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filter the data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday).
-    
-    Args:
-        data: DataFrame with DatetimeIndex in UTC
-        
-    Returns:
-        DataFrame: Filtered data containing only market hours
-    """
-    if not isinstance(data.index, pd.DatetimeIndex):
-        logger.error("Data index is not a DatetimeIndex, cannot filter market hours")
-        return data
-    
-    # Make a copy to avoid modifying the original
-    filtered_data = data.copy()
-    
-    # Convert UTC times to Eastern Time
-    eastern = pytz.timezone('US/Eastern')
-    
-    # Ensure the index is timezone-aware
-    if filtered_data.index.tz is None:
-        filtered_data.index = filtered_data.index.tz_localize('UTC')
-    
-    # Convert to Eastern Time
-    filtered_data.index = filtered_data.index.tz_convert(eastern)
-    
-    # Filter for weekdays (Monday=0, Friday=4)
-    weekday_mask = (filtered_data.index.dayofweek >= 0) & (filtered_data.index.dayofweek <= 4)
-    
-    # Filter for market hours (9:30 AM to 4:00 PM ET)
-    market_open = time(9, 30)
-    market_close = time(16, 0)
-    
-    hours_mask = (
-        (filtered_data.index.time >= market_open) & 
-        (filtered_data.index.time <= market_close)
-    )
-    
-    # Apply both filters
-    market_hours_mask = weekday_mask & hours_mask
-    filtered_data = filtered_data.loc[market_hours_mask]
-    
-    # Convert back to UTC for consistency with the rest of the system
-    filtered_data.index = filtered_data.index.tz_convert('UTC')
-    
-    # Log filtering results
-    filtered_pct = (len(filtered_data) / len(data)) * 100
-    logger.info(f"Filtered data to market hours only: {len(filtered_data)} / {len(data)} rows ({filtered_pct:.2f}%)")
-    
-    return filtered_data
+# Import filter_market_hours from shared utilities
+from utils.data_utils import filter_market_hours
 
 def get_trading_days(data: pd.DataFrame) -> List[str]:
     """
@@ -550,13 +508,15 @@ def process_single_window(
         "test_end": test_data.index[-1]
     }
     save_json(window_periods, f"{window_folder}/window_periods.json")
-    
+
     # Scale technical indicator columns within this window to prevent data leakage
-    window_logger.info(f"Window {window_idx}: Scaling technical indicators to prevent data leakage")
     
     # Get columns to scale using the helper function from normalization module
     cols_to_scale = get_standardized_column_names(train_data)
-    
+
+    # Get scaler type from config
+    scaler_type = config.get("normalization", {}).get("scaler_type", "robust")
+
     # Scale the data
     scaler, train_data, validation_data, test_data = scale_window(
         train_data=train_data,
@@ -564,7 +524,8 @@ def process_single_window(
         test_data=test_data,
         cols_to_scale=cols_to_scale,
         feature_range=(-1, 1),
-        window_folder=window_folder
+        window_folder=window_folder,
+        scaler_type=scaler_type
     )
     
     # Training the model with the scaled data
@@ -581,12 +542,26 @@ def process_single_window(
         tuning_trials=tuning_trials,
         model_params=best_hyperparameters  # Pass the best hyperparameters to use
     )
-    
-    # Plot training progress
-    plot_training_progress(training_stats, window_folder)
-    
-    # Load the best model for testing
-    model = PPO.load(f"{window_folder}/model")
+
+    # Save loss history if available
+    if "loss_history" in training_stats and training_stats["loss_history"]:
+        loss_history_path = f"{window_folder}/loss_history.json"
+        save_json(training_stats["loss_history"], loss_history_path)
+
+    # Plot training progress (pass iterations list)
+    plot_training_progress(training_stats.get("iterations", training_stats), window_folder)
+
+    # Load the best model for testing (try RecurrentPPO first if enabled)
+    seq_config = config.get("sequence_model", {})
+    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+
+    if use_recurrent:
+        try:
+            model = RecurrentPPO.load(f"{window_folder}/model")
+        except Exception:
+            model = PPO.load(f"{window_folder}/model")
+    else:
+        model = PPO.load(f"{window_folder}/model")
     
     # Get risk management parameters from config
     risk_config = config.get("risk_management", {})
@@ -628,24 +603,8 @@ def process_single_window(
             position_size = position_sizing_config.get("size_multiplier", 1.0)
             max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 0.0)
     
-    # Log risk management settings
-    window_logger.info("Risk Management Settings:")
-    window_logger.info(f"  Risk Management Enabled: {risk_enabled}")
-    if risk_enabled:
-        window_logger.info(f"  Daily Risk Limit: {'Enabled' if daily_risk_limit is not None else 'Disabled'}" + 
-                         (f" (${daily_risk_limit})" if daily_risk_limit is not None else ""))
-        window_logger.info(f"  Stop Loss: {'Enabled' if stop_loss_pct is not None else 'Disabled'}" + 
-                         (f" ({stop_loss_pct}%)" if stop_loss_pct is not None else ""))
-        window_logger.info(f"  Take Profit: {'Enabled' if take_profit_pct is not None else 'Disabled'}" + 
-                         (f" ({take_profit_pct}%)" if take_profit_pct is not None else ""))
-        window_logger.info(f"  Trailing Stop: {'Enabled' if trailing_stop_pct is not None else 'Disabled'}" + 
-                         (f" ({trailing_stop_pct}%)" if trailing_stop_pct is not None else ""))
-        window_logger.info(f"  Position Size: {position_size}")
-        window_logger.info(f"  Max Risk per Trade: {max_risk_per_trade_pct}%")
-    
     # Evaluate with risk management if enabled
     if risk_enabled:
-        window_logger.info(f"Evaluating window {window_idx} with risk management")
         
         # Convert all numeric parameters to Decimal before passing to trade_with_risk_management
         import money
@@ -665,11 +624,10 @@ def process_single_window(
         )
     else:
         # Evaluate without risk management
-        window_logger.info(f"Evaluating window {window_idx} without risk management")
         test_env = TradingEnv(
             test_data,
             initial_balance=config["environment"]["initial_balance"],
-            transaction_cost=0.0
+            transaction_cost=config["environment"].get("transaction_cost", 2.50)
         )
         
         test_results = evaluate_agent(
@@ -684,7 +642,6 @@ def process_single_window(
     # Save test results
     test_results_path = f'{window_folder}/test_results.json'
     save_json(test_results, test_results_path)
-    window_logger.info(f"Test results saved to {test_results_path}")
     
     # Compile window result
     window_result = {
@@ -710,20 +667,15 @@ def process_single_window(
         window_result["correct_predictions"] = test_results.get("correct_predictions", 0)
         window_result["total_predictions"] = test_results.get("total_predictions", 0)
     
-    window_logger.info(f"Window {window_idx} Return: {test_results['total_return_pct']:.2f}%, "
-                      f"Portfolio Value: ${test_results['final_portfolio_value']:.2f}, "
-                      f"Trades: {test_results['trade_count']}")
-    
+    logger.info(f"Window {window_idx}: Return={test_results['total_return_pct']:.2f}%, Portfolio=${test_results['final_portfolio_value']:.2f}")
+
     if "trade_history" in test_results:
         window_result["has_trade_history"] = True
-        
+
         # Only save trade history if there are actual trades in the history
         if test_results["trade_history"] and len(test_results["trade_history"]) > 0:
             trade_history_path = f'{window_folder}/trade_history.csv'
             save_trade_history(test_results["trade_history"], trade_history_path)
-            window_logger.info(f"Trade history saved to {trade_history_path}")
-        else:
-            window_logger.warning(f"Empty trade history even though trade_count is {test_results['trade_count']}. Not saving empty CSV.")
     else:
         window_result["has_trade_history"] = False
     
@@ -785,9 +737,10 @@ def walk_forward_testing(
         save_json(error_report, f'{session_folder}/reports/error_report.json')
         return error_report
     
-    # Filter data to include only market hours
-    logger.info("Filtering data to include only NYSE market hours")
-    data = filter_market_hours(data)
+    # Filter data to include only market hours if configured
+    if config.get("data", {}).get("market_hours_only", True):
+        logger.info("Filtering data to NYSE market hours only")
+        data = filter_market_hours(data)
     
     # Get list of unique trading days in the dataset
     trading_days = get_trading_days(data)
@@ -892,18 +845,21 @@ def walk_forward_testing(
         # Convert to Eastern timezone for proper day-based filtering
         eastern = pytz.timezone('US/Eastern')
         data_eastern = data.copy()
-        data_eastern.index = data_eastern.index.tz_convert(eastern)
+        # Handle both tz-aware and tz-naive timestamps
+        if data_eastern.index.tz is None:
+            data_eastern.index = data_eastern.index.tz_localize('UTC').tz_convert(eastern)
+        else:
+            data_eastern.index = data_eastern.index.tz_convert(eastern)
         
         # Extract data for this window by trading days
         window_mask = (data_eastern.index.date.astype(str) >= start_day) & (data_eastern.index.date.astype(str) <= end_day)
         window_data = data_eastern[window_mask].copy()
-        
-        # Convert back to UTC
-        window_data.index = window_data.index.tz_convert('UTC')
-        
-        # Log window data range
-        logger.info(f"Window {i+1} data range: {window_data.index[0]} to {window_data.index[-1]} (UTC)")
-        logger.info(f"Window {i+1} data points: {len(window_data)}")
+
+        # Convert back to original timezone (UTC if it was tz-aware, remove tz if it was naive)
+        if data.index.tz is None:
+            window_data.index = window_data.index.tz_localize(None)
+        else:
+            window_data.index = window_data.index.tz_convert('UTC')
         
         # Split window into train, validation, and test sets
         train_idx = int(len(window_data) * train_ratio)
@@ -1201,70 +1157,114 @@ def hyperparameter_tuning(
     def objective(trial):
         # Get hyperparameter ranges from config
         hp_config = config.get("hyperparameter_tuning", {}).get("parameters", {})
-        
+
+        # Get sequence model config
+        seq_config = config.get("sequence_model", {})
+        use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+
         # Define hyperparameters to tune using ranges from config
         learning_rate_cfg = hp_config.get("learning_rate", {})
         learning_rate = trial.suggest_float(
-            "learning_rate", 
-            learning_rate_cfg.get("min", 1e-5), 
-            learning_rate_cfg.get("max", 1e-2), 
+            "learning_rate",
+            learning_rate_cfg.get("min", 1e-5),
+            learning_rate_cfg.get("max", 1e-2),
             log=learning_rate_cfg.get("log", True)
         )
-        
+
         n_steps_cfg = hp_config.get("n_steps", {})
         n_steps = trial.suggest_int(
-            "n_steps", 
-            n_steps_cfg.get("min", 128), 
-            n_steps_cfg.get("max", 2048), 
+            "n_steps",
+            n_steps_cfg.get("min", 128),
+            n_steps_cfg.get("max", 2048),
             log=n_steps_cfg.get("log", True)
         )
-        
+
         ent_coef_cfg = hp_config.get("ent_coef", {})
         ent_coef = trial.suggest_float(
-            "ent_coef", 
-            ent_coef_cfg.get("min", 0.00001), 
-            ent_coef_cfg.get("max", 0.5), 
+            "ent_coef",
+            ent_coef_cfg.get("min", 0.00001),
+            ent_coef_cfg.get("max", 0.5),
             log=ent_coef_cfg.get("log", True)
         )
-        
+
         batch_size_cfg = hp_config.get("batch_size", {})
         batch_size = trial.suggest_int(
-            "batch_size", 
-            batch_size_cfg.get("min", 8), 
-            batch_size_cfg.get("max", 128), 
+            "batch_size",
+            batch_size_cfg.get("min", 8),
+            batch_size_cfg.get("max", 128),
             log=batch_size_cfg.get("log", True)
         )
-        
+
         # Use fixed values for gamma and gae_lambda from config
         gamma = hp_config.get("gamma", 0.995)
         gae_lambda = hp_config.get("gae_lambda", 0.95)
-        
-        # Create environment
+
+        # LSTM hyperparameters (only tuned when RecurrentPPO is enabled)
+        lstm_hidden_size = seq_config.get("lstm_hidden_size", 256)
+        n_lstm_layers = seq_config.get("n_lstm_layers", 1)
+
+        if use_recurrent:
+            lstm_cfg = hp_config.get("lstm_hidden_size", {})
+            if "choices" in lstm_cfg:
+                lstm_hidden_size = trial.suggest_categorical("lstm_hidden_size", lstm_cfg["choices"])
+
+            n_lstm_cfg = hp_config.get("n_lstm_layers", {})
+            if "min" in n_lstm_cfg and "max" in n_lstm_cfg:
+                n_lstm_layers = trial.suggest_int("n_lstm_layers", n_lstm_cfg["min"], n_lstm_cfg["max"])
+
+        # Create environment with realistic transaction costs
         train_env = TradingEnv(
             train_data,
             initial_balance=config["environment"]["initial_balance"],
-            transaction_cost=0.0,
+            transaction_cost=config["environment"].get("transaction_cost", 2.50),
             position_size=config["environment"].get("position_size", 1)
         )
-        
+
+        # Get device (use CPU for recurrent models due to MPS LSTM bugs)
+        device_config = seq_config.get("device", "auto")
+        device = get_device(device_config, for_recurrent=use_recurrent)
+
         # Create model with trial hyperparameters
-        model = PPO(
-            "MlpPolicy",
-            train_env,
-            verbose=0,
-            learning_rate=learning_rate,
-            n_steps=n_steps,
-            ent_coef=ent_coef,
-            batch_size=batch_size,
-            gamma=gamma,
-            seed=config.get('seed'),
-            gae_lambda=gae_lambda
-        )
-        
+        if use_recurrent:
+            shared_lstm = seq_config.get("shared_lstm", False)
+            model = RecurrentPPO(
+                "MlpLstmPolicy",
+                train_env,
+                verbose=0,
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                ent_coef=ent_coef,
+                batch_size=batch_size,
+                gamma=gamma,
+                seed=config.get('seed'),
+                gae_lambda=gae_lambda,
+                device=device,
+                policy_kwargs={
+                    "lstm_hidden_size": lstm_hidden_size,
+                    "n_lstm_layers": n_lstm_layers,
+                    "shared_lstm": shared_lstm,
+                    "enable_critic_lstm": not shared_lstm,  # Can't have both shared and separate critic LSTM
+                }
+            )
+        else:
+            model = PPO(
+                "MlpPolicy",
+                train_env,
+                verbose=0,
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                ent_coef=ent_coef,
+                batch_size=batch_size,
+                gamma=gamma,
+                seed=config.get('seed'),
+                gae_lambda=gae_lambda,
+                device=device,
+            )
+
         # Train the model
         total_timesteps = config["training"].get("total_timesteps", 10000)
         model.learn(total_timesteps=total_timesteps)
-        
+
         # Evaluate on validation data based on the chosen metric
         if eval_metric == "prediction_accuracy":
             results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=0, deterministic=True)
@@ -1275,12 +1275,15 @@ def hyperparameter_tuning(
         else:  # Default to "return"
             results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
             metric_value = results["total_return_pct"]
-        
+
         # Log trial results
-        logger.info(f"Trial {trial.number}: {eval_metric} = {metric_value:.2f}%, "
-                   f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, "
-                   f"ent_coef={ent_coef:.6f}, batch_size={batch_size}")
-        
+        log_msg = f"Trial {trial.number}: {eval_metric} = {metric_value:.2f}%, "
+        log_msg += f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, "
+        log_msg += f"ent_coef={ent_coef:.6f}, batch_size={batch_size}"
+        if use_recurrent:
+            log_msg += f", lstm_hidden={lstm_hidden_size}, n_lstm_layers={n_lstm_layers}"
+        logger.info(log_msg)
+
         return metric_value
     
     # Run optimization with parallel processing if enabled
@@ -1372,10 +1375,10 @@ def plot_training_progress(training_stats: List[Dict], window_folder: str) -> No
         plt.text(iteration, value, f"{value:.1f}%", 
                 ha='center', va='bottom', fontsize=8)
         
-        # Add star for best models
+        # Add marker for best models
         if best:
-            plt.text(iteration, value, '⭐', 
-                    ha='center', va='top', fontsize=12)
+            plt.text(iteration, value, '*',
+                    ha='center', va='top', fontsize=14, fontweight='bold', color='gold')
     
     plt.xlabel('Training Iteration')
     plt.ylabel(y_label)
@@ -1693,17 +1696,12 @@ def main():
         print("\nERROR: Data loading failed. Please check the TradingView data file and ensure it contains valid data.")
         return
     
-    logger.info(f"Loaded TradingView dataset with {len(full_data)} rows spanning from {full_data.index[0]} to {full_data.index[-1]}")
-    logger.info("Note: Dataset will be filtered to include only NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)")
+    logger.info(f"Loaded {len(full_data)} rows from {full_data.index[0].strftime('%Y-%m-%d')} to {full_data.index[-1].strftime('%Y-%m-%d')}")
     
     # Get walk-forward parameters from config or use defaults
     wf_config = config.get("walk_forward", {})
     window_size = wf_config.get("window_size", 14)  # 14 trading days default
     step_size = wf_config.get("step_size", 7)       # 7 trading days default
-    
-    # Log information about how days are counted
-    logger.info(f"Window size: {window_size} trading days (NYSE business days, not calendar days)")
-    logger.info(f"Step size: {step_size} trading days (NYSE business days, not calendar days)")
     
     # Get evaluation metric from config
     eval_metric = config.get("training", {}).get("evaluation", {}).get("metric", "return")

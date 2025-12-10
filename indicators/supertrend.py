@@ -1,101 +1,98 @@
+"""
+SuperTrend indicator module.
+
+SuperTrend is a trend-following indicator that combines ATR with price bands.
+It provides clear buy/sell signals based on price crossing the SuperTrend line.
+"""
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
 import logging
 
+from indicators.utils import get_ohlcv_columns
+
 logger = logging.getLogger(__name__)
+
 
 def calculate_supertrend(
     df: pd.DataFrame,
-    length: int = 21,
-    multiplier: float = 4.5,
-    smooth_periods: int = 5,
-    threshold: float = 0.5,
-    lookback_periods: int = 3,
-    min_trend_duration: int = 3,
+    length: int = 10,
+    multiplier: float = 3.0,
     target_col: str = 'supertrend'
 ) -> pd.DataFrame:
     """
-    Calculate a stabilized Supertrend indicator with trend-duration guard.
+    Calculate the standard SuperTrend indicator.
+
+    SuperTrend uses ATR to create dynamic support/resistance bands:
+    - Upper Band = (High + Low) / 2 + multiplier * ATR
+    - Lower Band = (High + Low) / 2 - multiplier * ATR
+
+    The trend direction changes when price crosses the SuperTrend line:
+    - Uptrend (+1): Price is above SuperTrend (use lower band as support)
+    - Downtrend (-1): Price is below SuperTrend (use upper band as resistance)
 
     Args:
         df: DataFrame with 'high', 'low', 'close' columns
-        length: ATR period (default: 21)
-        multiplier: ATR multiplier (default: 4.5)
-        smooth_periods: Rolling window for smoothing raw trend (default: 5)
-        threshold: Minimum rolling-average magnitude to register a signal (default: 0.5)
-        lookback_periods: Consecutive smoothed signals required to flip (default: 3)
-        min_trend_duration: Minimum bars before another flip allowed (default: 3)
+        length: ATR period (default: 10)
+        multiplier: ATR multiplier for band calculation (default: 3.0)
         target_col: Name of output column (+1/-1 signal, default: 'supertrend')
+
     Returns:
-        DataFrame augmented with `target_col` of +1/-1 trend signals.
+        DataFrame augmented with `target_col` containing +1 (uptrend) or -1 (downtrend)
     """
     try:
-        # 1. Compute raw Supertrend
+        # Get column names
+        cols = get_ohlcv_columns(df)
+        if not all([cols['high'], cols['low'], cols['close']]):
+            logger.error(f"Missing required columns. Available: {df.columns.tolist()}")
+            df[target_col] = 0
+            return df
+
+        # Make a copy to avoid modifying the original
+        result_df = df.copy()
+
+        # Calculate SuperTrend using pandas_ta
         st = ta.supertrend(
-            high=df['high'], low=df['low'], close=df['close'],
-            length=length, multiplier=multiplier
+            high=result_df[cols['high']],
+            low=result_df[cols['low']],
+            close=result_df[cols['close']],
+            length=length,
+            multiplier=multiplier
         )
-        trend_col = next((c for c in st.columns if c.startswith('SUPERTd_')), None)
-        df['raw_trend'] = st[trend_col].fillna(method='ffill').fillna(0) if trend_col else 0
 
-        # 2. Smooth the raw trend (rolling average)
-        if smooth_periods > 1:
-            rolling = df['raw_trend'].rolling(window=smooth_periods, min_periods=1).mean()
-            # map to -1, 0, +1
-            df['smoothed'] = np.where(
-                rolling >= threshold, 1,
-                np.where(rolling <= -threshold, -1, 0)
-            )
-        else:
-            df['smoothed'] = df['raw_trend']
+        # pandas_ta returns columns like:
+        # - SUPERT_{length}_{multiplier} (the SuperTrend line value)
+        # - SUPERTd_{length}_{multiplier} (the direction: 1 or -1)
+        # - SUPERTl_{length}_{multiplier} (lower band, used in uptrend)
+        # - SUPERTs_{length}_{multiplier} (upper band, used in downtrend)
 
-        # 3. Initialize
-        df[target_col] = 0
-        last_flip_index = 0
+        # Find the direction column
+        trend_col = None
+        for col in st.columns:
+            if col.startswith('SUPERTd_'):
+                trend_col = col
+                break
 
-        # Set first value
-        if len(df) > 0:
-            first_signal = df['smoothed'].iat[0]
-            df[target_col].iat[0] = first_signal if first_signal != 0 else 0
-            last_flip_index = 0
+        if trend_col is None:
+            logger.error(f"Could not find SuperTrend direction column. Columns: {st.columns.tolist()}")
+            result_df[target_col] = 0
+            return result_df
 
-        # 4. Loop with lookback & min-duration
-        for i in range(1, len(df)):
-            prev = df[target_col].iat[i-1]
-            curr = df['smoothed'].iat[i]
+        # Extract the trend direction (+1 for uptrend, -1 for downtrend)
+        result_df[target_col] = st[trend_col].fillna(0).astype(int)
 
-            # guard: enforce minimum trend duration
-            if (i - last_flip_index) < min_trend_duration:
-                df[target_col].iat[i] = prev
-                continue
+        # Log distribution
+        value_counts = result_df[target_col].value_counts().to_dict()
+        logger.info(f"SuperTrend distribution: {value_counts}")
 
-            # no new signal => hold
-            if curr == 0:
-                df[target_col].iat[i] = prev
-                continue
-
-            # same as prior => hold
-            if curr == prev:
-                df[target_col].iat[i] = prev
-                continue
-
-            # candidate flip: require lookback_periods of same smoothed
-            start = max(0, i - lookback_periods + 1)
-            window = df['smoothed'].iloc[start:i+1]
-            if (window == curr).all():
-                df[target_col].iat[i] = curr
-                last_flip_index = i
-            else:
-                df[target_col].iat[i] = prev
-
-        # 5. Cleanup
-        df.drop(['raw_trend', 'smoothed'], axis=1, inplace=True)
-        logger.info(f"Supertrend distribution: {df[target_col].value_counts().to_dict()}")
-        return df
+        return result_df
 
     except Exception as e:
         logger.error(f"Error in calculate_supertrend: {e}")
+        import traceback
+        traceback.print_exc()
+
         if target_col not in df.columns:
+            df = df.copy()
             df[target_col] = 0
         return df

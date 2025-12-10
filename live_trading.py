@@ -14,12 +14,13 @@ from trading.utils import get_most_recent_contract
 
 # Import bar handling functions and variables
 from trading.bar_handler import (
-    aggregate_bars, get_interval_key, end_of_interval, synchronize_bars, 
+    aggregate_bars, get_interval_key, end_of_interval, synchronize_bars,
     bar_buckets, BARS_PER_FIVE_MIN, FIVE_SEC_PER_BAR, ROUND_TO, UTC as BH_UTC
 )
 
-# Import config
+# Import config and constants
 from config import config
+import constants
 
 # Import ModelTrader class
 from trading.model_trader import ModelTrader
@@ -57,9 +58,6 @@ last_execution_time = None
 last_data_timestamp = datetime.now()
 is_data_flowing = False
 reconnection_attempts = 0
-MAX_RECONNECTION_ATTEMPTS = 3
-DATA_FLOW_THRESHOLD = 60  # seconds
-MIN_EXECUTION_INTERVAL = 10  # seconds
 
 # Daily PnL tracking
 daily_pnl = 0.0
@@ -270,6 +268,11 @@ def onBar(bars, hasNewBar):
             save_last_trading_day(current_day)
             logger.info(f"New trading day started: {current_day}")
 
+            # Reset LSTM states for recurrent models at day boundary
+            if model_trader and model_trader.is_recurrent_model:
+                model_trader.reset_lstm_state()
+                logger.info("Reset LSTM hidden states for new trading day")
+
         # Only process bar completion logic if we have a new bar
         if not hasNewBar:
             return
@@ -330,9 +333,9 @@ def onBar(bars, hasNewBar):
             
             # Check if enough time has passed since last execution
             now = datetime.now()
-            if last_execution_time and now - last_execution_time < timedelta(seconds=MIN_EXECUTION_INTERVAL):
+            if last_execution_time and now - last_execution_time < timedelta(seconds=constants.MIN_EXECUTION_INTERVAL):
                 time_since_last = (now - last_execution_time).total_seconds()
-                logger.info(f"Skipping execution - only {time_since_last:.1f} seconds since last execution (min {MIN_EXECUTION_INTERVAL}s)")
+                logger.info(f"Skipping execution - only {time_since_last:.1f} seconds since last execution (min {constants.MIN_EXECUTION_INTERVAL}s)")
                 return
             
             if model_trader is None:
@@ -387,8 +390,8 @@ def heartbeat_monitor():
             if is_data_flowing:
                 time_since_last = (current_time - last_data_timestamp).total_seconds()
                 
-                # If no data for over DATA_FLOW_THRESHOLD seconds, try to reconnect
-                if time_since_last > DATA_FLOW_THRESHOLD:
+                # If no data for over constants.DATA_FLOW_THRESHOLD seconds, try to reconnect
+                if time_since_last > constants.DATA_FLOW_THRESHOLD:
                     logger.error(f"No data received for {time_since_last:.1f} seconds. Attempting reconnection.")
                     reconnected = reconnect_to_ib()
                     
@@ -421,7 +424,7 @@ def reconnect_to_ib():
     global ib, model_trader, reconnection_attempts
     
     reconnection_attempts += 1
-    if reconnection_attempts > MAX_RECONNECTION_ATTEMPTS:
+    if reconnection_attempts > constants.MAX_RECONNECTION_ATTEMPTS:
         logger.error("Max reconnection attempts reached. Exiting.")
         # sys.exit(1) # Consider how to handle this; exiting thread might not stop main
         return False
@@ -434,7 +437,7 @@ def reconnect_to_ib():
             time.sleep(1) # Brief pause after disconnect
         
         # Wait before reconnecting
-        logger.info(f"Attempting reconnection {reconnection_attempts}/{MAX_RECONNECTION_ATTEMPTS}...")
+        logger.info(f"Attempting reconnection {reconnection_attempts}/{constants.MAX_RECONNECTION_ATTEMPTS}...")
         time.sleep(5)
         
         if not ib.isConnected():
@@ -706,7 +709,7 @@ if __name__ == "__main__":
         # model_trader.load_state() # Already called in init and after reconnect attempts if needed
         
         # Add force reconnect timer
-        ib.setTimeout(120)  # 2-minute timeout for IB API calls
+        ib.setTimeout(constants.IB_TIMEOUT)
         
         # Main loop - just keep the connection alive
         logger.info("Entering main loop, waiting for bar events and IB events...")

@@ -1,23 +1,30 @@
+# Standard library imports
+import logging
+from decimal import Decimal
+
+# Third-party imports
 import gymnasium as gym
-from gymnasium import spaces
-from gymnasium.utils import seeding
 import numpy as np
 import pandas as pd
-from decimal import Decimal
-import money  # Import the new money module
-import logging
-from config import config
+from gymnasium import spaces
+from gymnasium.utils import seeding
 from stable_baselines3.common.env_util import make_vec_env
+
+# Local application imports
+import constants
+import money
+from config import config
 
 class TradingEnv(gym.Env):
     """
     Custom Gymnasium environment for trading with multiple technical indicators.
 
-    Observation Space: [close_norm, technical_indicators..., position]
+    Observation Space: [close_norm, technical_indicators..., position, unrealized_pnl_norm, time_in_position_norm]
     Action Space:
         0: Long (Buy)
         1: Short (Sell)
         2: Hold (Stay in current position or do nothing)
+        3: Flat (Close position and stay out of market)
     """
 
     metadata = {"render.modes": ["human"]}
@@ -42,8 +49,8 @@ class TradingEnv(gym.Env):
         self.data = data.reset_index(drop=True)
         self.total_steps = len(self.data) - 1  # Last valid index
 
-        # Action space: 0 = long (buy), 1 = short (sell), 2 = hold (stay in current position)
-        self.action_space = spaces.Discrete(3)
+        # Action space: 0 = long (buy), 1 = short (sell), 2 = hold (stay in current position), 3 = flat (close position)
+        self.action_space = spaces.Discrete(4)
 
         # Define the technical indicators to include in the observation space
         self.technical_indicators = []
@@ -109,31 +116,37 @@ class TradingEnv(gym.Env):
             if 'ZScore' in self.data.columns:
                 self.technical_indicators.append('MSO_COS')
             
-        # Calculate observation space size: close_norm + all technical indicators + position
-        obs_size = 1 + len(self.technical_indicators) + 1
-        
+        # Calculate observation space size: close_norm + all technical indicators + position + unrealized_pnl + time_in_position
+        obs_size = 1 + len(self.technical_indicators) + 3  # +3 for position, unrealized_pnl, time_in_position
+
         # Create observation space with appropriate bounds
         # Most indicators are normalized between -1 and 1 or 0 and 1
         low_obs = np.array([-1.0] * obs_size, dtype=np.float32)
         high_obs = np.array([1.0] * obs_size, dtype=np.float32)
-        
+
         # Ensure close_norm is between 0 and 1
         low_obs[0] = 0.0
-        
+
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
 
         # Internal state variables
         self.current_step = 0
-        self.position = 0  # Will be immediately updated to either 1 (long) or -1 (short)
+        self.position = 0  # 0 = flat, 1 = long, -1 = short
         self.entry_price = Decimal('0.0')  # Actual price when position was opened
         self.initial_index = 0
+        self.time_in_position = 0  # Number of steps since position was opened
+        self.trade_count = 0  # Total number of trades made in episode
 
         # Portfolio tracking with Decimal for precision
         self.initial_balance = money.to_decimal(initial_balance)
         self.net_worth = self.initial_balance
         self.transaction_cost = money.to_decimal(transaction_cost)
         self.previous_net_worth = self.initial_balance  # Track previous net worth for reward calculation
-        
+
+        # Risk-adjusted reward tracking
+        self.returns_history = []  # Store returns for volatility calculation
+        self.max_net_worth = self.initial_balance  # Track peak for drawdown calculation
+
         # Position sizing
         self.position_size = position_size
 
@@ -149,19 +162,23 @@ class TradingEnv(gym.Env):
         Args:
             seed: Random seed for reproducibility
             options: Additional options (unused)
-            
+
         Returns:
             tuple: (observation, info)
         """
         # Set random seed if provided
         if seed is not None:
             self.seed(seed)
-            
+
         self.current_step = self.initial_index
-        self.position = 0  # Will be immediately set by first action
+        self.position = 0  # Start flat (no position)
         self.entry_price = Decimal('0.0')
         self.net_worth = self.initial_balance
         self.previous_net_worth = self.initial_balance  # Reset previous net worth for reward calculation
+        self.time_in_position = 0  # Reset time in position
+        self.trade_count = 0  # Reset trade count
+        self.returns_history = []  # Reset returns history for volatility calculation
+        self.max_net_worth = self.initial_balance  # Reset peak for drawdown
         obs = self._get_obs()
         return obs, {}
 
@@ -170,7 +187,7 @@ class TradingEnv(gym.Env):
         Constructs the observation at the current time step.
 
         Returns:
-            np.ndarray: Array with [close_norm, technical_indicators..., position].
+            np.ndarray: Array with [close_norm, technical_indicators..., position, unrealized_pnl_norm, time_in_position_norm].
         """
         # Get close_norm value - check for any capitalization variant
         if "CLOSE_NORM" in self.data.columns:
@@ -179,13 +196,13 @@ class TradingEnv(gym.Env):
             close_norm = self.data.loc[self.current_step, "Close_norm"]
         else:
             close_norm = self.data.loc[self.current_step, "close_norm"]
-        
+
         # Add all technical indicators
         indicators = []
         for indicator in self.technical_indicators:
             # For each indicator, try to find it in any capitalization format
             indicator_value = None
-            
+
             # Try different capitalization formats
             possible_names = [
                 indicator,
@@ -193,12 +210,12 @@ class TradingEnv(gym.Env):
                 indicator.upper(),
                 indicator.capitalize()
             ]
-            
+
             for name in possible_names:
                 if name in self.data.columns:
                     indicator_value = self.data.loc[self.current_step, name]
                     break
-            
+
             # Special handling for supertrend indicator
             if indicator.lower() == 'supertrend' and indicator_value is None:
                 # Try additional variations specific to supertrend
@@ -206,113 +223,176 @@ class TradingEnv(gym.Env):
                     if name in self.data.columns:
                         indicator_value = self.data.loc[self.current_step, name]
                         break
-            
+
             # If we found a value, add it, otherwise use a default
             if indicator_value is not None:
                 indicators.append(indicator_value)
             else:
+                logger = logging.getLogger(__name__)
                 logger.warning(f"Could not find indicator {indicator} in data columns: {self.data.columns}")
                 indicators.append(0.0)  # Default value if indicator not found
-        
-        # Add position
+
+        # Add position (normalized to -1, 0, 1)
         position = float(self.position)
-        
-        # DEBUGGING: Print details about observation vector construction
-        logger = logging.getLogger(__name__)
-    
-        
-        observation_elements = ["close_norm"]
-        observation_elements.extend(self.technical_indicators)
-        observation_elements.append("position")
-        
+
+        # Calculate unrealized P&L normalized to [-1, 1]
+        unrealized_pnl_norm = self._calculate_unrealized_pnl_normalized()
+
+        # Normalize time in position (using sigmoid-like scaling, capped at ~100 steps)
+        # This maps 0 -> 0, 50 -> ~0.76, 100 -> ~0.96
+        time_in_position_norm = float(np.tanh(self.time_in_position / 50.0))
+
         # Combine all features
-        obs = np.array([close_norm] + indicators + [position], dtype=np.float32)
-        
+        obs = np.array([close_norm] + indicators + [position, unrealized_pnl_norm, time_in_position_norm], dtype=np.float32)
+
         # Ensure observation is within bounds
         obs = np.clip(obs, self.observation_space.low, self.observation_space.high)
-        
+
         return obs
+
+    def _get_current_price(self) -> Decimal:
+        """Get the current price from the data."""
+        if 'CLOSE' in self.data.columns:
+            return money.to_decimal(self.data.loc[self.current_step, "CLOSE"])
+        elif 'Close' in self.data.columns:
+            return money.to_decimal(self.data.loc[self.current_step, "Close"])
+        else:
+            return money.to_decimal(self.data.loc[self.current_step, "close"])
+
+    def _calculate_unrealized_pnl_normalized(self) -> float:
+        """
+        Calculate the unrealized P&L normalized to [-1, 1].
+
+        Uses tanh scaling to map P&L to a bounded range.
+        A P&L of ~$500 maps to ~0.76, $1000 maps to ~0.96.
+        """
+        if self.position == 0 or self.entry_price == Decimal('0.0'):
+            return 0.0
+
+        current_price = self._get_current_price()
+
+        # Calculate unrealized P&L
+        if self.position == 1:  # Long
+            price_change = current_price - self.entry_price
+        else:  # Short
+            price_change = self.entry_price - current_price
+
+        point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+        unrealized_pnl = float(price_change * point_value * money.to_decimal(self.position_size))
+
+        # Normalize using tanh with scaling factor of $500
+        # This maps $500 -> ~0.76, $1000 -> ~0.96, -$500 -> ~-0.76
+        normalized = float(np.tanh(unrealized_pnl / 500.0))
+
+        return normalized
 
     def step(self, action: int):
         """
         Apply an action, update the portfolio, and return the next observation.
 
         Args:
-            action (int): Action to execute (0: long/buy, 1: short/sell, 2: hold).
+            action (int): Action to execute (0: long/buy, 1: short/sell, 2: hold, 3: flat/close position).
 
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
         """
         info = {}
-        
+        info["action_masked"] = False
+
         # Store the previous net worth for reward calculation
         self.previous_net_worth = self.net_worth
 
-        # Current price - check for any capitalization of 'Close'/'close'/'CLOSE'
-        if 'CLOSE' in self.data.columns:
-            current_price = money.to_decimal(self.data.loc[self.current_step, "CLOSE"])
-        elif 'Close' in self.data.columns:
-            current_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
-        else:
-            current_price = money.to_decimal(self.data.loc[self.current_step, "close"])
-        
+        # Get current price
+        current_price = self._get_current_price()
+
         # Track old position to detect changes for transaction cost
         old_position = self.position
+        position_changed = False
+        is_redundant_action = False
 
-        # Update position based on action
-        if action == 0:  # Go long
-            # If already long (position == 1), maintain position
-            # Otherwise, set position to long
-            if self.position != 1:
-                self.position = 1
-                self.entry_price = current_price
-            else:
-                pass  # Already long, no change
-                
-        elif action == 1:  # Go short
-            # If already short (position == -1), maintain position
-            # Otherwise, set position to short
-            if self.position != -1:
-                self.position = -1
-                self.entry_price = current_price
-            else:
-                pass  # Already short, no change
-                
-        elif action == 2:  # Hold current position
-            pass  # No change to position
-            
+        # ACTION MASKING: Prevent redundant actions
+        # If action would result in no change, treat it as hold
+        if action == 0 and self.position == 1:  # Already long, trying to go long
+            is_redundant_action = True
+            info["action_masked"] = True
+        elif action == 1 and self.position == -1:  # Already short, trying to go short
+            is_redundant_action = True
+            info["action_masked"] = True
+        elif action == 3 and self.position == 0:  # Already flat, trying to go flat
+            is_redundant_action = True
+            info["action_masked"] = True
+
+        # Update position based on action (unless redundant)
+        if not is_redundant_action:
+            if action == 0:  # Go long
+                if self.position != 1:
+                    self.position = 1
+                    self.entry_price = current_price
+                    self.time_in_position = 0
+                    self.trade_count += 1
+                    position_changed = True
+
+            elif action == 1:  # Go short
+                if self.position != -1:
+                    self.position = -1
+                    self.entry_price = current_price
+                    self.time_in_position = 0
+                    self.trade_count += 1
+                    position_changed = True
+
+            elif action == 2:  # Hold current position
+                pass  # No change to position
+
+            elif action == 3:  # Go flat (close position)
+                if self.position != 0:
+                    self.position = 0
+                    self.entry_price = Decimal('0.0')
+                    self.time_in_position = 0
+                    self.trade_count += 1
+                    position_changed = True
+
+        # Apply transaction cost if position changed (realistic cost model)
+        transaction_cost_applied = Decimal('0.0')
+        if position_changed and self.transaction_cost > Decimal('0.0'):
+            # Transaction cost per contract (round trip if reversing position)
+            cost_multiplier = 2 if old_position != 0 and self.position != 0 and old_position != self.position else 1
+            transaction_cost_applied = self.transaction_cost * money.to_decimal(self.position_size) * Decimal(str(cost_multiplier))
+            self.net_worth -= transaction_cost_applied
+
+        # Increment time in position if holding
+        if self.position != 0 and not position_changed:
+            self.time_in_position += 1
+
         # Advance to next step
         self.current_step += 1
-        
+
         # Calculate portfolio value change based on position and price change
         if self.current_step < self.total_steps:
-            # Next price - check for any capitalization of 'Close'/'close'/'CLOSE'
-            if 'CLOSE' in self.data.columns:
-                next_price = money.to_decimal(self.data.loc[self.current_step, "CLOSE"])
-            elif 'Close' in self.data.columns:
-                next_price = money.to_decimal(self.data.loc[self.current_step, "Close"])
-            else:
-                next_price = money.to_decimal(self.data.loc[self.current_step, "close"])
-            
-            # Calculate price change using the same function as in RiskManager
-            if self.position != 0:  # Only if we have an active position
+            next_price = self._get_current_price()
+
+            # Calculate P&L if we have an active position
+            if self.position != 0:
                 # Calculate price change - matching RiskManager logic
                 if self.position == 1:  # Long position
                     price_change = next_price - current_price
                 else:  # Short position
                     price_change = current_price - next_price
-                
+
                 # For NQ futures, each point is $20
-                point_value = money.to_decimal(20.0)
-                
+                point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+
                 # Calculate dollar change directly
                 dollar_change = price_change * point_value * money.to_decimal(self.position_size)
-                
+
                 # Update portfolio value
                 self.net_worth += dollar_change
-        
+
+        # Update max net worth for drawdown tracking
+        if self.net_worth > self.max_net_worth:
+            self.max_net_worth = self.net_worth
+
         # Ensure net_worth doesn't go below a minimum threshold (e.g., 1% of initial balance)
-        min_balance = self.initial_balance * Decimal('0.01')
+        min_balance = self.initial_balance * Decimal(str(constants.MIN_BALANCE_PERCENTAGE))
         if self.net_worth < min_balance:
             self.net_worth = min_balance
             info["hit_minimum_balance"] = True
@@ -322,19 +402,79 @@ class TradingEnv(gym.Env):
 
         if terminated:
             self.current_step = self.total_steps  # Clamp to last valid index
-        
-        # Calculate reward based on logarithmic return
-        if self.previous_net_worth > Decimal('0.0'):
-            reward = float(np.log(float(self.net_worth / self.previous_net_worth)))
-        else:
-            reward = 0.0
-        
+
+        # Calculate RISK-ADJUSTED REWARD
+        reward = self._calculate_risk_adjusted_reward(
+            position_changed=position_changed,
+            transaction_cost_applied=float(transaction_cost_applied),
+            is_redundant_action=is_redundant_action
+        )
+
         obs = self._get_obs()
-        
+
         # Add info about current state
         info["position"] = self.position
-        info["reward"] = float(reward)  # Convert Decimal to float for compatibility
-        info["net_worth"] = float(self.net_worth)  # Convert Decimal to float for compatibility
+        info["old_position"] = old_position
+        info["position_changed"] = position_changed
+        info["reward"] = float(reward)
+        info["net_worth"] = float(self.net_worth)
         info["position_size"] = self.position_size
-        
+        info["time_in_position"] = self.time_in_position
+        info["trade_count"] = self.trade_count
+        info["transaction_cost"] = float(transaction_cost_applied)
+        info["max_net_worth"] = float(self.max_net_worth)
+
         return obs, float(reward), terminated, truncated, info
+
+    def _calculate_risk_adjusted_reward(self, position_changed: bool, transaction_cost_applied: float, is_redundant_action: bool) -> float:
+        """
+        Calculate a risk-adjusted reward that encourages profitable, stable trading.
+
+        Components:
+        1. Base return (log return) - primary signal
+        2. Transaction cost penalty - discourages excessive trading
+        3. Redundant action penalty - penalizes no-op trades
+        4. Volatility penalty - penalizes erratic equity curves
+        5. Drawdown penalty - penalizes losses from peak
+
+        Returns:
+            float: Risk-adjusted reward value
+        """
+        # 1. Base return (log return)
+        if self.previous_net_worth > Decimal('0.0'):
+            base_return = float(np.log(float(self.net_worth / self.previous_net_worth)))
+        else:
+            base_return = 0.0
+
+        # Track returns for volatility calculation
+        self.returns_history.append(base_return)
+
+        # 2. Transaction cost penalty (already deducted from net worth, but add small penalty to discourage churn)
+        trade_penalty = 0.0
+        if position_changed:
+            trade_penalty = -0.0001  # Small penalty for each trade to discourage overtrading
+
+        # 3. Redundant action penalty
+        redundant_penalty = 0.0
+        if is_redundant_action:
+            redundant_penalty = -0.00005  # Small penalty for redundant actions
+
+        # 4. Volatility penalty (rolling volatility of returns)
+        volatility_penalty = 0.0
+        if len(self.returns_history) >= 20:
+            recent_returns = self.returns_history[-20:]
+            volatility = float(np.std(recent_returns))
+            # Penalize high volatility (scale factor: volatility of 0.01 -> penalty of ~0.0001)
+            volatility_penalty = -0.01 * volatility
+
+        # 5. Drawdown penalty
+        drawdown_penalty = 0.0
+        if self.max_net_worth > Decimal('0.0'):
+            drawdown = float((self.max_net_worth - self.net_worth) / self.max_net_worth)
+            if drawdown > 0.05:  # Only penalize drawdowns > 5%
+                drawdown_penalty = -0.001 * drawdown
+
+        # Combine all components
+        reward = base_return + trade_penalty + redundant_penalty + volatility_penalty + drawdown_penalty
+
+        return reward

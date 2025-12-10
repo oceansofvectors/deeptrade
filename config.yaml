@@ -1,23 +1,34 @@
 seed: 42 #Global RNG seed
 
 training:
-  total_timesteps: 120000
+  total_timesteps: 10000
   fee_rate: 0.0
   # New parameters for iterative training
-  max_iterations: 100
+  max_iterations: 10
   improvement_threshold: 0.20
   additional_timesteps: 1000
-  n_stagnant_loops: 20
+  n_stagnant_loops: 10
   verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
   # Evaluation metric configuration
   evaluation:
     metric: "return"  # Options: "return" (total return percentage), "hit_rate" (percentage of profitable trades), or "prediction_accuracy" (percentage of correct price direction predictions)
+  # Early stopping based on loss convergence (more stable than profit-based)
+  early_stopping:
+    enabled: true           # Use loss-based early stopping (recommended)
+    patience: 5             # Stop if no loss improvement for N iterations
+    min_delta: 0.001        # Minimum loss decrease to count as improvement
 
 data:
   train_ratio: 0.6
   validation_ratio: 0.2
   test_ratio: 0.2
-  market_hours_only: true  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
+  market_hours_only: false  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
+
+normalization:
+  scaler_type: "robust"  # Options: "robust" (recommended), "minmax", "quantile"
+  # robust: Uses median and IQR, handles outliers well, applies tanh for soft clipping to [-1,1]
+  # minmax: Standard min-max scaling to [-1,1], sensitive to outliers
+  # quantile: Maps to uniform distribution then rescales to [-1,1], best for heavy-tailed data
 
 indicators:
   supertrend:
@@ -86,7 +97,7 @@ indicators:
   minutes_since_open:
     enabled: true
   z_score:
-    enabled: true
+    enabled: false
     length: 50  # Lookback period for calculating rolling mean and std
   rrcf_anomaly:
     enabled: false
@@ -99,10 +110,12 @@ indicators:
 environment:
   initial_balance: 10000.0
   position_size: 1  # Number of NQ futures contracts to trade (default: 1)
-  transaction_cost: 0.0  # Transaction cost as percentage
+  transaction_cost: 2.50  # Transaction cost per contract per side in dollars (realistic: $2-3 for futures)
 
 model:
-  ent_coef: 0.00011640494075069245
+  ent_coef: 0.01  # Increased from 0.0001 for better exploration (recommended: 0.01-0.1)
+  ent_coef_decay: true  # Enable entropy decay during training
+  final_ent_coef: 0.001  # Final entropy coefficient after decay
   learning_rate: 0.0029977835304081614
   n_steps: 562
   batch_size: 22
@@ -110,10 +123,19 @@ model:
   gae_lambda: 0.95
   use_lr_decay: true
 
+# Sequence model configuration (LSTM for temporal context)
+sequence_model:
+  enabled: true  # Use RecurrentPPO with LSTM instead of standard PPO
+  lstm_hidden_size: 128  # Size of LSTM hidden state
+  n_lstm_layers: 1  # Number of LSTM layers (1-2 recommended)
+  shared_lstm: true  # Whether actor and critic share the LSTM
+  reset_on_new_day: false  # Reset LSTM state at start of each trading day
+  device: "auto"  # Device for training: "auto", "cuda", "mps", or "cpu"
+
 # Risk management configuration for trade.py
 risk_management:
   # Enable/disable risk management features
-  enabled: true  # Master switch to enable/disable all risk management
+  enabled: false  # Master switch to enable/disable all risk management
   
   # Daily risk limit configuration
   daily_risk_limit:
@@ -130,7 +152,7 @@ risk_management:
   
   # Take profit configuration
   take_profit:
-    enabled: true 
+    enabled: true
     mode: "percentage"  # Options: "percentage", "atr"
     percentage: 20  # Take profit as percentage of portfolio value (used when mode="percentage")
     atr_multiplier: 5.0  # Take profit as multiple of ATR (used when mode="atr")
@@ -149,10 +171,10 @@ risk_management:
 # Walk-forward testing configuration
 walk_forward:
   enabled: true
-  window_size: 120
+  window_size: 240
   step_size: 30
   parallel_processing:
-    enabled: true   # Enable parallel processing for walk-forward windows
+    enabled: false  # Disabled - MPS doesn't work well with multiprocessing
     n_processes: 0  # Auto-detect number of CPU cores
     max_workers: 0  # Use all available workers
 
@@ -184,3 +206,9 @@ hyperparameter_tuning:
     # Fixed values for gamma and gae_lambda
     gamma: 0.995  # Fixed value instead of search range
     gae_lambda: 0.95  # Fixed value instead of search range
+    # LSTM hyperparameters (only used when sequence_model.enabled is true)
+    lstm_hidden_size:
+      choices: [64, 128, 256, 512]
+    n_lstm_layers:
+      min: 1
+      max: 2
