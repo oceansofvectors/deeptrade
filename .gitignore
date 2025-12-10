@@ -171,4 +171,5 @@ logs/
 models 
 plots
 data
+checkpoints/
 trader_state.pkl
