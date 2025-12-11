@@ -1,198 +1,177 @@
-seed: 42 #Global RNG seed
-
+seed: 42
 training:
-  total_timesteps: 50000
+  total_timesteps: 10000
   fee_rate: 0.0
-  # New parameters for iterative training
-  max_iterations: 20
+  max_iterations: 10
   improvement_threshold: 0.01
-  additional_timesteps: 5000
-  n_stagnant_loops: 10
-  verbose: 0  # 0 for minimal output, 1 for normal, 2 for detailed
-  # Evaluation metric configuration
+  additional_timesteps: 1000
+  n_stagnant_loops: 5
+  verbose: 0
   evaluation:
-    metric: "calmar"  # Options: "return", "hit_rate", "prediction_accuracy", "calmar" (return/max_drawdown - rewards stable returns)
-  # Early stopping based on loss convergence (more stable than profit-based)
+    metric: calmar
   early_stopping:
-    enabled: true           # Use loss-based early stopping (recommended)
-    patience: 20            # Stop if no loss improvement for N iterations
-    min_delta: 0.001        # Minimum loss decrease to count as improvement
-
+    enabled: true
+    patience: 10
+    min_delta: 0.001
 data:
-  train_ratio: 0.60
-  validation_ratio: 0.20
-  test_ratio: 0.20
-  embargo_days: 1  # Gap between train/val and test to prevent leakage from indicators
-  market_hours_only: false  # Filter data to only include NYSE market hours (9:30 AM to 4:00 PM ET, Monday to Friday)
-
+  train_ratio: 0.6
+  validation_ratio: 0.2
+  test_ratio: 0.2
+  embargo_days: 1
+  market_hours_only: false
 normalization:
-  scaler_type: "robust"  # Options: "robust" (recommended), "minmax", "quantile"
-  # robust: Uses median and IQR, handles outliers well, applies tanh for soft clipping to [-1,1]
-  # minmax: Standard min-max scaling to [-1,1], sensitive to outliers
-  # quantile: Maps to uniform distribution then rescales to [-1,1], best for heavy-tailed data
-
+  scaler_type: robust
 indicators:
   supertrend:
-    enabled: true
+    enabled: false
     length: 20
     multiplier: 3
     smooth_periods: 3
     lookback_periods: 2
   rsi:
-    enabled: true
+    enabled: false
     length: 14
   cci:
-    enabled: true
+    enabled: false
     length: 20
   adx:
-    enabled: true  # Keep ADX (trend strength)
+    enabled: false
     length: 14
   adx_pos:
-    enabled: false  # Redundant with ADX
+    enabled: false
   adx_neg:
-    enabled: false  # Redundant with ADX
+    enabled: false
   stoch_k:
-    enabled: true
+    enabled: false
     length: 14
   stoch_d:
-    enabled: false  # Redundant - just smoothed STOCH_K
+    enabled: false
     length: 3
   macd:
-    enabled: false  # Keep only MACD_HIST
+    enabled: false
     fast: 12
     slow: 26
     signal: 9
   roc:
-    enabled: true
+    enabled: false
     length: 10
   williams_r:
-    enabled: false  # Redundant with RSI
+    enabled: false
     length: 14
   sma:
-    enabled: false  # Redundant with EMA
+    enabled: false
     length: 20
   ema:
-    enabled: true
+    enabled: false
     length: 20
   disparity:
-    enabled: true
+    enabled: false
   atr:
     enabled: true
     length: 14
   obv:
-    enabled: true
+    enabled: false
   cmf:
-    enabled: true
+    enabled: false
     length: 20
   psar:
-    enabled: true
+    enabled: false
     af: 0.02
     max_af: 0.2
-    include_norm: false  # Only use PSAR_DIR, not PSAR_NORM
+    include_norm: false
   volume:
-    enabled: true
+    enabled: false
     ma_length: 20
   vwap:
-    enabled: false  # Less useful for futures
+    enabled: false
   day_of_week:
-    enabled: true
+    enabled: false
   minutes_since_open:
-    enabled: true
+    enabled: false
   z_score:
     enabled: false
-    length: 50  # Lookback period for calculating rolling mean and std
+    length: 50
   rrcf_anomaly:
     enabled: false
-    window_size: 100  # Size of sliding window for RRCF calculation
-    num_trees: 64     # Number of trees in the forest (reduced from 40 for speed)
-    tree_size: 256    # Maximum size of each tree (reduced from 256 for speed)
-    feature_cols: ["close"]  # Features to use for anomaly detection
-    random_seed: 42   # Random seed for reproducibility
-
+    window_size: 100
+    num_trees: 64
+    tree_size: 256
+    feature_cols:
+    - close
+    random_seed: 42
+  lstm_features:
+    enabled: true
+    lookback: 20
+    hidden_size: 32
+    num_layers: 1
+    output_size: 8
+    pretrain_epochs: 50
+    pretrain_lr: 0.001
+    pretrain_batch_size: 64
+    pretrain_patience: 10
 environment:
   initial_balance: 100000.0
-  position_size: 1  # Number of NQ futures contracts to trade (default: 1)
-  transaction_cost: 2.50  # Transaction cost per contract per side in dollars (realistic: $2-3 for futures)
-  dsr_eta: 0.00713  # Tuned (trial 11) - Differential Sharpe Ratio decay rate
-
+  position_size: 1
+  transaction_cost: 2.5
+  dsr_eta: 0.00521  # Tuned (trial 6)
 model:
-  ent_coef: 0.0001167  # Tuned (trial 11)
-  ent_coef_decay: true  # Enable entropy decay during training
-  final_ent_coef: 0.00001  # Final entropy coefficient after decay
-  learning_rate: 0.000231  # Tuned (trial 11)
-  n_steps: 1663  # Tuned (trial 11)
-  batch_size: 22  # Tuned (trial 11)
-  gamma: 0.9555  # Tuned (trial 11)
-  gae_lambda: 0.9758  # Tuned (trial 11)
+  ent_coef: 0.02097  # Tuned (trial 6) - higher for more exploration
+  ent_coef_decay: true
+  final_ent_coef: 0.001
+  learning_rate: 0.0000103  # Tuned (trial 6)
+  n_steps: 1549  # Tuned (trial 6)
+  batch_size: 60  # Tuned (trial 6)
+  gamma: 0.9878  # Tuned (trial 6)
+  gae_lambda: 0.9067  # Tuned (trial 6)
   use_lr_decay: true
-
-# Sequence model configuration (LSTM for temporal context)
 sequence_model:
-  enabled: true  # Use RecurrentPPO with LSTM instead of standard PPO
-  lstm_hidden_size: 128  # Tuned (trial 11)
-  n_lstm_layers: 2  # Tuned (trial 11)
-  shared_lstm: false  # Whether actor and critic share the LSTM
-  reset_on_new_day: false  # Keep state across sessions for 24h data
-  device: "auto"  # Device for training: "auto", "cuda", "mps", or "cpu"
-
-# Risk management configuration for trade.py
+  enabled: true
+  lstm_hidden_size: 128  # Tuned (trial 6)
+  n_lstm_layers: 1  # Tuned (trial 6)
+  shared_lstm: false
+  reset_on_new_day: false
+  device: auto
 risk_management:
-  # Enable/disable risk management features
-  enabled: false  # Master switch to enable/disable all risk management
-  
-  # Daily risk limit configuration
+  enabled: true
   daily_risk_limit:
-    enabled: false  # Enable/disable daily risk limit
-    max_daily_loss: 3000.0  # Maximum dollar loss allowed per trading day
-    daily_take_profit: 2000.0  # Maximum profit target for the day, stop trading when reached
-  
-  # Stop loss configuration
+    enabled: false
+    max_daily_loss: 3000.0
+    daily_take_profit: 2000.0
   stop_loss:
-    enabled: false 
-    mode: "percentage"  # Options: "percentage", "atr"
-    percentage: 17  # Stop loss as percentage of portfolio value (used when mode="percentage")
-    atr_multiplier: 5.0  # Stop loss as multiple of ATR (used when mode="atr")
-  
-  # Take profit configuration
+    enabled: true
+    mode: atr
+    percentage: 17
+    atr_multiplier: 2.0  # Stop loss at 2x ATR below entry
   take_profit:
     enabled: true
-    mode: "percentage"  # Options: "percentage", "atr"
-    percentage: 20  # Take profit as percentage of portfolio value (used when mode="percentage")
-    atr_multiplier: 5.0  # Take profit as multiple of ATR (used when mode="atr")
-  
-  # Trailing stop loss configuration
+    mode: atr
+    percentage: 20
+    atr_multiplier: 3.0  # Take profit at 3x ATR above entry (1.5:1 reward/risk)
   trailing_stop:
     enabled: false
-    percentage: 1.0  # Trailing stop as percentage of highest/lowest price
-  
-  # Position sizing configuration
+    percentage: 1.0
   position_sizing:
     enabled: false
-    size_multiplier: 1.0  # Position size as a multiplier (1.0 = 100% of available capital)
-    max_risk_per_trade_percentage: 1.0  # Maximum risk per trade as percentage of portfolio
-
-# Walk-forward testing configuration
+    size_multiplier: 1.0
+    max_risk_per_trade_percentage: 1.0
 walk_forward:
   enabled: true
   window_size: 120
-  step_size: 24  # Matches test_ratio (20% of 120 days) for non-overlapping test periods
+  step_size: 24
   parallel_processing:
-    enabled: false  # Disabled - MPS doesn't work well with multiprocessing
-    n_processes: 0  # Auto-detect number of CPU cores
-    max_workers: 0  # Use all available workers
-
-# Hyperparameter tuning configuration
+    enabled: false
+    n_processes: 0
+    max_workers: 0
 hyperparameter_tuning:
   enabled: false
-  n_trials: 30
-  tuning_timesteps: 20000  # Reduced timesteps for faster tuning (finds relative differences)
+  n_trials: 10
+  tuning_timesteps: 10000
   parallel_processing:
-    enabled: false  # Disable parallel processing for hyperparameter tuning
-    n_jobs: 5      # Use single process for tuning
-  # Parameters to tune (these are the search spaces)
+    enabled: false
+    n_jobs: 5
   parameters:
-    learning_rate: 
-      min: 0.00001
+    learning_rate:
+      min: 1.0e-05
       max: 0.001
       log: true
     n_steps:
@@ -200,14 +179,13 @@ hyperparameter_tuning:
       max: 2000
       log: true
     ent_coef:
-      min: 0.00001
+      min: 1.0e-05
       max: 0.5
       log: true
     batch_size:
       min: 8
       max: 128
       log: true
-    # Gamma and GAE lambda (tunable for RL temporal credit assignment)
     gamma:
       min: 0.95
       max: 0.999
@@ -216,14 +194,16 @@ hyperparameter_tuning:
       min: 0.9
       max: 0.99
       log: false
-    # Differential Sharpe Ratio eta (reward decay rate)
     dsr_eta:
       min: 0.001
       max: 0.1
       log: true
-    # LSTM hyperparameters (only used when sequence_model.enabled is true)
     lstm_hidden_size:
-      choices: [64, 128, 256, 512]
+      choices:
+      - 64
+      - 128
+      - 256
+      - 512
     n_lstm_layers:
       min: 1
       max: 2

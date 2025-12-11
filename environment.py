@@ -115,6 +115,11 @@ class TradingEnv(gym.Env):
                 self.technical_indicators.append('MSO_COS')
             if 'ZScore' in self.data.columns:
                 self.technical_indicators.append('ZScore')
+            # Add LSTM-extracted features (LSTM_F0 through LSTM_F7 or more)
+            for i in range(16):  # Support up to 16 LSTM features
+                lstm_col = f'LSTM_F{i}'
+                if lstm_col in self.data.columns:
+                    self.technical_indicators.append(lstm_col)
             
         # Calculate observation space size: close_norm + all technical indicators + position + unrealized_pnl + time_in_position
         obs_size = 1 + len(self.technical_indicators) + 3  # +3 for position, unrealized_pnl, time_in_position
@@ -312,8 +317,9 @@ class TradingEnv(gym.Env):
         # Get current price
         current_price = self._get_current_price()
 
-        # Track old position to detect changes for transaction cost
+        # Track old position and entry price to detect changes for transaction cost and profit calculation
         old_position = self.position
+        old_entry_price = self.entry_price
         position_changed = False
         is_redundant_action = False
 
@@ -412,11 +418,14 @@ class TradingEnv(gym.Env):
         if terminated:
             self.current_step = self.total_steps  # Clamp to last valid index
 
-        # Calculate RISK-ADJUSTED REWARD
+        # Calculate RISK-ADJUSTED REWARD with scalping incentives
         reward = self._calculate_risk_adjusted_reward(
             position_changed=position_changed,
             transaction_cost_applied=float(transaction_cost_applied),
-            is_redundant_action=is_redundant_action
+            is_redundant_action=is_redundant_action,
+            old_position=old_position,
+            old_entry_price=old_entry_price,
+            exit_price=current_price
         )
 
         obs = self._get_obs()
@@ -435,15 +444,20 @@ class TradingEnv(gym.Env):
 
         return obs, float(reward), terminated, truncated, info
 
-    def _calculate_risk_adjusted_reward(self, position_changed: bool, transaction_cost_applied: float, is_redundant_action: bool) -> float:
+    def _calculate_risk_adjusted_reward(self, position_changed: bool, transaction_cost_applied: float,
+                                         is_redundant_action: bool, old_position: int = 0,
+                                         old_entry_price: Decimal = Decimal('0.0'),
+                                         exit_price: Decimal = Decimal('0.0')) -> float:
         """
-        Calculate reward using Differential Sharpe Ratio.
+        Calculate reward using Differential Sharpe Ratio with scalping incentives.
 
-        Rewards improvement in risk-adjusted performance, not just raw returns.
-        This encourages consistent returns over volatile swings.
+        Rewards:
+        1. Differential Sharpe Ratio (risk-adjusted returns)
+        2. Profit-taking bonus (reward for closing profitable trades)
+        3. Hold penalty (small cost for staying in position too long)
 
         Returns:
-            float: Differential Sharpe reward
+            float: Combined reward signal
         """
         if self.previous_net_worth > Decimal('0.0'):
             base_return = float(np.log(float(self.net_worth / self.previous_net_worth)))
@@ -478,5 +492,31 @@ class TradingEnv(gym.Env):
         diff_sharpe = current_sharpe - self._prev_sharpe
         self._prev_sharpe = current_sharpe
 
-        # Scale for stronger learning signal
-        return diff_sharpe * 100.0
+        # Base reward from Differential Sharpe
+        reward = diff_sharpe * 100.0
+
+        # === SCALPING INCENTIVES ===
+
+        # 1. PROFIT-TAKING BONUS: Reward closing profitable trades
+        if position_changed and old_position != 0 and old_entry_price > Decimal('0.0'):
+            # Calculate trade P&L
+            if old_position == 1:  # Was long
+                trade_pnl = float(exit_price - old_entry_price)
+            else:  # Was short
+                trade_pnl = float(old_entry_price - exit_price)
+
+            # Bonus for profitable trades (scaled by profit size)
+            if trade_pnl > 0:
+                # Reward proportional to profit (in points), capped
+                profit_bonus = min(trade_pnl * 0.5, 10.0)  # Cap at 10
+                reward += profit_bonus
+
+        # 2. HOLD PENALTY: Small cost for holding position too long
+        # Encourages the model to close positions rather than hold forever
+        if self.position != 0 and self.time_in_position > 0:
+            # Penalty increases with time in position (encourages scalping)
+            # Very small penalty that accumulates: 0.01 per bar, max 0.5
+            hold_penalty = min(self.time_in_position * 0.01, 0.5)
+            reward -= hold_penalty
+
+        return reward

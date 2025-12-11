@@ -33,6 +33,7 @@ import money
 from utils.seeding import seed_worker  # Import the seed_worker function
 from utils.device import get_device  # Import device utility
 from normalization import scale_window, get_standardized_column_names  # Import both functions from normalization
+from indicators.lstm_features import LSTMFeatureGenerator
 
 # Setup logging to save to file and console
 os.makedirs('models/logs', exist_ok=True)
@@ -584,7 +585,7 @@ def process_single_window(
     """
     # Create a logger for this window
     window_logger = logging.getLogger(f"walk_forward.window_{window_idx}")
-    
+
     # Save window periods
     window_periods = {
         "train_start": train_data.index[0],
@@ -596,8 +597,33 @@ def process_single_window(
     }
     save_json(window_periods, f"{window_folder}/window_periods.json")
 
+    # Generate LSTM features if enabled (train per window on that window's training data)
+    lstm_config = config.get("indicators", {}).get("lstm_features", {})
+    if lstm_config.get("enabled", False):
+        window_logger.info("Training LSTM autoencoder for this window")
+        lstm_generator = LSTMFeatureGenerator(
+            lookback=lstm_config.get("lookback", 20),
+            hidden_size=lstm_config.get("hidden_size", 32),
+            num_layers=lstm_config.get("num_layers", 1),
+            output_size=lstm_config.get("output_size", 8),
+            pretrain_epochs=lstm_config.get("pretrain_epochs", 50),
+            pretrain_lr=lstm_config.get("pretrain_lr", 0.001),
+            pretrain_batch_size=lstm_config.get("pretrain_batch_size", 64),
+            pretrain_patience=lstm_config.get("pretrain_patience", 10)
+        )
+        # Pre-train on this window's training data
+        checkpoint_path = f"{window_folder}/lstm_autoencoder_checkpoint.pt"
+        lstm_generator.fit(train_data, checkpoint_path=checkpoint_path)
+        # Transform all datasets using the trained encoder
+        train_data = lstm_generator.transform(train_data)
+        validation_data = lstm_generator.transform(validation_data)
+        test_data = lstm_generator.transform(test_data)
+        # Save the generator for this window
+        lstm_generator.save(f"{window_folder}/lstm_generator.pkl")
+        window_logger.info(f"Added {lstm_generator.output_size} LSTM features")
+
     # Scale technical indicator columns within this window to prevent data leakage
-    
+
     # Get columns to scale using the helper function from normalization module
     cols_to_scale = get_standardized_column_names(train_data)
 
@@ -663,7 +689,7 @@ def process_single_window(
     # Get risk management parameters from config
     risk_config = config.get("risk_management", {})
     risk_enabled = risk_config.get("enabled", False)
-    
+
     # Initialize risk parameters with default values (disabled)
     stop_loss_pct = None
     take_profit_pct = None
@@ -671,41 +697,53 @@ def process_single_window(
     position_size = 1.0
     max_risk_per_trade_pct = 0.0
     daily_risk_limit = None
-    
+    stop_loss_mode = "percentage"
+    take_profit_mode = "percentage"
+    stop_loss_atr_multiplier = None
+    take_profit_atr_multiplier = None
+
     # Only set risk parameters if risk management is enabled
     if risk_enabled:
         # Daily risk limit configuration
         daily_risk_config = risk_config.get("daily_risk_limit", {})
         if daily_risk_config.get("enabled", False):
             daily_risk_limit = daily_risk_config.get("max_daily_loss", 1000.0)
-        
+
         # Stop loss configuration
         stop_loss_config = risk_config.get("stop_loss", {})
         if stop_loss_config.get("enabled", False):
-            stop_loss_pct = stop_loss_config.get("percentage", 0.0)
-        
+            stop_loss_mode = stop_loss_config.get("mode", "percentage")
+            if stop_loss_mode == "percentage":
+                stop_loss_pct = stop_loss_config.get("percentage", 0.0)
+            elif stop_loss_mode == "atr":
+                stop_loss_atr_multiplier = stop_loss_config.get("atr_multiplier", 2.0)
+
         # Take profit configuration
         take_profit_config = risk_config.get("take_profit", {})
         if take_profit_config.get("enabled", False):
-            take_profit_pct = take_profit_config.get("percentage", 0.0)
-        
+            take_profit_mode = take_profit_config.get("mode", "percentage")
+            if take_profit_mode == "percentage":
+                take_profit_pct = take_profit_config.get("percentage", 0.0)
+            elif take_profit_mode == "atr":
+                take_profit_atr_multiplier = take_profit_config.get("atr_multiplier", 3.0)
+
         # Trailing stop configuration
         trailing_stop_config = risk_config.get("trailing_stop", {})
         if trailing_stop_config.get("enabled", False):
             trailing_stop_pct = trailing_stop_config.get("percentage", 0.0)
-        
+
         # Position sizing configuration
         position_sizing_config = risk_config.get("position_sizing", {})
         if position_sizing_config.get("enabled", False):
             position_size = position_sizing_config.get("size_multiplier", 1.0)
             max_risk_per_trade_pct = position_sizing_config.get("max_risk_per_trade_percentage", 0.0)
-    
+
     # Evaluate with risk management if enabled
     if risk_enabled:
-        
+
         # Convert all numeric parameters to Decimal before passing to trade_with_risk_management
         import money
-        
+
         test_results = trade_with_risk_management(
             model_path=f"{window_folder}/model",
             test_data=test_data,
@@ -717,7 +755,11 @@ def process_single_window(
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 0.0),
             verbose=1,
-            daily_risk_limit=daily_risk_limit
+            daily_risk_limit=daily_risk_limit,
+            stop_loss_mode=stop_loss_mode,
+            take_profit_mode=take_profit_mode,
+            stop_loss_atr_multiplier=stop_loss_atr_multiplier,
+            take_profit_atr_multiplier=take_profit_atr_multiplier
         )
     else:
         # Evaluate without risk management
@@ -1013,7 +1055,7 @@ def walk_forward_testing(
             window_folder=first_window["window_folder"],
             eval_metric=eval_metric
         )["best_params"]
-        
+
         # Save the best hyperparameters to JSON report
         save_json(best_hyperparameters, f'{session_folder}/reports/best_hyperparameters.json')
         logger.info(f"Best hyperparameters found: {best_hyperparameters}")
@@ -1022,20 +1064,21 @@ def walk_forward_testing(
         save_best_hyperparameters_to_config(best_hyperparameters)
     
     # Process windows - either in parallel or sequentially
+    # Note: With LSTM features, each window trains its own autoencoder
     if use_parallel and num_windows > 1:
         # Process windows in parallel
         logger.info(f"Processing {num_windows} windows in parallel with {max_workers} workers")
-        
+
         seed_value = config.get("seed", 42)
         logger.info(f"Using seed {seed_value} for worker initialization")
-        
+
         with ProcessPoolExecutor(
             max_workers=max_workers,
-            initializer=seed_worker, 
+            initializer=seed_worker,
             initargs=(seed_value,)
         ) as executor:
             futures = []
-            
+
             # Submit all windows for processing
             for window_data_dict in window_data_list:
                 futures.append(
@@ -1058,7 +1101,7 @@ def walk_forward_testing(
                         best_hyperparameters  # Pass the best hyperparameters found
                     )
                 )
-            
+
             # Collect results as they complete
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -1069,13 +1112,13 @@ def walk_forward_testing(
                     logger.error(f"Error processing window: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
-        
+
         # Sort results by window number
         all_window_results.sort(key=lambda x: x["window"])
     else:
         # Process windows sequentially
         logger.info(f"Processing {num_windows} windows sequentially")
-        
+
         for window_data_dict in window_data_list:
             try:
                 window_result = process_single_window(
@@ -1420,19 +1463,13 @@ def hyperparameter_tuning(
         tuning_timesteps = config.get("hyperparameter_tuning", {}).get("tuning_timesteps", 20000)
         model.learn(total_timesteps=tuning_timesteps)
 
-        # Evaluate on validation data based on the chosen metric
-        if eval_metric == "prediction_accuracy":
-            results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=0, deterministic=True)
-            metric_value = results["prediction_accuracy"]
-        elif eval_metric == "hit_rate":
-            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-            metric_value = results["hit_rate"]
-        else:  # Default to "return"
-            results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-            metric_value = results["total_return_pct"]
+        # Evaluate on validation data using Calmar ratio (risk-adjusted returns)
+        results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
+        metric_value = results["calmar_ratio"]
 
         # Log trial results
-        log_msg = f"Trial {trial.number}: {eval_metric} = {metric_value:.2f}%, "
+        log_msg = f"Trial {trial.number}: calmar = {metric_value:.2f}, "
+        log_msg += f"return = {results['total_return_pct']:.2f}%, "
         log_msg += f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, "
         log_msg += f"ent_coef={ent_coef:.6f}, batch_size={batch_size}, "
         log_msg += f"gamma={gamma:.4f}, gae_lambda={gae_lambda:.3f}, dsr_eta={dsr_eta:.4f}"
@@ -1454,7 +1491,7 @@ def hyperparameter_tuning(
     
     logger.info("\n" + "="*80)
     logger.info("Hyperparameter Tuning Results:")
-    logger.info(f"Best {eval_metric}: {best_value:.2f}%")
+    logger.info(f"Best calmar: {best_value:.2f}")
     logger.info("Best parameters:")
     for param, value in best_params.items():
         logger.info(f"  {param}: {value}")

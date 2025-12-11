@@ -41,6 +41,7 @@ from indicators.vwap import calculate_vwap
 from indicators.volume import calculate_volume_indicator
 from indicators.williams_r import calculate_williams_r
 from indicators.z_score import calculate_zscore
+# Note: LSTM features are imported and used in walk_forward.py, not here
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -345,7 +346,10 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         if config["indicators"].get("z_score", {}).get("enabled", False):
             df = calculate_zscore(df, length=config["indicators"]["z_score"].get("length", 50),
                                 target_col='ZScore')
-        
+
+        # Note: LSTM features are generated in walk_forward.py, not here
+        # This ensures the autoencoder is pre-trained once on training data only
+
         # Create an initial 'position' column (should start with no position)
         df['position'] = 0  # Initialize with no position
         
@@ -367,17 +371,19 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             model_columns.append('supertrend')
         
         # Add all technical indicators that were enabled and calculated
-        for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D', 
-                         'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R', 
-                         'SMA', 'EMA', 'DISPARITY', 'ATR', 'OBV', 
+        for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D',
+                         'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R',
+                         'SMA', 'EMA', 'DISPARITY', 'ATR', 'OBV',
                          'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM', 'RRCF_ANOMALY', 'ZScore']:
             if indicator in df.columns:
                 model_columns.append(indicator)
-                
+
                 # Skip indicators that are already guaranteed to be within bounds
                 if indicator not in ['supertrend', 'RSI', 'PSAR_DIR', 'RRCF_ANOMALY']:
                     indicators_to_normalize.append(indicator)
-        
+
+        # Note: LSTM features (LSTM_F0, LSTM_F1, etc.) are added in walk_forward.py
+
         # Fill any remaining NaN values
         df = df.fillna(0)
         
