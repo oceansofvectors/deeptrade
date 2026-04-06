@@ -218,18 +218,14 @@ class TradingEnv(gym.Env):
         base_slippage = exec_config.get("base_slippage_points", 0.10)
 
         # Pre-compute per-bar slippage in points (time-of-day dependent)
-        # Market open (9:30-10:00 ET = 13:30-14:00 UTC) and close (15:30-16:00 ET = 19:30-20:00 UTC)
-        # get 3x slippage; first/last 30 min of session get 2x; rest is base
-        if self._hours is not None:
+        # For 1 NQ lot, slippage is near-zero during RTH due to massive liquidity
+        # Only meaningful if position_size scales up significantly
+        if self._hours is not None and base_slippage > 0:
             slippage = np.full(len(self.data), base_slippage, dtype=np.float64)
-            # Open period: 13-14 UTC (9-10 AM ET) - high slippage
-            slippage[(self._hours >= 13) & (self._hours < 14)] = base_slippage * 3.0
-            # Close period: 19-20 UTC (3-4 PM ET) - high slippage
-            slippage[(self._hours >= 19) & (self._hours < 20)] = base_slippage * 3.0
-            # Shoulder periods: 14 UTC (10 AM ET), 18-19 UTC (2-3 PM ET) - moderate
-            slippage[self._hours == 14] = base_slippage * 2.0
-            slippage[(self._hours >= 18) & (self._hours < 19)] = base_slippage * 2.0
-            # Overnight: less liquid
+            # Open/close: slightly worse fills
+            slippage[(self._hours >= 13) & (self._hours < 14)] = base_slippage * 2.0
+            slippage[(self._hours >= 19) & (self._hours < 20)] = base_slippage * 2.0
+            # Overnight: wider spreads
             slippage[(self._hours >= 0) & (self._hours < 13)] = base_slippage * 1.5
             slippage[self._hours >= 21] = base_slippage * 1.5
             self._slippage_points = slippage
