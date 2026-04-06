@@ -1,14 +1,16 @@
 seed: 42
 training:
-  total_timesteps: 10000
+  total_timesteps: 100000
   fee_rate: 0.0
-  max_iterations: 10
+  max_iterations: 20
   improvement_threshold: 0.01
-  additional_timesteps: 1000
-  n_stagnant_loops: 5
+  additional_timesteps: 20000
+  n_stagnant_loops: 10
+  n_envs: 4
+  eval_frequency: 2
   verbose: 0
   evaluation:
-    metric: calmar
+    metric: sortino
   early_stopping:
     enabled: true
     patience: 10
@@ -18,7 +20,7 @@ data:
   validation_ratio: 0.2
   test_ratio: 0.2
   embargo_days: 1
-  market_hours_only: false
+  market_hours_only: true
 normalization:
   scaler_type: robust
 indicators:
@@ -29,13 +31,13 @@ indicators:
     smooth_periods: 3
     lookback_periods: 2
   rsi:
-    enabled: false
+    enabled: true
     length: 14
   cci:
     enabled: false
     length: 20
   adx:
-    enabled: false
+    enabled: true
     length: 14
   adx_pos:
     enabled: false
@@ -48,7 +50,7 @@ indicators:
     enabled: false
     length: 3
   macd:
-    enabled: false
+    enabled: true
     fast: 12
     slow: 26
     signal: 9
@@ -80,14 +82,14 @@ indicators:
     max_af: 0.2
     include_norm: false
   volume:
-    enabled: false
+    enabled: true
     ma_length: 20
   vwap:
     enabled: false
   day_of_week:
-    enabled: false
+    enabled: true
   minutes_since_open:
-    enabled: false
+    enabled: true
   z_score:
     enabled: false
     length: 50
@@ -109,44 +111,67 @@ indicators:
     pretrain_lr: 0.001
     pretrain_batch_size: 64
     pretrain_patience: 10
+    tuning:
+      enabled: false
+      n_trials: 20
+      parameters:
+        hidden_size:
+          choices: [16, 32, 64, 128]
+        num_layers:
+          min: 1
+          max: 2
+        output_size:
+          choices: [4, 8, 16]
+        lookback:
+          choices: [10, 20, 30, 50]
+        pretrain_lr:
+          min: 0.0001
+          max: 0.01
+          log: true
 environment:
   initial_balance: 100000.0
   position_size: 1
   transaction_cost: 2.5
-  dsr_eta: 0.00521  # Tuned (trial 6)
 model:
-  ent_coef: 0.02097  # Tuned (trial 6) - higher for more exploration
-  ent_coef_decay: true
-  final_ent_coef: 0.001
-  learning_rate: 0.0000103  # Tuned (trial 6)
-  n_steps: 1549  # Tuned (trial 6)
-  batch_size: 60  # Tuned (trial 6)
-  gamma: 0.9878  # Tuned (trial 6)
-  gae_lambda: 0.9067  # Tuned (trial 6)
+  ent_coef: 0.1  # Higher entropy to prevent directional collapse with 2-action space
+  ent_coef_decay: true  # Decay to exploit learned policy
+  final_ent_coef: 0.02  # Keep meaningful entropy floor
+  learning_rate: 0.0003  # SB3 default, decays via use_lr_decay
+  n_steps: 384  # Shorter rollouts for LSTM to maintain temporal coherence
+  batch_size: 48  # n_steps / 8 for stable mini-batch training
+  gamma: 0.9945  # Reduced: 0.9878^384=0.009 (too myopic); 0.9945^384=0.12 (better)
+  gae_lambda: 0.85  # Reduced for more aggressive bootstrapping, less reliance on uncertain future
   use_lr_decay: true
 sequence_model:
   enabled: true
-  lstm_hidden_size: 128  # Tuned (trial 6)
+  lstm_hidden_size: 64  # Reduced to prevent overfitting with 2-action space
   n_lstm_layers: 1  # Tuned (trial 6)
   shared_lstm: false
   reset_on_new_day: false
   device: auto
 risk_management:
-  enabled: true
+  enabled: false
+  dynamic_sl_tp:
+    enabled: false
+    sl_multiplier_range: [1.5, 5.0]
+    tp_multiplier_range: [1.5, 5.0]
+    num_choices: 8
+    default_sl_multiplier: 2.0
+    default_tp_multiplier: 3.0
   daily_risk_limit:
     enabled: false
     max_daily_loss: 3000.0
     daily_take_profit: 2000.0
   stop_loss:
-    enabled: true
+    enabled: false
     mode: atr
     percentage: 17
-    atr_multiplier: 2.0  # Stop loss at 2x ATR below entry
+    atr_multiplier: 4.0  # Wide stop to avoid noise - only catches catastrophic moves
   take_profit:
-    enabled: true
+    enabled: false
     mode: atr
     percentage: 20
-    atr_multiplier: 3.0  # Take profit at 3x ATR above entry (1.5:1 reward/risk)
+    atr_multiplier: 6.0  # Wide TP at 6x ATR (1.5:1 reward/risk ratio)
   trailing_stop:
     enabled: false
     percentage: 1.0
@@ -158,8 +183,9 @@ walk_forward:
   enabled: true
   window_size: 120
   step_size: 24
+  max_windows: 2
   parallel_processing:
-    enabled: false
+    enabled: true
     n_processes: 0
     max_workers: 0
 hyperparameter_tuning:
@@ -194,10 +220,6 @@ hyperparameter_tuning:
       min: 0.9
       max: 0.99
       log: false
-    dsr_eta:
-      min: 0.001
-      max: 0.1
-      log: true
     lstm_hidden_size:
       choices:
       - 64

@@ -12,6 +12,7 @@ This module creates an LSTM encoder that:
 4. Outputs learned features that complement hand-crafted indicators
 """
 
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -207,18 +208,10 @@ class LSTMFeatureGenerator:
         self.pretrain_batch_size = pretrain_batch_size
         self.pretrain_patience = pretrain_patience
 
-        # Determine device
-        if device == "auto":
-            if torch.cuda.is_available():
-                self.device = torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                # MPS support for LSTMs improved in PyTorch 2.0+
-                self.device = torch.device("mps")
-                logger.info("Using MPS (Metal Performance Shaders) for LSTM training")
-            else:
-                self.device = torch.device("cpu")
-        else:
-            self.device = torch.device(device)
+        # Determine device (use centralized logic, avoid MPS for LSTM)
+        from utils.device import get_device
+        resolved = get_device(device, for_recurrent=True)
+        self.device = torch.device(resolved)
 
         # Input features: returns, high-low range, close-open, volume change, volatility
         self.input_size = 5
@@ -397,25 +390,36 @@ class LSTMFeatureGenerator:
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path} (loss: {loss:.6f})")
 
-    def fit(self, df: pd.DataFrame, checkpoint_path: str = None):
+    def fit(self, df: pd.DataFrame, checkpoint_path: str = None, warm_start_path: str = None):
         """
         Fit the feature extractor on training data.
 
         This includes:
-        1. Computing normalization statistics
-        2. Pre-training the autoencoder
-        3. Saving checkpoint if path provided
+        1. Computing normalization statistics (always from current data)
+        2. Optionally warm-starting from a previous window's weights
+        3. Pre-training the autoencoder
+        4. Saving checkpoint if path provided
 
         Args:
             df: Training DataFrame with OHLCV data
             checkpoint_path: Optional path to save the trained model checkpoint
+            warm_start_path: Optional path to previous window's checkpoint to initialize weights from
         """
         # Prepare input features
         features = self._prepare_input(df)
 
-        # Compute normalization statistics
+        # Compute normalization statistics (always from current data, never inherited)
         self.input_mean = np.mean(features, axis=0)
         self.input_std = np.std(features, axis=0) + 1e-8
+
+        # Warm-start from previous window's weights if available
+        if warm_start_path and os.path.exists(warm_start_path):
+            try:
+                checkpoint = torch.load(warm_start_path, map_location=self.device, weights_only=False)
+                self.autoencoder.load_state_dict(checkpoint['autoencoder_state'])
+                logger.info(f"Warm-started LSTM from {warm_start_path} (prev loss: {checkpoint.get('best_loss', 'N/A')})")
+            except Exception as e:
+                logger.warning(f"Failed to warm-start LSTM from {warm_start_path}: {e}. Training from scratch.")
 
         # Normalize
         features_norm = (features - self.input_mean) / self.input_std
@@ -474,9 +478,9 @@ class LSTMFeatureGenerator:
         for i in range(self.output_size):
             result[f'LSTM_F{i}'] = all_features[:, i]
 
-        # Backward fill NaN values (use first valid value)
+        # Fill NaN values with 0.0 (neutral value since LSTM features are tanh-bounded to [-1,1])
         for i in range(self.output_size):
-            result[f'LSTM_F{i}'] = result[f'LSTM_F{i}'].bfill()
+            result[f'LSTM_F{i}'] = result[f'LSTM_F{i}'].fillna(0.0)
 
         logger.debug(f"Generated {self.output_size} LSTM features for {len(df)} samples")
 
@@ -568,3 +572,189 @@ def calculate_lstm_features(
         result = generator.transform(df)
 
     return result, generator
+
+
+def tune_lstm_hyperparameters(
+    train_data: pd.DataFrame,
+    tuning_config: dict,
+    base_config: dict,
+    window_folder: str = None
+) -> dict:
+    """
+    Tune LSTM autoencoder hyperparameters using Optuna.
+
+    Args:
+        train_data: Training DataFrame with OHLCV data
+        tuning_config: Tuning configuration with parameters to search
+        base_config: Base LSTM config for defaults
+        window_folder: Optional folder to save study results
+
+    Returns:
+        Dictionary of best hyperparameters
+    """
+    import optuna
+    from optuna.samplers import TPESampler
+
+    n_trials = tuning_config.get("n_trials", 20)
+    params_config = tuning_config.get("parameters", {})
+
+    # Determine device once (use centralized logic, avoid MPS for LSTM)
+    from utils.device import get_device
+    device = torch.device(get_device("auto", for_recurrent=True))
+
+    logger.info(f"Starting LSTM hyperparameter tuning with {n_trials} trials on {device}")
+
+    def objective(trial: optuna.Trial) -> float:
+        # Sample hyperparameters
+        hidden_size_config = params_config.get("hidden_size", {})
+        if "choices" in hidden_size_config:
+            hidden_size = trial.suggest_categorical("hidden_size", hidden_size_config["choices"])
+        else:
+            hidden_size = base_config.get("hidden_size", 32)
+
+        num_layers_config = params_config.get("num_layers", {})
+        if "min" in num_layers_config:
+            num_layers = trial.suggest_int("num_layers", num_layers_config["min"], num_layers_config["max"])
+        else:
+            num_layers = base_config.get("num_layers", 1)
+
+        output_size_config = params_config.get("output_size", {})
+        if "choices" in output_size_config:
+            output_size = trial.suggest_categorical("output_size", output_size_config["choices"])
+        else:
+            output_size = base_config.get("output_size", 8)
+
+        lookback_config = params_config.get("lookback", {})
+        if "choices" in lookback_config:
+            lookback = trial.suggest_categorical("lookback", lookback_config["choices"])
+        else:
+            lookback = base_config.get("lookback", 20)
+
+        lr_config = params_config.get("pretrain_lr", {})
+        if "min" in lr_config:
+            pretrain_lr = trial.suggest_float(
+                "pretrain_lr",
+                lr_config["min"],
+                lr_config["max"],
+                log=lr_config.get("log", True)
+            )
+        else:
+            pretrain_lr = base_config.get("pretrain_lr", 0.001)
+
+        # Create generator with trial parameters
+        generator = LSTMFeatureGenerator(
+            lookback=lookback,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            output_size=output_size,
+            device=str(device),
+            pretrain_epochs=base_config.get("pretrain_epochs", 50),
+            pretrain_lr=pretrain_lr,
+            pretrain_batch_size=base_config.get("pretrain_batch_size", 64),
+            pretrain_patience=base_config.get("pretrain_patience", 10)
+        )
+
+        # Prepare data for training
+        features = generator._prepare_input(train_data)
+        generator.input_mean = np.mean(features, axis=0)
+        generator.input_std = np.std(features, axis=0) + 1e-8
+        features_norm = (features - generator.input_mean) / generator.input_std
+        features_norm = np.clip(features_norm, -5, 5)
+        sequences = generator._create_sequences(features_norm)
+
+        # Split into train/val for tuning
+        split_idx = int(len(sequences) * 0.8)
+        train_seq = sequences[:split_idx]
+        val_seq = sequences[split_idx:]
+
+        # Train with reduced epochs for tuning
+        tuning_epochs = min(20, base_config.get("pretrain_epochs", 50))
+
+        x_train = torch.FloatTensor(train_seq).to(device)
+        x_val = torch.FloatTensor(val_seq).to(device)
+
+        train_dataset = TensorDataset(x_train)
+        train_loader = DataLoader(train_dataset, batch_size=generator.pretrain_batch_size, shuffle=True)
+
+        optimizer = torch.optim.Adam(generator.autoencoder.parameters(), lr=pretrain_lr)
+        criterion = nn.MSELoss()
+
+        generator.autoencoder.train()
+        best_val_loss = float('inf')
+        patience_counter = 0
+
+        for epoch in range(tuning_epochs):
+            # Training
+            for (batch_x,) in train_loader:
+                optimizer.zero_grad()
+                reconstructed, _ = generator.autoencoder(batch_x)
+                loss = criterion(reconstructed, batch_x)
+                loss.backward()
+                optimizer.step()
+
+            # Validation
+            generator.autoencoder.eval()
+            with torch.no_grad():
+                val_reconstructed, _ = generator.autoencoder(x_val)
+                val_loss = criterion(val_reconstructed, x_val).item()
+            generator.autoencoder.train()
+
+            # Early stopping
+            if val_loss < best_val_loss - 0.0001:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= 5:
+                break
+
+            # Report intermediate value for pruning
+            trial.report(val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return best_val_loss
+
+    # Create study
+    sampler = TPESampler(seed=42)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5)
+    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+
+    # Suppress Optuna logging
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    # Run optimization
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    # Get best parameters
+    best_params = study.best_params
+    best_value = study.best_value
+
+    logger.info(f"LSTM tuning complete. Best validation loss: {best_value:.6f}")
+    logger.info(f"Best parameters: {best_params}")
+
+    # Save study results if folder provided
+    if window_folder:
+        import json
+        results = {
+            "best_params": best_params,
+            "best_value": best_value,
+            "n_trials": n_trials
+        }
+        with open(f"{window_folder}/lstm_tuning_results.json", "w") as f:
+            json.dump(results, f, indent=2)
+
+    # Merge with base config (use base values for non-tuned params)
+    final_params = {
+        "lookback": best_params.get("lookback", base_config.get("lookback", 20)),
+        "hidden_size": best_params.get("hidden_size", base_config.get("hidden_size", 32)),
+        "num_layers": best_params.get("num_layers", base_config.get("num_layers", 1)),
+        "output_size": best_params.get("output_size", base_config.get("output_size", 8)),
+        "pretrain_lr": best_params.get("pretrain_lr", base_config.get("pretrain_lr", 0.001)),
+        "pretrain_epochs": base_config.get("pretrain_epochs", 50),
+        "pretrain_batch_size": base_config.get("pretrain_batch_size", 64),
+        "pretrain_patience": base_config.get("pretrain_patience", 10)
+    }
+
+    return final_params

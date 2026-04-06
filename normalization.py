@@ -202,6 +202,33 @@ def scale_window(train_data: pd.DataFrame,
                 window_folder=window_folder
             )
 
+    # Compute close_norm using training data min/max to prevent data leakage
+    # Find the close price column
+    close_col = None
+    for col_name in ['close', 'Close', 'CLOSE']:
+        if col_name in train.columns:
+            close_col = col_name
+            break
+
+    if close_col is not None:
+        close_min = train[close_col].min()
+        close_max = train[close_col].max()
+        close_range = close_max - close_min
+
+        if close_range > 0:
+            for df in [train, val, test]:
+                df['close_norm'] = ((df[close_col] - close_min) / close_range).clip(0, 1)
+        else:
+            for df in [train, val, test]:
+                df['close_norm'] = 0.5
+
+        # Save close_norm params alongside the scaler
+        if window_folder:
+            close_norm_params = {'close_min': close_min, 'close_max': close_max}
+            close_norm_path = os.path.join(window_folder, "close_norm_params.pkl")
+            with open(close_norm_path, "wb") as f:
+                pickle.dump(close_norm_params, f)
+
     # Create normalized versions of indicators that the model expects
     # Apply to all three datasets
     for df in [train, val, test]:

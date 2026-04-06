@@ -193,21 +193,9 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 logger.warning(f"Found NaN values in {col} column. Filling with forward fill.")
                 df[col] = df[col].fillna(method='ffill')
         
-        # Calculate normalized close
-        window = 100  # Use last 100 bars for min-max scaling
-        # For each point, calculate min/max over the previous window periods
-        rolling_min = df['close'].rolling(window=window, min_periods=1).min()
-        rolling_max = df['close'].rolling(window=window, min_periods=1).max()
-        
-        # Avoid division by zero and ensure values are in [0, 1]
-        df['close_norm'] = np.where(
-            rolling_max > rolling_min,
-            (df['close'] - rolling_min) / (rolling_max - rolling_min),
-            0.5  # Default to middle value when there's no range
-        )
-        # Ensure NaN values are filled
-        df['close_norm'] = df['close_norm'].fillna(0.5)
-        
+        # Note: close_norm is computed per-window in normalization.py scale_window()
+        # to prevent data leakage from future price information
+
         # Add all the requested technical indicators using the individual modules
         
         # RSI (Relative Strength Index)

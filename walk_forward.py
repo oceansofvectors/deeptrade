@@ -33,7 +33,7 @@ import money
 from utils.seeding import seed_worker  # Import the seed_worker function
 from utils.device import get_device  # Import device utility
 from normalization import scale_window, get_standardized_column_names  # Import both functions from normalization
-from indicators.lstm_features import LSTMFeatureGenerator
+from indicators.lstm_features import LSTMFeatureGenerator, tune_lstm_hyperparameters
 
 # Setup logging to save to file and console
 os.makedirs('models/logs', exist_ok=True)
@@ -111,12 +111,6 @@ def save_best_hyperparameters_to_config(best_params: Dict, config_path: str = "c
         for param in lstm_params:
             if param in best_params:
                 config_data['sequence_model'][param] = int(best_params[param])
-
-        # Update environment section for dsr_eta
-        if 'dsr_eta' in best_params:
-            if 'environment' not in config_data:
-                config_data['environment'] = {}
-            config_data['environment']['dsr_eta'] = float(best_params['dsr_eta'])
 
         # Write back to config
         with open(config_path, 'w') as f:
@@ -376,14 +370,22 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
         
         # Get model's action
         action, _ = model.predict(obs, deterministic=deterministic)
-        action_history.append(int(action))
-        
+
+        # Handle MultiDiscrete action space (dynamic SL/TP)
+        # Use np.ndim to safely check if action is an array (avoids len() on scalar)
+        if isinstance(action, np.ndarray) and action.ndim > 0 and action.size > 1:
+            # MultiDiscrete action: [position_action, sl_idx, tp_idx]
+            position_action = int(action[0])
+        else:
+            position_action = int(action)
+        action_history.append(position_action)
+
         # Convert action to position (0 = long/buy, 1 = short/sell, 2 = hold, 3 = flat)
-        if action == 0:  # Long
+        if position_action == 0:  # Long
             new_position = 1
-        elif action == 1:  # Short
+        elif position_action == 1:  # Short
             new_position = -1
-        elif action == 3:  # Flat - close position
+        elif position_action == 3:  # Flat - close position
             new_position = 0
         else:  # Hold - maintain current position
             new_position = current_position
@@ -578,7 +580,8 @@ def process_single_window(
     improvement_threshold: float,
     run_hyperparameter_tuning: bool,
     tuning_trials: int,
-    best_hyperparameters: Dict = None
+    best_hyperparameters: Dict = None,
+    prev_lstm_checkpoint_path: str = None
 ) -> Dict:
     """
     Process a single window in the walk-forward analysis.
@@ -600,20 +603,46 @@ def process_single_window(
     # Generate LSTM features if enabled (train per window on that window's training data)
     lstm_config = config.get("indicators", {}).get("lstm_features", {})
     if lstm_config.get("enabled", False):
+        # Check if LSTM hyperparameter tuning is enabled
+        lstm_tuning_config = lstm_config.get("tuning", {})
+        if lstm_tuning_config.get("enabled", False):
+            window_logger.info("Tuning LSTM hyperparameters for this window")
+            lstm_params = tune_lstm_hyperparameters(
+                train_data=train_data,
+                tuning_config=lstm_tuning_config,
+                base_config=lstm_config,
+                window_folder=window_folder
+            )
+            window_logger.info(f"Best LSTM params: hidden={lstm_params['hidden_size']}, "
+                             f"layers={lstm_params['num_layers']}, output={lstm_params['output_size']}, "
+                             f"lookback={lstm_params['lookback']}, lr={lstm_params['pretrain_lr']:.6f}")
+        else:
+            # Use config values directly
+            lstm_params = {
+                "lookback": lstm_config.get("lookback", 20),
+                "hidden_size": lstm_config.get("hidden_size", 32),
+                "num_layers": lstm_config.get("num_layers", 1),
+                "output_size": lstm_config.get("output_size", 8),
+                "pretrain_epochs": lstm_config.get("pretrain_epochs", 50),
+                "pretrain_lr": lstm_config.get("pretrain_lr", 0.001),
+                "pretrain_batch_size": lstm_config.get("pretrain_batch_size", 64),
+                "pretrain_patience": lstm_config.get("pretrain_patience", 10)
+            }
+
         window_logger.info("Training LSTM autoencoder for this window")
         lstm_generator = LSTMFeatureGenerator(
-            lookback=lstm_config.get("lookback", 20),
-            hidden_size=lstm_config.get("hidden_size", 32),
-            num_layers=lstm_config.get("num_layers", 1),
-            output_size=lstm_config.get("output_size", 8),
-            pretrain_epochs=lstm_config.get("pretrain_epochs", 50),
-            pretrain_lr=lstm_config.get("pretrain_lr", 0.001),
-            pretrain_batch_size=lstm_config.get("pretrain_batch_size", 64),
-            pretrain_patience=lstm_config.get("pretrain_patience", 10)
+            lookback=lstm_params["lookback"],
+            hidden_size=lstm_params["hidden_size"],
+            num_layers=lstm_params["num_layers"],
+            output_size=lstm_params["output_size"],
+            pretrain_epochs=lstm_params.get("pretrain_epochs", 50),
+            pretrain_lr=lstm_params.get("pretrain_lr", 0.001),
+            pretrain_batch_size=lstm_params.get("pretrain_batch_size", 64),
+            pretrain_patience=lstm_params.get("pretrain_patience", 10)
         )
         # Pre-train on this window's training data
         checkpoint_path = f"{window_folder}/lstm_autoencoder_checkpoint.pt"
-        lstm_generator.fit(train_data, checkpoint_path=checkpoint_path)
+        lstm_generator.fit(train_data, checkpoint_path=checkpoint_path, warm_start_path=prev_lstm_checkpoint_path)
         # Transform all datasets using the trained encoder
         train_data = lstm_generator.transform(train_data)
         validation_data = lstm_generator.transform(validation_data)
@@ -642,8 +671,22 @@ def process_single_window(
     )
 
     # Drop redundant columns (raw versions that have normalized equivalents, unused OHLC)
-    cols_to_drop = ['open', 'high', 'low', 'volume', 'Volume', 'SMA', 'EMA',
+    # Keep high/low if ANY ATR-based SL/TP is used (needed for accurate SL/TP checking)
+    risk_config = config.get("risk_management", {})
+    risk_enabled = risk_config.get("enabled", False)
+    dynamic_sl_tp_enabled = risk_config.get("dynamic_sl_tp", {}).get("enabled", False)
+    sl_mode_atr = risk_config.get("stop_loss", {}).get("mode") == "atr"
+    tp_mode_atr = risk_config.get("take_profit", {}).get("mode") == "atr"
+    needs_ohlc = risk_enabled or dynamic_sl_tp_enabled or sl_mode_atr or tp_mode_atr
+
+    cols_to_drop = ['volume', 'Volume', 'SMA', 'EMA',
                     'VWAP', 'PSAR', 'OBV', 'VOLUME_NORM', 'DOW', 'position']
+    if not needs_ohlc:
+        # Only drop OHLC columns if risk management is not used
+        cols_to_drop.extend(['open', 'Open', 'OPEN'])
+        cols_to_drop.extend(['high', 'low', 'High', 'Low', 'HIGH', 'LOW'])
+        cols_to_drop.extend(['close', 'Close', 'CLOSE'])
+
     for df in [train_data, validation_data, test_data]:
         cols_present = [c for c in cols_to_drop if c in df.columns]
         if cols_present:
@@ -837,7 +880,8 @@ def walk_forward_testing(
     n_stagnant_loops: int = 3,
     improvement_threshold: float = 0.1,
     run_hyperparameter_tuning: bool = False,
-    tuning_trials: int = 30
+    tuning_trials: int = 30,
+    max_windows: int = 0
 ) -> Dict:
     """
     Perform walk-forward testing with anchored walk-forward analysis.
@@ -906,6 +950,9 @@ def walk_forward_testing(
     
     # Calculate number of windows
     num_windows = max(1, (len(trading_days) - window_size) // step_size + 1)
+    if max_windows > 0:
+        num_windows = min(num_windows, max_windows)
+        logger.info(f"Limiting to {num_windows} windows (max_windows={max_windows})")
     logger.info(f"Number of walk-forward windows: {num_windows}")
     
     # Get evaluation metric from config
@@ -1024,8 +1071,11 @@ def walk_forward_testing(
         # Apply embargo: skip embargo_bars between validation and test
         test_start_idx = validation_idx + embargo_bars
         if test_start_idx >= len(window_data):
-            test_start_idx = validation_idx  # Fall back if embargo is too large
-            logger.warning(f"Window {i+1} - Embargo too large, skipping embargo gap")
+            # Reduce embargo to maximum feasible size (ensure at least 5% of window for test)
+            min_test_bars = max(int(len(window_data) * 0.05), 10)
+            test_start_idx = max(validation_idx + 1, len(window_data) - min_test_bars)
+            actual_embargo = test_start_idx - validation_idx
+            logger.warning(f"Window {i+1} - Embargo reduced from {embargo_bars} to {actual_embargo} bars")
         test_data = window_data.iloc[test_start_idx:].copy()
 
         logger.info(f"Window {i+1} - Train: {train_data.index[0]} to {train_data.index[-1]} ({len(train_data)} bars)")
@@ -1119,6 +1169,7 @@ def walk_forward_testing(
         # Process windows sequentially
         logger.info(f"Processing {num_windows} windows sequentially")
 
+        prev_lstm_checkpoint_path = None  # For LSTM warm-starting between windows
         for window_data_dict in window_data_list:
             try:
                 window_result = process_single_window(
@@ -1136,9 +1187,12 @@ def walk_forward_testing(
                     improvement_threshold,
                     False,  # Don't run hyperparameter tuning for each window
                     tuning_trials,
-                    best_hyperparameters  # Pass the best hyperparameters found
+                    best_hyperparameters,  # Pass the best hyperparameters found
+                    prev_lstm_checkpoint_path=prev_lstm_checkpoint_path
                 )
                 all_window_results.append(window_result)
+                # Update warm-start path for next window
+                prev_lstm_checkpoint_path = f"{window_data_dict['window_folder']}/lstm_autoencoder_checkpoint.pt"
             except Exception as e:
                 logger.error(f"Error processing window {window_data_dict['window_idx']}: {e}")
                 import traceback
@@ -1384,18 +1438,6 @@ def hyperparameter_tuning(
         else:
             gae_lambda = gae_lambda_cfg if isinstance(gae_lambda_cfg, (int, float)) else 0.95
 
-        # Tune dsr_eta (Differential Sharpe Ratio decay rate for reward)
-        dsr_eta_cfg = hp_config.get("dsr_eta", {})
-        if isinstance(dsr_eta_cfg, dict) and "min" in dsr_eta_cfg and "max" in dsr_eta_cfg:
-            dsr_eta = trial.suggest_float(
-                "dsr_eta",
-                dsr_eta_cfg.get("min", 0.001),
-                dsr_eta_cfg.get("max", 0.1),
-                log=dsr_eta_cfg.get("log", True)
-            )
-        else:
-            dsr_eta = dsr_eta_cfg if isinstance(dsr_eta_cfg, (int, float)) else 0.01
-
         # LSTM hyperparameters (only tuned when RecurrentPPO is enabled)
         lstm_hidden_size = seq_config.get("lstm_hidden_size", 256)
         n_lstm_layers = seq_config.get("n_lstm_layers", 1)
@@ -1409,13 +1451,12 @@ def hyperparameter_tuning(
             if "min" in n_lstm_cfg and "max" in n_lstm_cfg:
                 n_lstm_layers = trial.suggest_int("n_lstm_layers", n_lstm_cfg["min"], n_lstm_cfg["max"])
 
-        # Create environment with realistic transaction costs and tuned dsr_eta
+        # Create environment with realistic transaction costs
         train_env = TradingEnv(
             train_data,
             initial_balance=config["environment"]["initial_balance"],
             transaction_cost=config["environment"].get("transaction_cost", 2.50),
             position_size=config["environment"].get("position_size", 1),
-            dsr_eta=dsr_eta
         )
 
         # Get device (use CPU for recurrent models due to MPS LSTM bugs)
@@ -1441,7 +1482,8 @@ def hyperparameter_tuning(
                     "lstm_hidden_size": lstm_hidden_size,
                     "n_lstm_layers": n_lstm_layers,
                     "shared_lstm": shared_lstm,
-                    "enable_critic_lstm": not shared_lstm,  # Can't have both shared and separate critic LSTM
+                    "enable_critic_lstm": not shared_lstm,
+                    "net_arch": {"pi": [128, 64], "vf": [128, 64]},
                 }
             )
         else:
@@ -1457,22 +1499,30 @@ def hyperparameter_tuning(
                 seed=config.get('seed'),
                 gae_lambda=gae_lambda,
                 device=device,
+                policy_kwargs={"net_arch": [128, 64]},
             )
 
         # Train the model (use tuning_timesteps for faster hyperparameter search)
         tuning_timesteps = config.get("hyperparameter_tuning", {}).get("tuning_timesteps", 20000)
         model.learn(total_timesteps=tuning_timesteps)
 
-        # Evaluate on validation data using Calmar ratio (risk-adjusted returns)
+        # Evaluate on validation data using configured metric
         results = evaluate_agent(model, validation_data, verbose=0, deterministic=True)
-        metric_value = results["calmar_ratio"]
+        metric_map = {
+            "sortino": "sortino_ratio",
+            "calmar": "calmar_ratio",
+            "return": "total_return_pct",
+            "hit_rate": "hit_rate",
+        }
+        metric_key = metric_map.get(eval_metric, "sortino_ratio")
+        metric_value = results[metric_key]
 
         # Log trial results
-        log_msg = f"Trial {trial.number}: calmar = {metric_value:.2f}, "
+        log_msg = f"Trial {trial.number}: {eval_metric} = {metric_value:.2f}, "
         log_msg += f"return = {results['total_return_pct']:.2f}%, "
         log_msg += f"Parameters: lr={learning_rate:.6f}, n_steps={n_steps}, "
         log_msg += f"ent_coef={ent_coef:.6f}, batch_size={batch_size}, "
-        log_msg += f"gamma={gamma:.4f}, gae_lambda={gae_lambda:.3f}, dsr_eta={dsr_eta:.4f}"
+        log_msg += f"gamma={gamma:.4f}, gae_lambda={gae_lambda:.3f}"
         if use_recurrent:
             log_msg += f", lstm_hidden={lstm_hidden_size}, n_lstm_layers={n_lstm_layers}"
         logger.info(log_msg)
@@ -1491,7 +1541,7 @@ def hyperparameter_tuning(
     
     logger.info("\n" + "="*80)
     logger.info("Hyperparameter Tuning Results:")
-    logger.info(f"Best calmar: {best_value:.2f}")
+    logger.info(f"Best {eval_metric}: {best_value:.2f}")
     logger.info("Best parameters:")
     for param, value in best_params.items():
         logger.info(f"  {param}: {value}")
@@ -1906,23 +1956,42 @@ def main():
     if risk_enabled:
         # Log risk management settings
         logger.info("Risk management is ENABLED for walk-forward testing")
-        
+
+        # Dynamic SL/TP configuration
+        dynamic_sl_tp_config = risk_config.get("dynamic_sl_tp", {})
+        if dynamic_sl_tp_config.get("enabled", False):
+            sl_range = dynamic_sl_tp_config.get("sl_multiplier_range", [1.5, 5.0])
+            tp_range = dynamic_sl_tp_config.get("tp_multiplier_range", [1.5, 5.0])
+            logger.info(f"  - Dynamic SL/TP: ENABLED (model chooses multipliers)")
+            logger.info(f"    - SL range: {sl_range[0]}x - {sl_range[1]}x ATR")
+            logger.info(f"    - TP range: {tp_range[0]}x - {tp_range[1]}x ATR")
+
         # Stop loss configuration
         stop_loss_config = risk_config.get("stop_loss", {})
         if stop_loss_config.get("enabled", False):
-            stop_loss_pct = stop_loss_config.get("percentage", 1.0)
-            logger.info(f"  - Stop loss: {stop_loss_pct}%")
+            stop_loss_mode = stop_loss_config.get("mode", "percentage")
+            if stop_loss_mode == "atr":
+                stop_loss_atr = stop_loss_config.get("atr_multiplier", 2.0)
+                logger.info(f"  - Stop loss: {stop_loss_atr}x ATR")
+            else:
+                stop_loss_pct = stop_loss_config.get("percentage", 1.0)
+                logger.info(f"  - Stop loss: {stop_loss_pct}%")
         else:
             logger.info("  - Stop loss: Disabled")
-        
+
         # Take profit configuration
         take_profit_config = risk_config.get("take_profit", {})
         if take_profit_config.get("enabled", False):
-            take_profit_pct = take_profit_config.get("percentage", 2.0)
-            logger.info(f"  - Take profit: {take_profit_pct}%")
+            take_profit_mode = take_profit_config.get("mode", "percentage")
+            if take_profit_mode == "atr":
+                take_profit_atr = take_profit_config.get("atr_multiplier", 3.0)
+                logger.info(f"  - Take profit: {take_profit_atr}x ATR")
+            else:
+                take_profit_pct = take_profit_config.get("percentage", 2.0)
+                logger.info(f"  - Take profit: {take_profit_pct}%")
         else:
             logger.info("  - Take profit: Disabled")
-        
+
         # Trailing stop configuration
         trailing_stop_config = risk_config.get("trailing_stop", {})
         if trailing_stop_config.get("enabled", False):
@@ -1930,7 +1999,7 @@ def main():
             logger.info(f"  - Trailing Stop: {trailing_stop_pct}%")
         else:
             logger.info("  - Trailing Stop: Disabled")
-        
+
         # Position sizing configuration
         position_sizing_config = risk_config.get("position_sizing", {})
         if position_sizing_config.get("enabled", False):
@@ -1957,7 +2026,8 @@ def main():
         n_stagnant_loops=config["training"].get("n_stagnant_loops", 3),
         improvement_threshold=config["training"].get("improvement_threshold", 0.1),
         run_hyperparameter_tuning=hyperparameter_tuning_enabled,
-        tuning_trials=tuning_trials
+        tuning_trials=tuning_trials,
+        max_windows=config.get("walk_forward", {}).get("max_windows", 0)
     )
     
     # Check if we have results

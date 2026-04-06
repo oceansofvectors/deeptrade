@@ -135,43 +135,59 @@ class RiskManager:
         
         return max_contracts
         
-    def enter_position(self, position: int, price: float, date: pd.Timestamp, contracts: int, atr_value: float = None) -> None:
+    def enter_position(self, position: int, price: float, date: pd.Timestamp, contracts: int, atr_value: float = None,
+                       sl_multiplier: float = None, tp_multiplier: float = None) -> None:
         """
         Enter a new position.
-        
+
         Args:
             position: Position to enter (1 for long, -1 for short)
             price: Entry price
             date: Entry date
             contracts: Number of contracts
             atr_value: Current ATR value (if None, use self.current_atr)
+            sl_multiplier: Dynamic stop loss ATR multiplier (overrides config if provided)
+            tp_multiplier: Dynamic take profit ATR multiplier (overrides config if provided)
         """
         self.position = position
         self.entry_price = money.to_decimal(price)
         self.current_contracts = contracts  # Store the number of contracts
-        
+
         # Update ATR value if provided
         if atr_value is not None:
             self.set_atr(atr_value)
-        
+
+        # Use dynamic multipliers if provided, otherwise fall back to config
+        effective_sl_mult = money.to_decimal(sl_multiplier) if sl_multiplier is not None else self.stop_loss_atr_multiplier
+        effective_tp_mult = money.to_decimal(tp_multiplier) if tp_multiplier is not None else self.take_profit_atr_multiplier
+
+        # Determine if we're using dynamic SL/TP (multipliers provided) or config-based
+        use_dynamic_sl = sl_multiplier is not None
+        use_dynamic_tp = tp_multiplier is not None
+
         # Calculate stop loss and take profit prices based on ATR if applicable
-        if self.position == 1:  # Long position
-            if self.stop_loss_mode == "atr" and self.stop_loss_atr_multiplier is not None:
-                self.stop_loss_price = self.entry_price - (self.current_atr * self.stop_loss_atr_multiplier)
-                logging.info(f"Long position: ATR-based stop loss set at {float(self.stop_loss_price):.2f} ({float(self.stop_loss_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
-            
-            if self.take_profit_mode == "atr" and self.take_profit_atr_multiplier is not None:
-                self.take_profit_price = self.entry_price + (self.current_atr * self.take_profit_atr_multiplier)
-                logging.info(f"Long position: ATR-based take profit set at {float(self.take_profit_price):.2f} ({float(self.take_profit_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
-        
-        elif self.position == -1:  # Short position
-            if self.stop_loss_mode == "atr" and self.stop_loss_atr_multiplier is not None:
-                self.stop_loss_price = self.entry_price + (self.current_atr * self.stop_loss_atr_multiplier)
-                logging.info(f"Short position: ATR-based stop loss set at {float(self.stop_loss_price):.2f} ({float(self.stop_loss_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
-            
-            if self.take_profit_mode == "atr" and self.take_profit_atr_multiplier is not None:
-                self.take_profit_price = self.entry_price - (self.current_atr * self.take_profit_atr_multiplier)
-                logging.info(f"Short position: ATR-based take profit set at {float(self.take_profit_price):.2f} ({float(self.take_profit_atr_multiplier)} x ATR {float(self.current_atr):.2f})")
+        # Skip if ATR is zero or invalid (would cause immediate triggers)
+        atr_valid = self.current_atr > Decimal('0.0')
+        if not atr_valid and ((use_dynamic_sl or self.stop_loss_mode == "atr") or (use_dynamic_tp or self.take_profit_mode == "atr")):
+            logging.warning(f"ATR is zero or invalid ({float(self.current_atr)}), skipping ATR-based SL/TP")
+
+        if atr_valid and self.position == 1:  # Long position
+            if (use_dynamic_sl or (self.stop_loss_mode == "atr")) and effective_sl_mult is not None:
+                self.stop_loss_price = self.entry_price - (self.current_atr * effective_sl_mult)
+                logging.info(f"Long position: ATR-based stop loss set at {float(self.stop_loss_price):.2f} ({float(effective_sl_mult)} x ATR {float(self.current_atr):.2f}){' [dynamic]' if use_dynamic_sl else ''}")
+
+            if (use_dynamic_tp or (self.take_profit_mode == "atr")) and effective_tp_mult is not None:
+                self.take_profit_price = self.entry_price + (self.current_atr * effective_tp_mult)
+                logging.info(f"Long position: ATR-based take profit set at {float(self.take_profit_price):.2f} ({float(effective_tp_mult)} x ATR {float(self.current_atr):.2f}){' [dynamic]' if use_dynamic_tp else ''}")
+
+        elif atr_valid and self.position == -1:  # Short position
+            if (use_dynamic_sl or (self.stop_loss_mode == "atr")) and effective_sl_mult is not None:
+                self.stop_loss_price = self.entry_price + (self.current_atr * effective_sl_mult)
+                logging.info(f"Short position: ATR-based stop loss set at {float(self.stop_loss_price):.2f} ({float(effective_sl_mult)} x ATR {float(self.current_atr):.2f}){' [dynamic]' if use_dynamic_sl else ''}")
+
+            if (use_dynamic_tp or (self.take_profit_mode == "atr")) and effective_tp_mult is not None:
+                self.take_profit_price = self.entry_price - (self.current_atr * effective_tp_mult)
+                logging.info(f"Short position: ATR-based take profit set at {float(self.take_profit_price):.2f} ({float(effective_tp_mult)} x ATR {float(self.current_atr):.2f}){' [dynamic]' if use_dynamic_tp else ''}")
         
         # Ensure we never have a zero portfolio value at entry to prevent division by zero
         if self.net_worth == 0:
@@ -454,10 +470,13 @@ class RiskManager:
         """
         if self.daily_risk_limit is None:
             return False, ""
-            
+
         # Convert current date to eastern time for market hours check
         eastern = pytz.timezone('US/Eastern')
-        current_date_eastern = current_date.tz_convert(eastern)
+        if current_date.tzinfo is None:
+            current_date_eastern = current_date.tz_localize(eastern)
+        else:
+            current_date_eastern = current_date.tz_convert(eastern)
         
         # If this is a new trading day, reset daily tracking
         if self.current_trading_day is None or self.current_trading_day.date() != current_date_eastern.date():
@@ -622,11 +641,15 @@ def trade_with_risk_management(
     price_history = []
     portfolio_history = []
     action_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Action counts (0=long, 1=short, 2=hold, 3=flat)
-    
+
     # Process each candle
     for i in range(len(test_data)):
         current_date = test_data.index[i]
-        current_date_et = current_date.tz_convert('America/New_York')
+        # Handle both timezone-aware and timezone-naive timestamps
+        if current_date.tzinfo is None:
+            current_date_et = current_date.tz_localize('America/New_York')
+        else:
+            current_date_et = current_date.tz_convert('America/New_York')
         
         # Get price data using the actual column names from the DataFrame
         if 'CLOSE' in test_data.columns:
@@ -674,44 +697,38 @@ def trade_with_risk_management(
         if exit_triggered:
             # For exit price, use the appropriate price based on exit reason and position
             exit_price = current_price  # Default to close price
-            
+
             if exit_reason == "stop_loss":
-                # For futures, we need to work backwards from desired P&L to price
-                point_value = money.to_decimal(constants.NQ_POINT_VALUE)  # $20 per point for NQ
-                
-                # Calculate how many points we need to move to achieve exact stop loss
-                # stop_loss_pct is % of portfolio, so we convert to dollars first
-                target_loss_dollars = risk_manager.entry_portfolio_value * (risk_manager.stop_loss_pct / 100)
-                
-                # Calculate how many points that equals based on contracts
-                target_loss_points = target_loss_dollars / (point_value * risk_manager.current_contracts)
-                
-                # Calculate exact exit price
-                if risk_manager.position == 1:  # Long position
-                    exit_price = risk_manager.entry_price - target_loss_points
-                else:  # Short position
-                    exit_price = risk_manager.entry_price + target_loss_points
-                
-                logging.info(f"Stop loss at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}, points={float(target_loss_points)}")
+                # Use pre-calculated stop loss price if using ATR mode
+                if risk_manager.stop_loss_mode == "atr" and risk_manager.stop_loss_price > 0:
+                    exit_price = risk_manager.stop_loss_price
+                    logging.info(f"Stop loss (ATR) at price: {float(exit_price)}")
+                elif risk_manager.stop_loss_pct is not None:
+                    # Percentage mode: calculate exact exit price from percentage
+                    point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+                    target_loss_dollars = risk_manager.entry_portfolio_value * (risk_manager.stop_loss_pct / 100)
+                    target_loss_points = target_loss_dollars / (point_value * risk_manager.current_contracts)
+                    if risk_manager.position == 1:  # Long position
+                        exit_price = risk_manager.entry_price - target_loss_points
+                    else:  # Short position
+                        exit_price = risk_manager.entry_price + target_loss_points
+                    logging.info(f"Stop loss (%) at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}")
             elif exit_reason == "take_profit":
-                # For futures, we need to work backwards from desired P&L to price
-                point_value = money.to_decimal(constants.NQ_POINT_VALUE)  # $20 per point for NQ
-                
-                # Calculate how many points we need to move to achieve exact take profit
-                # take_profit_pct is % of portfolio, so we convert to dollars first
-                target_profit_dollars = risk_manager.entry_portfolio_value * (risk_manager.take_profit_pct / 100)
-                
-                # Calculate how many points that equals based on contracts
-                target_profit_points = target_profit_dollars / (point_value * risk_manager.current_contracts)
-                
-                # Calculate exact exit price
-                if risk_manager.position == 1:  # Long position
-                    exit_price = risk_manager.entry_price + target_profit_points
-                else:  # Short position
-                    exit_price = risk_manager.entry_price - target_profit_points
-                
-                logging.info(f"Take profit at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}, points={float(target_profit_points)}")
-            elif exit_reason == "trailing_stop" and trailing_stop_pct and trailing_stop_pct > 0:  # Only use trailing stop if enabled
+                # Use pre-calculated take profit price if using ATR mode
+                if risk_manager.take_profit_mode == "atr" and risk_manager.take_profit_price > 0:
+                    exit_price = risk_manager.take_profit_price
+                    logging.info(f"Take profit (ATR) at price: {float(exit_price)}")
+                elif risk_manager.take_profit_pct is not None:
+                    # Percentage mode: calculate exact exit price from percentage
+                    point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+                    target_profit_dollars = risk_manager.entry_portfolio_value * (risk_manager.take_profit_pct / 100)
+                    target_profit_points = target_profit_dollars / (point_value * risk_manager.current_contracts)
+                    if risk_manager.position == 1:  # Long position
+                        exit_price = risk_manager.entry_price + target_profit_points
+                    else:  # Short position
+                        exit_price = risk_manager.entry_price - target_profit_points
+                    logging.info(f"Take profit (%) at exact price: entry={float(risk_manager.entry_price)}, exit={float(exit_price)}")
+            elif exit_reason == "trailing_stop" and trailing_stop_pct and trailing_stop_pct > 0:
                 exit_price = current_low  # Use low price for trailing stop (worst case)
             
             # Record portfolio value before exit for profit checking
@@ -797,9 +814,31 @@ def trade_with_risk_management(
             if not is_last_candle and not is_second_to_last_candle:
                 # Get model prediction - using deterministic parameter
                 action, _ = model.predict(obs, deterministic=deterministic)
-                current_action = int(action)
+
+                # Parse MultiDiscrete action if dynamic SL/TP enabled
+                dynamic_sl_tp_config = config.get("risk_management", {}).get("dynamic_sl_tp", {})
+                if dynamic_sl_tp_config.get("enabled", False):
+                    position_action = int(action[0])
+                    sl_idx = int(action[1])
+                    tp_idx = int(action[2])
+
+                    # Convert indices to multipliers
+                    num_choices = dynamic_sl_tp_config.get("num_choices", 8)
+                    sl_range = dynamic_sl_tp_config.get("sl_multiplier_range", [1.5, 5.0])
+                    tp_range = dynamic_sl_tp_config.get("tp_multiplier_range", [1.5, 5.0])
+                    sl_multipliers = np.linspace(sl_range[0], sl_range[1], num_choices)
+                    tp_multipliers = np.linspace(tp_range[0], tp_range[1], num_choices)
+
+                    current_sl_mult = float(sl_multipliers[sl_idx])
+                    current_tp_mult = float(tp_multipliers[tp_idx])
+                    current_action = position_action
+                else:
+                    current_action = int(action)
+                    current_sl_mult = None
+                    current_tp_mult = None
+
                 action_counts[current_action] += 1
-                
+
                 # Update risk manager's stops if we have an open position
                 if risk_manager.position != 0:
                     risk_manager.update_stops(
@@ -807,7 +846,7 @@ def trade_with_risk_management(
                         high_price=current_high,
                         low_price=current_low
                     )
-                
+
                 # Process the model's action
                 if is_last_candle or is_second_to_last_candle:
                     # On last or second-to-last candle, only exit positions, no new entries
@@ -827,18 +866,19 @@ def trade_with_risk_management(
                             # First exit any existing position
                             if risk_manager.position != 0:
                                 risk_manager.exit_position(current_price, current_date, "signal_change")
-                            
+
                             # Get current ATR value if available
                             current_atr = None
                             if "atr" in test_data.columns:
                                 current_atr = test_data.loc[test_data.index[i], "atr"]
                             elif "ATR" in test_data.columns:
                                 current_atr = test_data.loc[test_data.index[i], "ATR"]
-                            
-                            # Then enter long position
+
+                            # Then enter long position with dynamic SL/TP multipliers
                             contracts = risk_manager.calculate_position_size(current_price)
                             if contracts > 0:
-                                risk_manager.enter_position(1, current_price, current_date, contracts, current_atr)
+                                risk_manager.enter_position(1, current_price, current_date, contracts, current_atr,
+                                                          sl_multiplier=current_sl_mult, tp_multiplier=current_tp_mult)
                                 buy_dates.append(current_date)
                                 buy_prices.append(current_price)
                             else:
@@ -848,22 +888,33 @@ def trade_with_risk_management(
                             # First exit any existing position
                             if risk_manager.position != 0:
                                 risk_manager.exit_position(current_price, current_date, "signal_change")
-                            
+
                             # Get current ATR value if available
                             current_atr = None
                             if "atr" in test_data.columns:
                                 current_atr = test_data.loc[test_data.index[i], "atr"]
                             elif "ATR" in test_data.columns:
                                 current_atr = test_data.loc[test_data.index[i], "ATR"]
-                            
-                            # Then enter short position
+
+                            # Then enter short position with dynamic SL/TP multipliers
                             contracts = risk_manager.calculate_position_size(current_price)
                             if contracts > 0:
-                                risk_manager.enter_position(-1, current_price, current_date, contracts, current_atr)
+                                risk_manager.enter_position(-1, current_price, current_date, contracts, current_atr,
+                                                          sl_multiplier=current_sl_mult, tp_multiplier=current_tp_mult)
                                 sell_dates.append(current_date)
                                 sell_prices.append(current_price)
                             else:
                                 logger.warning(f"Insufficient portfolio size to enter short position at {current_date_et}")
+                    elif current_action == 3:  # Flat signal - close position
+                        if risk_manager.position != 0:
+                            risk_manager.exit_position(current_price, current_date, "model_flat")
+                            if risk_manager.position == 1:  # Was long
+                                sell_dates.append(current_date)
+                                sell_prices.append(current_price)
+                            else:  # Was short
+                                buy_dates.append(current_date)
+                                buy_prices.append(current_price)
+                            exit_reasons["model_flat"] += 1
                     else:  # Model suggests hold (action 2)
                         # No position change, just maintain current position
                         pass
@@ -958,11 +1009,18 @@ def trade_with_risk_management(
         if close_at_end_of_day and risk_manager.position != 0:
             # Convert current timestamp to eastern time for market hours check
             eastern = pytz.timezone('US/Eastern')
-            current_date_eastern = current_date.tz_convert(eastern)
-            
+            if current_date.tzinfo is None:
+                current_date_eastern = current_date.tz_localize(eastern)
+            else:
+                current_date_eastern = current_date.tz_convert(eastern)
+
             # Get next timestamp in eastern time
             if i + 1 < len(test_data):
-                next_date_eastern = test_data.index[i + 1].tz_convert(eastern)
+                next_date = test_data.index[i + 1]
+                if next_date.tzinfo is None:
+                    next_date_eastern = next_date.tz_localize(eastern)
+                else:
+                    next_date_eastern = next_date.tz_convert(eastern)
             else:
                 next_date_eastern = None
             

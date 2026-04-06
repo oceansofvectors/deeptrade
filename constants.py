@@ -21,8 +21,7 @@ MULTIPLIER_THRESHOLD = 2.0  # Flag profit multipliers above this value
 MIN_BALANCE_REQUIRED = 100.0  # Minimum account balance to continue trading
 
 # Data processing
-NORMALIZATION_WINDOW = 100  # Bars to use for rolling min-max normalization
-WARMUP_BARS = 35  # Number of bars to trim for indicator warmup
+WARMUP_BARS = 50  # Number of bars to trim for indicator warmup (accounts for MACD(26) + buffer)
 
 # Interactive Brokers connection
 IB_LIVE_PORT = 7496  # TWS/Gateway live trading port

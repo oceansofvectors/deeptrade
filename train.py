@@ -13,6 +13,7 @@ from plotly.subplots import make_subplots
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 # RecurrentPPO for LSTM support
 try:
@@ -90,6 +91,25 @@ class LossTrackingCallback(BaseCallback):
         self.entropy_losses = []
         self.n_updates = 0
 
+
+class EntropyDecayCallback(BaseCallback):
+    """
+    Callback to decay entropy coefficient during training.
+    Works with both PPO and RecurrentPPO (which doesn't support callable ent_coef).
+    """
+
+    def __init__(self, initial_ent: float, final_ent: float, total_timesteps: int, verbose=0):
+        super().__init__(verbose)
+        self.initial_ent = initial_ent
+        self.final_ent = final_ent
+        self.total_timesteps = total_timesteps
+
+    def _on_step(self):
+        progress = min(self.num_timesteps / self.total_timesteps, 1.0)
+        self.model.ent_coef = self.initial_ent + (self.final_ent - self.initial_ent) * progress
+        return True
+
+
 def train_agent(train_data, total_timesteps: int):
     """
     Train a PPO model based on training data.
@@ -101,13 +121,21 @@ def train_agent(train_data, total_timesteps: int):
     Returns:
         model: Trained PPO or RecurrentPPO model.
     """
-    env = TradingEnv(
-        train_data,
+    env_kwargs = dict(
         initial_balance=config["environment"]["initial_balance"],
         transaction_cost=config["environment"].get("transaction_cost", 2.50),
-        position_size=config["environment"].get("position_size", 1)
+        position_size=config["environment"].get("position_size", 1),
     )
-    check_env(env, skip_render_check=True)
+
+    # Validate with a single env first
+    single_env = TradingEnv(train_data, **env_kwargs)
+    check_env(single_env, skip_render_check=True)
+
+    # Create vectorized environment for faster rollout collection
+    n_envs = config.get("training", {}).get("n_envs", 4)
+    env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
+    env = DummyVecEnv([lambda data=train_data.copy(), kw=env_kwargs: TradingEnv(data, **kw) for _ in range(n_envs)])
+    logger.info(f"Using {n_envs} vectorized environments for training")
 
     # Get sequence model config
     seq_config = config.get("sequence_model", {})
@@ -135,15 +163,21 @@ def train_agent(train_data, total_timesteps: int):
         learning_rate = config["model"].get("learning_rate", 0.0003)
 
     # Check for entropy coefficient decay in config
-    # Note: RecurrentPPO doesn't support function-based ent_coef, so use constant for LSTM
     use_ent_decay = config["model"].get("ent_coef_decay", False)
+    entropy_callback = None
     if use_ent_decay and not use_recurrent:
         initial_ent = config["model"].get("ent_coef", 0.01)
         final_ent = config["model"].get("final_ent_coef", 0.001)
-        # LinearSchedule(start, end, end_fraction) - end_fraction=1.0 means decay over full training
         from stable_baselines3.common.utils import LinearSchedule
         ent_coef = LinearSchedule(initial_ent, final_ent, 1.0)
-        logger.debug(f"Entropy decay: {initial_ent} -> {final_ent}")
+        logger.debug(f"Entropy decay (schedule): {initial_ent} -> {final_ent}")
+    elif use_ent_decay and use_recurrent:
+        # RecurrentPPO doesn't support callable ent_coef, use callback instead
+        initial_ent = config["model"].get("ent_coef", 0.01)
+        final_ent = config["model"].get("final_ent_coef", 0.001)
+        ent_coef = initial_ent  # Start with initial value
+        entropy_callback = EntropyDecayCallback(initial_ent, final_ent, total_timesteps)
+        logger.debug(f"Entropy decay (callback): {initial_ent} -> {final_ent}")
     else:
         ent_coef = config["model"].get("ent_coef", 0.01)
 
@@ -163,7 +197,8 @@ def train_agent(train_data, total_timesteps: int):
                 "lstm_hidden_size": seq_config.get("lstm_hidden_size", 256),
                 "n_lstm_layers": seq_config.get("n_lstm_layers", 1),
                 "shared_lstm": shared_lstm,
-                "enable_critic_lstm": not shared_lstm,  # Can't have both shared and separate critic LSTM
+                "enable_critic_lstm": not shared_lstm,
+                "net_arch": {"pi": [128, 64], "vf": [128, 64]},
             }
         )
     else:
@@ -177,10 +212,12 @@ def train_agent(train_data, total_timesteps: int):
             ent_coef=ent_coef,
             seed=config.get('seed'),
             device=device,
+            policy_kwargs={"net_arch": [128, 64]},
         )
 
+    callbacks = [cb for cb in [entropy_callback] if cb is not None]
     logger.info("Starting training for %d timesteps", total_timesteps)
-    model.learn(total_timesteps=total_timesteps, progress_bar=True)
+    model.learn(total_timesteps=total_timesteps, progress_bar=True, callback=callbacks if callbacks else None)
     logger.info("Training completed")
     return model
 
@@ -205,26 +242,24 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     Returns:
         tuple: (best_model, best_results, all_results)
     """
-    # Get dsr_eta from model_params (if tuned), environment config, or use default
-    if model_params and "dsr_eta" in model_params:
-        dsr_eta = model_params["dsr_eta"]
-    else:
-        dsr_eta = config.get("environment", {}).get("dsr_eta", 0.01)
-
     # Initialize training environment with realistic transaction costs
-    train_env = TradingEnv(
-        train_data,
+    env_kwargs = dict(
         initial_balance=config["environment"]["initial_balance"],
         transaction_cost=config["environment"].get("transaction_cost", 2.50),
         position_size=config["environment"].get("position_size", 1),
-        dsr_eta=dsr_eta
     )
-    
-    check_env(train_env, skip_render_check=True)
 
-    # Debug observation space info
-    obs, _ = train_env.reset()
-    logger.debug(f"Observation space: {train_env.observation_space.shape}, indicators: {len(train_env.technical_indicators)}")
+    # Validate with a single env first
+    single_env = TradingEnv(train_data, **env_kwargs)
+    check_env(single_env, skip_render_check=True)
+    obs, _ = single_env.reset()
+    logger.debug(f"Observation space: {single_env.observation_space.shape}, indicators: {len(single_env.technical_indicators)}")
+
+    # Create vectorized environment for faster rollout collection
+    n_envs = config.get("training", {}).get("n_envs", 4)
+    env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
+    train_env = DummyVecEnv([lambda data=train_data.copy(), kw=env_kwargs: TradingEnv(data, **kw) for _ in range(n_envs)])
+    logger.info(f"Using {n_envs} vectorized environments for iterative training")
     
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
@@ -263,14 +298,19 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
 
     # Get entropy coefficient decay parameters from config or use defaults
-    # Note: RecurrentPPO doesn't support function-based ent_coef, so use constant for LSTM
     use_ent_decay = config["model"].get("ent_coef_decay", False)
+    entropy_callback = None
     if use_ent_decay and not use_recurrent:
         initial_ent = model_params.get("ent_coef", 0.01)
         final_ent = config["model"].get("final_ent_coef", 0.001)
-        # LinearSchedule(start, end, end_fraction) - end_fraction=1.0 means decay over full training
         from stable_baselines3.common.utils import LinearSchedule
         ent_coef = LinearSchedule(initial_ent, final_ent, 1.0)
+    elif use_ent_decay and use_recurrent:
+        # RecurrentPPO doesn't support callable ent_coef, use callback instead
+        initial_ent = model_params.get("ent_coef", 0.01)
+        final_ent = config["model"].get("final_ent_coef", 0.001)
+        ent_coef = initial_ent
+        entropy_callback = EntropyDecayCallback(initial_ent, final_ent, total_decay_timesteps)
     else:
         ent_coef = model_params.get("ent_coef", 0.01)
 
@@ -302,7 +342,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
                 "lstm_hidden_size": lstm_hidden_size,
                 "n_lstm_layers": n_lstm_layers,
                 "shared_lstm": shared_lstm,
-                "enable_critic_lstm": not shared_lstm,  # Can't have both shared and separate critic LSTM
+                "enable_critic_lstm": not shared_lstm,
+                "net_arch": {"pi": [128, 64], "vf": [128, 64]},
             }
         )
     else:
@@ -320,17 +361,21 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             seed=config.get('seed'),
             gae_lambda=model_params.get("gae_lambda", 0.95),
             device=device,
+            policy_kwargs={"net_arch": [128, 64]},
         )
-    
-    # Create loss tracking callback for early stopping
+
+    # Create callbacks
     loss_callback = LossTrackingCallback(verbose=verbose_level)
+    callbacks = [loss_callback]
+    if entropy_callback is not None:
+        callbacks.append(entropy_callback)
     loss_history = []
     best_loss = float('inf')
-    loss_stagnant_counter = 0
+    metric_stagnant_counter = 0  # Track validation metric stagnation, not loss
 
     # Initial training
     logger.info(f"Starting initial training for {initial_timesteps} timesteps")
-    model.learn(total_timesteps=initial_timesteps, progress_bar=True, callback=loss_callback)
+    model.learn(total_timesteps=initial_timesteps, progress_bar=True, callback=callbacks)
 
     # Get initial loss values
     initial_losses = loss_callback.get_latest_losses()
@@ -358,6 +403,10 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
         best_metric_value = results["calmar_ratio"]
         metric_name = "calmar"
+    elif evaluation_metric == "sortino":
+        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+        best_metric_value = results["sortino_ratio"]
+        metric_name = "sortino"
     else:  # Default to "return"
         results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
         best_metric_value = results["total_return_pct"]
@@ -380,19 +429,27 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Add metric information to results
     results["metric_used"] = metric_name
 
+    # Evaluation frequency: evaluate every N iterations to reduce overhead
+    eval_frequency = config.get("training", {}).get("eval_frequency", 1)
+
     # Continue training until max_iterations or loss plateau
     for iteration in range(1, max_iterations + 1):
         # Reset callback for this iteration
         loss_callback.reset()
 
         # Train for additional timesteps
-        model.learn(total_timesteps=additional_timesteps, progress_bar=True, callback=loss_callback)
+        model.learn(total_timesteps=additional_timesteps, progress_bar=True, callback=callbacks)
 
         # Get loss values for this iteration
         iter_losses = loss_callback.get_latest_losses()
         current_loss = iter_losses["value_loss"] if iter_losses["value_loss"] is not None else float('inf')
         if iter_losses["value_loss"] is not None:
             loss_history.append(iter_losses)
+
+        # Skip evaluation on non-evaluation iterations (except the last one)
+        if eval_frequency > 1 and iteration % eval_frequency != 0 and iteration < max_iterations:
+            logger.info(f"Iter {iteration} - Training only (eval every {eval_frequency} iters), loss={current_loss:.4f}")
+            continue
 
         # Evaluate the model on validation data using the specified metric
         if evaluation_metric == "prediction_accuracy":
@@ -405,6 +462,9 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         elif evaluation_metric == "calmar":
             results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
             current_metric_value = results["calmar_ratio"]
+        elif evaluation_metric == "sortino":
+            results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
+            current_metric_value = results["sortino_ratio"]
         else:  # Default to "return"
             results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
             current_metric_value = results["total_return_pct"]
@@ -416,36 +476,42 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
 
         all_results.append(results)
 
-        # Early stopping based on training loss plateau
+        # Track best loss (for logging only)
         if current_loss < best_loss:
             best_loss = current_loss
-            loss_stagnant_counter = 0
-        else:
-            loss_stagnant_counter += 1
 
-        # Model selection based on VALIDATION metric (higher is better for calmar/return)
-        if current_metric_value > best_metric_value:
+        # Model selection AND early stopping based on VALIDATION metric (higher is better for calmar/return)
+        # Require minimum trade count to prevent selecting near-static models
+        min_trades = max(20, len(validation_data) // 200)  # At least 1 trade per 200 bars
+        has_enough_trades = results['trade_count'] >= min_trades
+        if current_metric_value > best_metric_value and has_enough_trades:
             best_metric_value = current_metric_value
             best_model = model
             best_results = results
             results["is_best"] = True
+            metric_stagnant_counter = 0  # Reset stagnation counter on improvement
 
-            logger.info(f"Iter {iteration} - New best (val {metric_name}={current_metric_value:.2f}): Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}")
+            logger.info(f"Iter {iteration} - New best (val {metric_name}={current_metric_value:.2f}): Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}")
+        elif current_metric_value > best_metric_value and not has_enough_trades:
+            metric_stagnant_counter += 1
+            logger.info(f"Iter {iteration} - Val {metric_name}={current_metric_value:.2f} but too few trades ({results['trade_count']}<{min_trades}) [no improvement {metric_stagnant_counter}/{n_stagnant_loops}]")
 
             # Save the best model
             best_model.save(os.path.join(window_folder, "best_model"))
         else:
-            logger.info(f"Iter {iteration} - Val {metric_name}={current_metric_value:.2f}, Train loss={current_loss:.4f} [loss stagnant {loss_stagnant_counter}/{n_stagnant_loops}]")
+            metric_stagnant_counter += 1
+            logger.info(f"Iter {iteration} - Val {metric_name}={current_metric_value:.2f}, Train loss={current_loss:.4f} [no improvement {metric_stagnant_counter}/{n_stagnant_loops}], Portfolio=${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}, Actions={results['action_counts']}")
 
-        # Early stopping based on training loss plateau
-        if loss_stagnant_counter >= n_stagnant_loops:
-            logger.info(f"Early stop: training loss plateau for {n_stagnant_loops} iterations")
+        # Early stopping based on validation metric plateau (not loss)
+        if metric_stagnant_counter >= n_stagnant_loops:
+            logger.info(f"Early stop: validation {metric_name} plateau for {n_stagnant_loops} iterations")
             break
 
     # Add loss history to best_results for saving
     best_results["loss_history"] = loss_history
 
-    logger.info(f"Training complete. Best {metric_name}: {best_metric_value:.2f}, Best train loss: {best_loss:.4f}")
+    total_iterations = iteration if 'iteration' in dir() else 0
+    logger.info(f"Training complete after {total_iterations} iterations. Best {metric_name}: {best_metric_value:.2f}")
     return best_model, best_results, all_results
 
 def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False):
@@ -470,8 +536,14 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         else:
             close_col = 'close'
 
-        # Calculate close_norm if missing
-        test_data['close_norm'] = test_data[close_col].pct_change().fillna(0)
+        # Calculate close_norm using min/max scaling to [0, 1]
+        close_min = test_data[close_col].min()
+        close_max = test_data[close_col].max()
+        close_range = close_max - close_min
+        if close_range > 0:
+            test_data['close_norm'] = ((test_data[close_col] - close_min) / close_range).clip(0, 1)
+        else:
+            test_data['close_norm'] = 0.5
 
     # Create evaluation environment with realistic transaction costs
     env = TradingEnv(
@@ -549,10 +621,19 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
             episode_starts = np.array([done])
         else:
             action, _ = model.predict(obs, deterministic=deterministic)
-        action_history.append(action)
-        
-        # Take action in environment
-        obs, reward, terminated, truncated, info = env.step(int(action))
+
+        # Handle MultiDiscrete action space (dynamic SL/TP)
+        # The environment's step() method handles both int and array actions
+        # Use np.ndim to safely check if action is an array (avoids len() on scalar)
+        if isinstance(action, np.ndarray) and action.ndim > 0 and action.size > 1:
+            # MultiDiscrete action: [position_action, sl_idx, tp_idx]
+            action_for_history = int(action[0])  # Store position action for history
+        else:
+            action_for_history = int(action)
+        action_history.append(action_for_history)
+
+        # Take action in environment (pass action as-is, env handles both types)
+        obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
         # Get portfolio value AFTER the step
@@ -656,10 +737,14 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     # Calculate trade history
     trade_history_df = pd.DataFrame(trade_history)
     
-    # Calculate action distribution (0=Long, 1=Short, 2=Hold, 3=Flat)
-    action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    # Calculate action distribution (0=Long, 1=Short, 2=Flat)
+    action_counts = {0: 0, 1: 0, 2: 0}
     for action in action_history:
-        action_counts[int(action)] += 1
+        action_val = int(action)
+        if action_val in action_counts:
+            action_counts[action_val] += 1
+        else:
+            action_counts[action_val] = 1  # Handle unexpected actions
 
     # Calculate max drawdown from portfolio history
     portfolio_array = np.array(portfolio_history)
@@ -670,10 +755,26 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     # Calculate Calmar ratio (return / |max_drawdown|)
     # Higher is better - rewards high returns with low drawdowns
     if max_drawdown == 0:
-        # No drawdown - use return as calmar (or a large value if positive return)
         calmar_ratio = total_return_pct if total_return_pct > 0 else 0.0
     else:
         calmar_ratio = total_return_pct / abs(max_drawdown)
+
+    # Calculate Sortino ratio (annualized return / annualized downside deviation)
+    # Proper annualization: multiply mean by N, multiply downside_std by sqrt(N)
+    # where N = number of bars per year (252 days * 78 five-min bars/day)
+    portfolio_returns = np.diff(portfolio_array) / portfolio_array[:-1]
+    downside_returns = portfolio_returns[portfolio_returns < 0]
+    if len(downside_returns) > 0:
+        downside_std = float(np.std(downside_returns))
+        if downside_std > 0:
+            bars_per_year = 252 * 78  # 5-min bars
+            annualized_mean = float(np.mean(portfolio_returns)) * bars_per_year
+            annualized_downside_std = downside_std * np.sqrt(bars_per_year)
+            sortino_ratio = float(annualized_mean / annualized_downside_std)
+        else:
+            sortino_ratio = total_return_pct if total_return_pct > 0 else 0.0
+    else:
+        sortino_ratio = total_return_pct if total_return_pct > 0 else 0.0
 
     # Prepare results
     results = {
@@ -692,7 +793,8 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         "sell_prices": [],
         "action_counts": action_counts,
         "max_drawdown": max_drawdown,
-        "calmar_ratio": calmar_ratio
+        "calmar_ratio": calmar_ratio,
+        "sortino_ratio": sortino_ratio
     }
 
     # Add additional information

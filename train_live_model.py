@@ -112,10 +112,14 @@ def load_live_data(csv_filepath="data/live.csv") -> pd.DataFrame:
             
         # Calculate close_norm manually if it wasn't created
         if 'close_norm' not in processed_df.columns:
-            logger.info("Manually calculating close_norm")
-            # Calculate close_norm as the percentage change from the first close price
-            first_close = processed_df['close'].iloc[0]
-            processed_df['close_norm'] = processed_df['close'] / first_close - 1.0
+            logger.info("Manually calculating close_norm using min/max scaling")
+            close_min = processed_df['close'].min()
+            close_max = processed_df['close'].max()
+            close_range = close_max - close_min
+            if close_range > 0:
+                processed_df['close_norm'] = ((processed_df['close'] - close_min) / close_range).clip(0, 1)
+            else:
+                processed_df['close_norm'] = 0.5
         
         # Apply market hours filter if configured
         if config["data"].get("market_hours_only", False):
