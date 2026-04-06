@@ -131,7 +131,10 @@ indicators:
 environment:
   initial_balance: 100000.0
   position_size: 1
-  transaction_cost: 2.5
+  transaction_cost: 2.5  # Commission per contract per fill
+execution_costs:
+  half_spread_points: 0.25  # NQ half-spread: 0.25 pts = $5 per fill
+  base_slippage_points: 0.10  # Base slippage: 0.10 pts = $2 per fill (3x at open/close)
 model:
   ent_coef: 0.1  # Higher entropy to prevent directional collapse with 2-action space
   ent_coef_decay: true  # Decay to exploit learned policy

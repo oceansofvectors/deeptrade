@@ -48,6 +48,15 @@ class TradingEnv(gym.Env):
             enabled_indicators (list): List of enabled indicators to use in the observation space.
         """
         super(TradingEnv, self).__init__()
+
+        # Preserve datetime index for time-of-day execution cost model
+        if isinstance(data.index, pd.DatetimeIndex):
+            self._hours = data.index.hour.values
+        elif 'time' in data.columns:
+            self._hours = pd.to_datetime(data['time']).dt.hour.values
+        else:
+            self._hours = None
+
         self.data = data.reset_index(drop=True)
         self.total_steps = len(self.data) - 1  # Last valid index
 
@@ -201,6 +210,31 @@ class TradingEnv(gym.Env):
         self._point_value_decimal = money.to_decimal(constants.NQ_POINT_VALUE)
         self._position_size_decimal = money.to_decimal(self.position_size)
         self._min_balance_pct_decimal = Decimal(str(constants.MIN_BALANCE_PERCENTAGE))
+
+        # Realistic execution cost model: spread + time-of-day slippage
+        # NQ tick = 0.25 pts ($5), typical half-spread = 0.25 pts during liquid hours
+        exec_config = config.get("execution_costs", {})
+        self._spread_points = Decimal(str(exec_config.get("half_spread_points", 0.25)))
+        base_slippage = exec_config.get("base_slippage_points", 0.10)
+
+        # Pre-compute per-bar slippage in points (time-of-day dependent)
+        # Market open (9:30-10:00 ET = 13:30-14:00 UTC) and close (15:30-16:00 ET = 19:30-20:00 UTC)
+        # get 3x slippage; first/last 30 min of session get 2x; rest is base
+        if self._hours is not None:
+            slippage = np.full(len(self.data), base_slippage, dtype=np.float64)
+            # Open period: 13-14 UTC (9-10 AM ET) - high slippage
+            slippage[(self._hours >= 13) & (self._hours < 14)] = base_slippage * 3.0
+            # Close period: 19-20 UTC (3-4 PM ET) - high slippage
+            slippage[(self._hours >= 19) & (self._hours < 20)] = base_slippage * 3.0
+            # Shoulder periods: 14 UTC (10 AM ET), 18-19 UTC (2-3 PM ET) - moderate
+            slippage[self._hours == 14] = base_slippage * 2.0
+            slippage[(self._hours >= 18) & (self._hours < 19)] = base_slippage * 2.0
+            # Overnight: less liquid
+            slippage[(self._hours >= 0) & (self._hours < 13)] = base_slippage * 1.5
+            slippage[self._hours >= 21] = base_slippage * 1.5
+            self._slippage_points = slippage
+        else:
+            self._slippage_points = np.full(len(self.data), base_slippage, dtype=np.float64)
 
         # Pre-compute column name lookups (avoid per-step capitalization checks)
         self._close_norm_col = next((c for c in ['CLOSE_NORM', 'Close_norm', 'close_norm'] if c in self.data.columns), 'close_norm')
@@ -572,12 +606,26 @@ class TradingEnv(gym.Env):
                 if self.fixed_tp_enabled and self.fixed_tp_atr_mult and atr > 0:
                     self.fixed_tp_price = self.entry_price - (atr * self.fixed_tp_atr_mult)
 
-        # Apply transaction cost if position changed (realistic cost model)
+        # Apply execution costs if position changed: commission + spread + slippage
         transaction_cost_applied = Decimal('0.0')
-        if position_changed and self.transaction_cost > Decimal('0.0'):
-            # Transaction cost per contract (round trip if reversing position)
-            cost_multiplier = 2 if old_position != 0 and self.position != 0 and old_position != self.position else 1
-            transaction_cost_applied = self.transaction_cost * self._position_size_decimal * Decimal(str(cost_multiplier))
+        if position_changed:
+            # Number of sides: reversal (long→short) = 2 fills, entry/exit = 1 fill
+            n_fills = 2 if old_position != 0 and self.position != 0 and old_position != self.position else 1
+
+            # Commission (per fill)
+            if self.transaction_cost > Decimal('0.0'):
+                transaction_cost_applied += self.transaction_cost * self._position_size_decimal * Decimal(str(n_fills))
+
+            # Spread cost: half-spread per fill (crossing the bid-ask)
+            spread_cost = self._spread_points * self._point_value_decimal * self._position_size_decimal * Decimal(str(n_fills))
+            transaction_cost_applied += spread_cost
+
+            # Slippage: time-of-day dependent, per fill
+            step_idx = min(self.current_step, len(self._slippage_points) - 1)
+            slippage_pts = Decimal(str(self._slippage_points[step_idx]))
+            slippage_cost = slippage_pts * self._point_value_decimal * self._position_size_decimal * Decimal(str(n_fills))
+            transaction_cost_applied += slippage_cost
+
             self.net_worth -= transaction_cost_applied
 
         # Increment time in position if holding, or time flat if no position
