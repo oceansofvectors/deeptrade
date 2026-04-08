@@ -221,9 +221,10 @@ def train_agent(train_data, total_timesteps: int):
     logger.info("Training completed")
     return model
 
-def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20, 
+def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20,
                            n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000,
-                           evaluation_metric: str = "return", model_params: dict = None, window_folder: str = None):
+                           evaluation_metric: str = "return", model_params: dict = None, window_folder: str = None,
+                           window_label: str = ""):
     """
     Train a PPO model iteratively based on validation performance.
     
@@ -448,7 +449,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
 
         # Skip evaluation on non-evaluation iterations (except the last one)
         if eval_frequency > 1 and iteration % eval_frequency != 0 and iteration < max_iterations:
-            logger.info(f"Iter {iteration} - Training only (eval every {eval_frequency} iters), loss={current_loss:.4f}")
+            logger.info(f"{window_label}Iter {iteration} - Training only (eval every {eval_frequency} iters), loss={current_loss:.4f}")
             continue
 
         # Evaluate the model on validation data using the specified metric
@@ -491,27 +492,27 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             results["is_best"] = True
             metric_stagnant_counter = 0  # Reset stagnation counter on improvement
 
-            logger.info(f"Iter {iteration} - New best (val {metric_name}={current_metric_value:.2f}): Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}")
+            logger.info(f"{window_label}Iter {iteration} - New best (val {metric_name}={current_metric_value:.2f}): Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}")
         elif current_metric_value > best_metric_value and not has_enough_trades:
             metric_stagnant_counter += 1
-            logger.info(f"Iter {iteration} - Val {metric_name}={current_metric_value:.2f} but too few trades ({results['trade_count']}<{min_trades}) [no improvement {metric_stagnant_counter}/{n_stagnant_loops}]")
+            logger.info(f"{window_label}Iter {iteration} - Val {metric_name}={current_metric_value:.2f} but too few trades ({results['trade_count']}<{min_trades}) [no improvement {metric_stagnant_counter}/{n_stagnant_loops}]")
 
             # Save the best model
             best_model.save(os.path.join(window_folder, "best_model"))
         else:
             metric_stagnant_counter += 1
-            logger.info(f"Iter {iteration} - Val {metric_name}={current_metric_value:.2f}, Train loss={current_loss:.4f} [no improvement {metric_stagnant_counter}/{n_stagnant_loops}], Portfolio=${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}, Actions={results['action_counts']}")
+            logger.info(f"{window_label}Iter {iteration} - Val {metric_name}={current_metric_value:.2f}, Train loss={current_loss:.4f} [no improvement {metric_stagnant_counter}/{n_stagnant_loops}], Portfolio=${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}, Actions={results['action_counts']}")
 
         # Early stopping based on validation metric plateau (not loss)
         if metric_stagnant_counter >= n_stagnant_loops:
-            logger.info(f"Early stop: validation {metric_name} plateau for {n_stagnant_loops} iterations")
+            logger.info(f"{window_label}Early stop: validation {metric_name} plateau for {n_stagnant_loops} iterations")
             break
 
     # Add loss history to best_results for saving
     best_results["loss_history"] = loss_history
 
     total_iterations = iteration if 'iteration' in dir() else 0
-    logger.info(f"Training complete after {total_iterations} iterations. Best {metric_name}: {best_metric_value:.2f}")
+    logger.info(f"{window_label}Training complete after {total_iterations} iterations. Best {metric_name}: {best_metric_value:.2f}")
     return best_model, best_results, all_results
 
 def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False):
@@ -953,9 +954,10 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
     trade_history_df.to_csv(filename, index=False)
     logger.info("Trade history saved to %s", filename)
 
-def train_walk_forward_model(train_data, validation_data, initial_timesteps=20000, additional_timesteps=10000, 
+def train_walk_forward_model(train_data, validation_data, initial_timesteps=20000, additional_timesteps=10000,
                          max_iterations=200, n_stagnant_loops=10, improvement_threshold=0.05, window_folder=None,
-                         run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None, model_params=None):
+                         run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None, model_params=None,
+                         window_label: str = ""):
     """
     Train a model using walk-forward optimization.
     
@@ -1024,7 +1026,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     
     # Train the model iteratively
     model, validation_results, all_results = train_agent_iteratively(
-        train_data, 
+        train_data,
         validation_data,
         initial_timesteps=initial_timesteps,
         additional_timesteps=additional_timesteps,
@@ -1033,7 +1035,8 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         improvement_threshold=improvement_threshold,
         evaluation_metric=evaluation_metric,
         model_params=model_params,
-        window_folder=window_folder
+        window_folder=window_folder,
+        window_label=window_label
     )
     
     # Save validation results

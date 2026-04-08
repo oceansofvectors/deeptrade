@@ -161,6 +161,10 @@ class TradingEnv(gym.Env):
                 self.technical_indicators.append('MSO_COS')
             if 'ZScore' in self.data.columns:
                 self.technical_indicators.append('ZScore')
+            if 'ROLLING_DD' in self.data.columns:
+                self.technical_indicators.append('ROLLING_DD')
+            if 'VOL_PERCENTILE' in self.data.columns:
+                self.technical_indicators.append('VOL_PERCENTILE')
             # Add LSTM-extracted features (LSTM_F0 through LSTM_F7 or more)
             for i in range(16):  # Support up to 16 LSTM features
                 lstm_col = f'LSTM_F{i}'
@@ -271,6 +275,15 @@ class TradingEnv(gym.Env):
         # Pre-allocate observation buffer
         self._obs_size = obs_size
         self._n_indicators = len(self.technical_indicators)
+
+        # Cache regime feature indices for reward shaping (calm holding bonus)
+        self._rolling_dd_idx = None
+        self._vol_pct_idx = None
+        for i, ind in enumerate(self.technical_indicators):
+            if ind == 'ROLLING_DD':
+                self._rolling_dd_idx = i
+            elif ind == 'VOL_PERCENTILE':
+                self._vol_pct_idx = i
 
 
     def seed(self, seed=None):
@@ -742,12 +755,21 @@ class TradingEnv(gym.Env):
         Portfolio-return-based reward aligned with Sortino/Calmar optimization.
 
         Primary signal: log change in net worth (captures P&L, costs, and compounding).
+        Asymmetric penalty: losses penalized at 1.7x gains.
+        Calm holding bonus: small reward for staying in position during low-vol regimes.
         Penalties: drawdown increase, excessive turnover.
-        No ad-hoc point-P&L scaling or arbitrary caps.
 
         Returns:
             float: Reward signal
         """
+        reward_config = config.get("reward", {})
+        base_scale = reward_config.get("base_scale", 500.0)
+        loss_multiplier = reward_config.get("loss_multiplier", 0.7)
+        dd_threshold = reward_config.get("drawdown_penalty_threshold", 0.03)
+        dd_penalty = reward_config.get("drawdown_penalty", 3.0)
+        turnover_pen = reward_config.get("turnover_penalty", 0.05)
+        calm_bonus = reward_config.get("calm_holding_bonus", 0.0005)
+
         # Primary signal: log change in equity
         if self.previous_net_worth > 0 and self.net_worth > 0:
             log_return = float(np.log(float(self.net_worth) / float(self.previous_net_worth)))
@@ -756,22 +778,37 @@ class TradingEnv(gym.Env):
 
         # Scale log return to useful reward magnitude
         # For NQ with $100k account: a 10-point move = $200 = 0.2% = log_return ~0.002
-        # Scale by 500 so 0.2% move → reward ~1.0
-        reward = log_return * 500.0
+        # Scale by base_scale so 0.2% move → reward ~1.0
+        reward = log_return * base_scale
 
-        # Asymmetric downside penalty: penalize losses more than rewarding gains
-        # This directly aligns with Sortino (downside deviation minimization)
+        # Asymmetric downside penalty: additive extra penalty on losses
+        # loss_multiplier=0.7 → losses at 1.7x base, gains at 1x
         if log_return < 0:
-            reward += log_return * 250.0  # Extra 1.5x total penalty on losses
+            reward += log_return * base_scale * loss_multiplier
 
         # Drawdown penalty: penalize increases in drawdown from peak
         if self.max_net_worth > self.initial_balance:
             current_dd = float((self.max_net_worth - self.net_worth) / self.max_net_worth)
-            if current_dd > 0.03:  # Penalty kicks in at 3% drawdown
-                reward -= current_dd * 3.0
+            if current_dd > dd_threshold:
+                reward -= current_dd * dd_penalty
+
+        # Calm holding bonus: reward holding LONG in calm, low-drawdown regimes
+        # This directly counters the "trade too little" problem in bull windows
+        if self.position == 1 and calm_bonus > 0:
+            rolling_dd_val = 0.0
+            vol_pct_val = 50.0
+            if self._rolling_dd_idx is not None:
+                rolling_dd_val = float(self._indicator_matrix[self.current_step, self._rolling_dd_idx])
+            if self._vol_pct_idx is not None:
+                vol_pct_val = float(self._indicator_matrix[self.current_step, self._vol_pct_idx])
+
+            # Stronger bonus when near highs and volatility is low
+            if rolling_dd_val > -2.5 and vol_pct_val < 68.0:
+                reward += calm_bonus * 2.0  # Double the bonus for holding long in good conditions
 
         # Turnover penalty: discourage excessive trading (cost already in net_worth, this is extra signal)
         if position_changed:
-            reward -= 0.05
+            reward -= turnover_pen
 
-        return reward
+        # Clamp reward to prevent gradient explosion from extreme values
+        return max(min(reward, 10.0), -10.0)
