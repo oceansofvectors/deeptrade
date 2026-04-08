@@ -41,6 +41,8 @@ from indicators.vwap import calculate_vwap
 from indicators.volume import calculate_volume_indicator
 from indicators.williams_r import calculate_williams_r
 from indicators.z_score import calculate_zscore
+from indicators.rolling_drawdown import calculate_rolling_drawdown
+from indicators.vol_percentile import calculate_vol_percentile
 # Note: LSTM features are imported and used in walk_forward.py, not here
 
 logging.basicConfig(level=logging.INFO)
@@ -335,6 +337,16 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             df = calculate_zscore(df, length=config["indicators"]["z_score"].get("length", 50),
                                 target_col='ZScore')
 
+        # Rolling Drawdown (regime-aware feature)
+        if config["indicators"].get("rolling_drawdown", {}).get("enabled", False):
+            df = calculate_rolling_drawdown(df, window=config["indicators"]["rolling_drawdown"].get("window", 50),
+                                           target_col='ROLLING_DD')
+
+        # Volatility Percentile (regime-aware feature)
+        if config["indicators"].get("vol_percentile", {}).get("enabled", False):
+            df = calculate_vol_percentile(df, window=config["indicators"]["vol_percentile"].get("window", 60),
+                                         target_col='VOL_PERCENTILE')
+
         # Note: LSTM features are generated in walk_forward.py, not here
         # This ensures the autoencoder is pre-trained once on training data only
 
@@ -362,7 +374,8 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D',
                          'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R',
                          'SMA', 'EMA', 'DISPARITY', 'ATR', 'OBV',
-                         'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM', 'RRCF_ANOMALY', 'ZScore']:
+                         'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM', 'RRCF_ANOMALY', 'ZScore',
+                         'ROLLING_DD', 'VOL_PERCENTILE']:
             if indicator in df.columns:
                 model_columns.append(indicator)
 

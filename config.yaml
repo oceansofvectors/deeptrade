@@ -101,6 +101,12 @@ indicators:
     feature_cols:
     - close
     random_seed: 42
+  rolling_drawdown:
+    enabled: true
+    window: 50
+  vol_percentile:
+    enabled: true
+    window: 60
   lstm_features:
     enabled: true
     lookback: 20
@@ -116,39 +122,62 @@ indicators:
       n_trials: 20
       parameters:
         hidden_size:
-          choices: [16, 32, 64, 128]
+          choices:
+          - 16
+          - 32
+          - 64
+          - 128
         num_layers:
           min: 1
           max: 2
         output_size:
-          choices: [4, 8, 16]
+          choices:
+          - 4
+          - 8
+          - 16
         lookback:
-          choices: [10, 20, 30, 50]
+          choices:
+          - 10
+          - 20
+          - 30
+          - 50
         pretrain_lr:
           min: 0.0001
           max: 0.01
           log: true
+augmentation:
+  synthetic_bears:
+    enabled: true
+    oversample_ratio: 0.315
+    segment_length_pct: 0.13
 environment:
   initial_balance: 100000.0
   position_size: 1
-  transaction_cost: 2.5  # Commission per contract per fill
+  transaction_cost: 2.5
 execution_costs:
-  half_spread_points: 0.125  # NQ half-spread: half of 1 tick = $2.50 per fill
-  base_slippage_points: 0.0  # 1 lot on NQ: effectively zero slippage during RTH
+  half_spread_points: 0.125
+  base_slippage_points: 0.0
+reward:
+  base_scale: 500.0
+  loss_multiplier: 0.769  # Tuned: losses at 1.77x gains
+  drawdown_penalty_threshold: 0.025
+  drawdown_penalty: 2.2
+  turnover_penalty: 0.011  # Tuned: low penalty to allow good entries
+  calm_holding_bonus: 0.0026  # Tuned: strong bonus for holding long in calm regimes
 model:
-  ent_coef: 0.1  # Higher entropy to prevent directional collapse with 2-action space
-  ent_coef_decay: true  # Decay to exploit learned policy
-  final_ent_coef: 0.02  # Keep meaningful entropy floor
-  learning_rate: 0.0003  # SB3 default, decays via use_lr_decay
-  n_steps: 384  # Shorter rollouts for LSTM to maintain temporal coherence
-  batch_size: 48  # n_steps / 8 for stable mini-batch training
-  gamma: 0.9945  # Reduced: 0.9878^384=0.009 (too myopic); 0.9945^384=0.12 (better)
-  gae_lambda: 0.85  # Reduced for more aggressive bootstrapping, less reliance on uncertain future
+  ent_coef: 0.15  # Tuned
+  ent_coef_decay: true
+  final_ent_coef: 0.045
+  learning_rate: 0.000229  # Tuned
+  n_steps: 311  # Tuned
+  batch_size: 83  # Tuned
+  gamma: 0.9958  # Tuned
+  gae_lambda: 0.85
   use_lr_decay: true
 sequence_model:
   enabled: true
-  lstm_hidden_size: 64  # Reduced to prevent overfitting with 2-action space
-  n_lstm_layers: 1  # Tuned (trial 6)
+  lstm_hidden_size: 512  # Tuned
+  n_lstm_layers: 2  # Tuned
   shared_lstm: false
   reset_on_new_day: false
   device: auto
@@ -156,8 +185,12 @@ risk_management:
   enabled: false
   dynamic_sl_tp:
     enabled: false
-    sl_multiplier_range: [1.5, 5.0]
-    tp_multiplier_range: [1.5, 5.0]
+    sl_multiplier_range:
+    - 1.5
+    - 5.0
+    tp_multiplier_range:
+    - 1.5
+    - 5.0
     num_choices: 8
     default_sl_multiplier: 2.0
     default_tp_multiplier: 3.0
@@ -169,12 +202,12 @@ risk_management:
     enabled: false
     mode: atr
     percentage: 17
-    atr_multiplier: 4.0  # Wide stop to avoid noise - only catches catastrophic moves
+    atr_multiplier: 4.0
   take_profit:
     enabled: false
     mode: atr
     percentage: 20
-    atr_multiplier: 6.0  # Wide TP at 6x ATR (1.5:1 reward/risk ratio)
+    atr_multiplier: 6.0
   trailing_stop:
     enabled: false
     percentage: 1.0
@@ -186,42 +219,53 @@ walk_forward:
   enabled: true
   window_size: 120
   step_size: 24
-  max_windows: 2
+  max_windows: 4
   parallel_processing:
     enabled: true
     n_processes: 0
     max_workers: 0
 hyperparameter_tuning:
   enabled: false
-  n_trials: 10
-  tuning_timesteps: 10000
+  n_trials: 40
+  tuning_timesteps: 12000
   parallel_processing:
-    enabled: false
-    n_jobs: 5
+    enabled: true
+    n_jobs: 0  # 0 = auto-detect all CPU cores
   parameters:
+    # Core PPO parameters
     learning_rate:
-      min: 1.0e-05
-      max: 0.001
+      min: 5.0e-06
+      max: 0.0008
       log: true
     n_steps:
-      min: 500
-      max: 2000
+      min: 256
+      max: 768
       log: true
     ent_coef:
-      min: 1.0e-05
-      max: 0.5
-      log: true
-    batch_size:
-      min: 8
-      max: 128
-      log: true
-    gamma:
-      min: 0.95
-      max: 0.999
+      min: 0.10
+      max: 0.25
       log: false
-    gae_lambda:
-      min: 0.9
-      max: 0.99
+    gamma:
+      min: 0.992
+      max: 0.997
+      log: false
+    # Reward shaping (most critical)
+    reward_loss_multiplier:
+      min: 0.30
+      max: 0.80
+      log: false
+    reward_turnover_penalty:
+      min: 0.008
+      max: 0.040
+      log: false
+    reward_calm_holding_bonus:
+      min: 0.0006
+      max: 0.0032
+      log: false
+    # Synthetic bears
+    synthetic_oversample_ratio:
+      min: 0.12
+      max: 0.32
       log: false
     lstm_hidden_size:
       choices:

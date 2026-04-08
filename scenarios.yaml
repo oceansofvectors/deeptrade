@@ -1,0 +1,31 @@
+# Walk-Forward Testing Scenarios
+# Each scenario defines a date-filtered slice of NQ_5min_2020_2025.csv
+# to run walk-forward testing on. All dates are inclusive.
+#
+# Volatility regimes were identified from monthly std of 5-min returns.
+# "Normal" = within 25th-75th percentile (~0.000577 to ~0.001032).
+
+scenarios:
+  steady_bull_2021:
+    description: "2021 steady bull market - low/normal volatility"
+    data_file: data/NQ_5min_2020_2025.csv
+    start_date: "2021-01-01"
+    end_date: "2021-09-30"
+
+  post_bear_recovery_2023:
+    description: "2023 post-bear recovery - normal volatility"
+    data_file: data/NQ_5min_2020_2025.csv
+    start_date: "2023-01-01"
+    end_date: "2023-10-31"
+
+  pre_aug_calm_2024:
+    description: "2024 pre-August calm - low/normal volatility"
+    data_file: data/NQ_5min_2020_2025.csv
+    start_date: "2024-01-01"
+    end_date: "2024-07-31"
+
+  high_vol_crash_2020:
+    description: "March 2020 crash + volatility spike"
+    data_file: data/NQ_5min_2020_2025.csv
+    start_date: "2020-02-01"
+    end_date: "2020-04-30"
