@@ -285,6 +285,15 @@ class TradingEnv(gym.Env):
             elif ind == 'VOL_PERCENTILE':
                 self._vol_pct_idx = i
 
+        # Cache reward config lookups (avoid repeated config.get() in per-step reward loop)
+        reward_config = config.get("reward", {})
+        self._reward_base_scale = reward_config.get("base_scale", 500.0)
+        self._reward_loss_multiplier = reward_config.get("loss_multiplier", 0.7)
+        self._reward_dd_threshold = reward_config.get("drawdown_penalty_threshold", 0.03)
+        self._reward_dd_penalty = reward_config.get("drawdown_penalty", 3.0)
+        self._reward_turnover_pen = reward_config.get("turnover_penalty", 0.05)
+        self._reward_calm_bonus = reward_config.get("calm_holding_bonus", 0.0005)
+
 
     def seed(self, seed=None):
         """Set random seed for reproducibility."""
@@ -762,13 +771,12 @@ class TradingEnv(gym.Env):
         Returns:
             float: Reward signal
         """
-        reward_config = config.get("reward", {})
-        base_scale = reward_config.get("base_scale", 500.0)
-        loss_multiplier = reward_config.get("loss_multiplier", 0.7)
-        dd_threshold = reward_config.get("drawdown_penalty_threshold", 0.03)
-        dd_penalty = reward_config.get("drawdown_penalty", 3.0)
-        turnover_pen = reward_config.get("turnover_penalty", 0.05)
-        calm_bonus = reward_config.get("calm_holding_bonus", 0.0005)
+        base_scale = self._reward_base_scale
+        loss_multiplier = self._reward_loss_multiplier
+        dd_threshold = self._reward_dd_threshold
+        dd_penalty = self._reward_dd_penalty
+        turnover_pen = self._reward_turnover_pen
+        calm_bonus = self._reward_calm_bonus
 
         # Primary signal: log change in equity
         if self.previous_net_worth > 0 and self.net_worth > 0:

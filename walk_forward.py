@@ -582,7 +582,8 @@ def process_single_window(
     run_hyperparameter_tuning: bool,
     tuning_trials: int,
     best_hyperparameters: Dict = None,
-    prev_lstm_checkpoint_path: str = None
+    prev_lstm_checkpoint_path: str = None,
+    prev_model_path: str = None
 ) -> Dict:
     """
     Process a single window in the walk-forward analysis.
@@ -705,6 +706,11 @@ def process_single_window(
 
     logger.info(f"Model input columns ({len(train_data.columns)}): {train_data.columns.tolist()}")
 
+    # Validate warm-start model path
+    if prev_model_path and not os.path.exists(f"{prev_model_path}.zip"):
+        logger.info(f"Previous model not found at {prev_model_path}.zip, training from scratch")
+        prev_model_path = None
+
     # Training the model with the scaled data
     model, training_stats = train_walk_forward_model(
         train_data=train_data,
@@ -718,7 +724,8 @@ def process_single_window(
         run_hyperparameter_tuning=run_hyperparameter_tuning,
         tuning_trials=tuning_trials,
         model_params=best_hyperparameters,  # Pass the best hyperparameters to use
-        window_label=f"[W{window_idx+1}/{num_windows}] "
+        window_label=f"[W{window_idx+1}/{num_windows}] ",
+        prev_model_path=prev_model_path
     )
 
     # Save loss history if available
@@ -1228,6 +1235,7 @@ def walk_forward_testing(
         logger.info(f"Processing {num_windows} windows sequentially")
 
         prev_lstm_checkpoint_path = None  # For LSTM warm-starting between windows
+        prev_model_path = None  # For policy warm-starting between windows
         for window_data_dict in window_data_list:
             try:
                 window_result = process_single_window(
@@ -1246,11 +1254,13 @@ def walk_forward_testing(
                     False,  # Don't run hyperparameter tuning for each window
                     tuning_trials,
                     best_hyperparameters,  # Pass the best hyperparameters found
-                    prev_lstm_checkpoint_path=prev_lstm_checkpoint_path
+                    prev_lstm_checkpoint_path=prev_lstm_checkpoint_path,
+                    prev_model_path=prev_model_path
                 )
                 all_window_results.append(window_result)
-                # Update warm-start path for next window
+                # Update warm-start paths for next window
                 prev_lstm_checkpoint_path = f"{window_data_dict['window_folder']}/lstm_autoencoder_checkpoint.pt"
+                prev_model_path = f"{window_data_dict['window_folder']}/model"
             except Exception as e:
                 logger.error(f"Error processing window {window_data_dict['window_idx']}: {e}")
                 import traceback

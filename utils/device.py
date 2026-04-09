@@ -3,9 +3,6 @@ Device detection utility for PyTorch.
 
 Provides automatic detection of the best available compute device:
 CUDA (NVIDIA GPU) > MPS (Apple Silicon) > CPU
-
-Note: MPS has issues with LSTM/RecurrentPPO (MPSNDArray slice errors),
-so recurrent models should use CPU on Apple Silicon.
 """
 import logging
 
@@ -23,7 +20,8 @@ def get_device(preferred: str = "auto", for_recurrent: bool = False) -> str:
             - "mps": Force MPS (will fall back to CPU if unavailable)
             - "cpu": Force CPU
         for_recurrent: If True, avoid MPS for recurrent models (LSTM) due to
-            Metal Performance Shaders bugs with tensor slicing operations.
+            MPSNDArray slice bug with variable-length sequences in RecurrentPPO.
+            Simple LSTM benchmarks pass but real SB3 workloads crash (PyTorch 2.6).
 
     Returns:
         Device string compatible with PyTorch/Stable-Baselines3: "cuda", "mps", or "cpu"
@@ -40,7 +38,7 @@ def get_device(preferred: str = "auto", for_recurrent: bool = False) -> str:
             logger.debug("Using MPS device (Apple Silicon)")
         elif torch.backends.mps.is_available() and for_recurrent:
             device = "cpu"
-            logger.debug("Using CPU device (MPS has LSTM compatibility issues)")
+            logger.debug("Using CPU (MPS has Apple Metal LSTM bug with variable-length sequences)")
         else:
             device = "cpu"
             logger.debug("Using CPU device")
@@ -58,7 +56,7 @@ def get_device(preferred: str = "auto", for_recurrent: bool = False) -> str:
             logger.debug("Using MPS device (Apple Silicon)")
         elif for_recurrent:
             device = "cpu"
-            logger.debug("MPS requested but using CPU for recurrent model (LSTM compatibility)")
+            logger.debug("MPS requested but using CPU (Apple Metal LSTM bug)")
         else:
             device = "cpu"
             logger.debug("MPS requested but not available, falling back to CPU")

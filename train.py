@@ -13,7 +13,7 @@ from plotly.subplots import make_subplots
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 # RecurrentPPO for LSTM support
 try:
@@ -134,8 +134,12 @@ def train_agent(train_data, total_timesteps: int):
     # Create vectorized environment for faster rollout collection
     n_envs = config.get("training", {}).get("n_envs", 4)
     env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
-    env = DummyVecEnv([lambda data=train_data.copy(), kw=env_kwargs: TradingEnv(data, **kw) for _ in range(n_envs)])
-    logger.info(f"Using {n_envs} vectorized environments for training")
+
+    def make_env(data, **kwargs):
+        return lambda: TradingEnv(data.copy(), **kwargs)
+
+    env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
+    logger.info(f"Using SubprocVecEnv with {n_envs} processes for faster rollouts")
 
     # Get sequence model config
     seq_config = config.get("sequence_model", {})
@@ -217,14 +221,14 @@ def train_agent(train_data, total_timesteps: int):
 
     callbacks = [cb for cb in [entropy_callback] if cb is not None]
     logger.info("Starting training for %d timesteps", total_timesteps)
-    model.learn(total_timesteps=total_timesteps, progress_bar=True, callback=callbacks if callbacks else None)
+    model.learn(total_timesteps=total_timesteps, progress_bar=False, callback=callbacks if callbacks else None)
     logger.info("Training completed")
     return model
 
 def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20,
                            n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000,
                            evaluation_metric: str = "return", model_params: dict = None, window_folder: str = None,
-                           window_label: str = ""):
+                           window_label: str = "", prev_model_path: str = None):
     """
     Train a PPO model iteratively based on validation performance.
     
@@ -259,8 +263,12 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Create vectorized environment for faster rollout collection
     n_envs = config.get("training", {}).get("n_envs", 4)
     env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
-    train_env = DummyVecEnv([lambda data=train_data.copy(), kw=env_kwargs: TradingEnv(data, **kw) for _ in range(n_envs)])
-    logger.info(f"Using {n_envs} vectorized environments for iterative training")
+
+    def make_env(data, **kwargs):
+        return lambda: TradingEnv(data.copy(), **kwargs)
+
+    train_env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
+    logger.info(f"{window_label}Using SubprocVecEnv with {n_envs} processes for faster rollouts")
     
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
@@ -365,6 +373,14 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             policy_kwargs={"net_arch": [128, 64]},
         )
 
+    # Warm-start from previous window's best model if available
+    if prev_model_path and os.path.exists(f"{prev_model_path}.zip"):
+        logger.info(f"{window_label}Warm-starting policy from previous window: {prev_model_path}")
+        if use_recurrent:
+            model = RecurrentPPO.load(f"{prev_model_path}", env=train_env, device=device)
+        else:
+            model = PPO.load(f"{prev_model_path}", env=train_env, device=device)
+
     # Create callbacks
     loss_callback = LossTrackingCallback(verbose=verbose_level)
     callbacks = [loss_callback]
@@ -375,15 +391,15 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     metric_stagnant_counter = 0  # Track validation metric stagnation, not loss
 
     # Initial training
-    logger.info(f"Starting initial training for {initial_timesteps} timesteps")
-    model.learn(total_timesteps=initial_timesteps, progress_bar=True, callback=callbacks)
+    logger.info(f"{window_label}Starting initial training for {initial_timesteps} timesteps")
+    model.learn(total_timesteps=initial_timesteps, progress_bar=False, callback=callbacks)
 
     # Get initial loss values
     initial_losses = loss_callback.get_latest_losses()
     if initial_losses["value_loss"] is not None:
         loss_history.append(initial_losses)
         best_loss = initial_losses["value_loss"]
-        logger.info(f"Iter 0 - Loss: {best_loss:.4f}")
+        logger.info(f"{window_label}Iter 0 - Loss: {best_loss:.4f}")
 
     # Evaluate initial model on validation data using the specified metric
     if verbose_level > 0:
@@ -421,7 +437,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     best_model.save(os.path.join(window_folder, "best_model"))
     
     # Log evaluation results based on metric
-    logger.info(f"Initial training completed. Validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, " 
+    logger.info(f"{window_label}Initial training completed. Validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, "
                 f"Validation Portfolio: ${results['final_portfolio_value']:.2f}")
     
     # Store all results for comparison
@@ -439,7 +455,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         loss_callback.reset()
 
         # Train for additional timesteps
-        model.learn(total_timesteps=additional_timesteps, progress_bar=True, callback=callbacks)
+        model.learn(total_timesteps=additional_timesteps, progress_bar=False, callback=callbacks)
 
         # Get loss values for this iteration
         iter_losses = loss_callback.get_latest_losses()
@@ -957,7 +973,7 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
 def train_walk_forward_model(train_data, validation_data, initial_timesteps=20000, additional_timesteps=10000,
                          max_iterations=200, n_stagnant_loops=10, improvement_threshold=0.05, window_folder=None,
                          run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None, model_params=None,
-                         window_label: str = ""):
+                         window_label: str = "", prev_model_path=None):
     """
     Train a model using walk-forward optimization.
     
@@ -1036,7 +1052,8 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         evaluation_metric=evaluation_metric,
         model_params=model_params,
         window_folder=window_folder,
-        window_label=window_label
+        window_label=window_label,
+        prev_model_path=prev_model_path
     )
     
     # Save validation results

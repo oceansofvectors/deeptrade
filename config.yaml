@@ -5,7 +5,7 @@ training:
   max_iterations: 20
   improvement_threshold: 0.01
   additional_timesteps: 20000
-  n_stagnant_loops: 10
+  n_stagnant_loops: 7
   n_envs: 4
   eval_frequency: 2
   verbose: 0
@@ -13,8 +13,8 @@ training:
     metric: sortino
   early_stopping:
     enabled: true
-    patience: 10
-    min_delta: 0.001
+    patience: 7
+    min_delta: 0.1
 data:
   train_ratio: 0.6
   validation_ratio: 0.2
@@ -219,9 +219,9 @@ walk_forward:
   enabled: true
   window_size: 120
   step_size: 24
-  max_windows: 4
+  max_windows: 1  # Temporarily limited for profiling
   parallel_processing:
-    enabled: true
+    enabled: false  # Temporarily disabled for cProfile compatibility
     n_processes: 0
     max_workers: 0
 hyperparameter_tuning:

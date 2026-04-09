@@ -29,3 +29,7 @@ scenarios:
     data_file: data/NQ_5min_2020_2025.csv
     start_date: "2020-02-01"
     end_date: "2020-04-30"
+
+  full_2020_2025:
+    description: "Full dataset - all regimes 2020-2025"
+    data_file: data/NQ_5min_2020_2025.csv
