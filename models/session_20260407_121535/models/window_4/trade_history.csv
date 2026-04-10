@@ -1,0 +1,5 @@
+date,trade_type,price,portfolio_value,profitable,position_from,position_to,exit_reason
+2021-09-13 15:00:00+00:00,Short,15347.5,99995.0,False,0.0,15347.5,
+2021-09-13 15:05:00+00:00,Flat,15378.25,99785.0,False,15347.5,0.0,
+2021-09-20 15:15:00+00:00,Short,14812.0,99780.0,False,0.0,0.0,
+2021-09-20 15:20:00+00:00,Flat,14848.75,99245.0,False,0.0,0.0,

@@ -1,0 +1,3 @@
+date,trade_type,price,portfolio_value,profitable,position_from,position_to,exit_reason
+2021-06-03 16:30:00+00:00,Long,13524.25,99995.0,False,0.0,13524.25,
+2021-06-04 13:30:00+00:00,Flat,13767.5,104735.0,True,13524.25,0.0,

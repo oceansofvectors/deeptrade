@@ -219,9 +219,9 @@ walk_forward:
   enabled: true
   window_size: 120
   step_size: 24
-  max_windows: 1  # Temporarily limited for profiling
+  max_windows: 0  # 0 = no limit
   parallel_processing:
-    enabled: false  # Temporarily disabled for cProfile compatibility
+    enabled: true
     n_processes: 0
     max_workers: 0
 hyperparameter_tuning:
