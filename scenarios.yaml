@@ -25,10 +25,10 @@ scenarios:
     end_date: "2024-07-31"
 
   high_vol_crash_2020:
-    description: "March 2020 crash + volatility spike"
+    description: "March 2020 crash + volatility spike (extended for walk-forward window)"
     data_file: data/NQ_5min_2020_2025.csv
-    start_date: "2020-02-01"
-    end_date: "2020-04-30"
+    start_date: "2020-01-02"
+    end_date: "2020-08-31"
 
   full_2020_2025:
     description: "Full dataset - all regimes 2020-2025"

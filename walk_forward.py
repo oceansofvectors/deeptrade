@@ -1,4 +1,5 @@
 import logging
+import re
 import pandas as pd
 import numpy as np
 import os
@@ -36,19 +37,32 @@ from normalization import scale_window, get_standardized_column_names  # Import 
 from indicators.lstm_features import LSTMFeatureGenerator, tune_lstm_hyperparameters
 from utils.synthetic_bears import augment_with_synthetic_bears
 
+from utils.log_format import (
+    ACTION_NAMES,
+    ANSI_BOLD,
+    ANSI_GREEN,
+    ANSI_RED,
+    ANSI_RESET,
+    AnsiStrippingFormatter,
+    bold,
+    color_pct,
+    format_action_distribution,
+)
+
 # Setup logging to save to file and console
 os.makedirs('models/logs', exist_ok=True)
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 log_filename = f'models/logs/walk_forward_{timestamp}.log'
 
-# Configure logging to both file and console
+_log_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+_file_handler = logging.FileHandler(log_filename)
+_file_handler.setFormatter(AnsiStrippingFormatter(_log_fmt))
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(logging.Formatter(_log_fmt))
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler()
-    ]
+    handlers=[_file_handler, _stream_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -509,8 +523,8 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
     # Log summary
     if verbose > 0:
         logger.info(f"Evaluation complete: {correct_predictions}/{total_predictions} correct predictions ({prediction_accuracy:.2f}%)")
-        logger.info(f"Return: {float(total_return_pct):.2f}%, Final portfolio: ${float(current_portfolio):.2f}")
-        logger.info(f"Total trades: {trade_count}")
+        logger.info(f"Return: {color_pct(float(total_return_pct))}, Final portfolio: ${float(current_portfolio):.2f}")
+        logger.info(f"Total trades: {trade_count}, Actions: {format_action_distribution(action_history)}")
     
     return results
 
@@ -870,9 +884,18 @@ def process_single_window(
     
     max_dd = test_results.get('max_drawdown', 0.0)
     calmar = test_results.get('calmar_ratio', 0.0)
+    sortino = test_results.get('sortino_ratio', 0.0)
     window_result["max_drawdown"] = max_dd
     window_result["calmar_ratio"] = calmar
-    logger.info(f"Window {window_idx}: Return={test_results['total_return_pct']:.2f}%, MaxDD={max_dd:.2f}%, Calmar={calmar:.2f}, Portfolio=${test_results['final_portfolio_value']:.2f}")
+    window_result["sortino_ratio"] = sortino
+    ret_pct = test_results['total_return_pct']
+    action_dist = format_action_distribution(test_results.get('action_history'))
+    logger.info(
+        f"Window {window_idx}: Return={color_pct(ret_pct)}, "
+        f"Sortino={bold(f'{sortino:.2f}')}, MaxDD={max_dd:.2f}%, Calmar={calmar:.2f}, "
+        f"Portfolio=${test_results['final_portfolio_value']:.2f}"
+    )
+    logger.info(f"Window {window_idx} actions: {action_dist}")
 
     if "trade_history" in test_results:
         window_result["has_trade_history"] = True
@@ -1270,6 +1293,7 @@ def walk_forward_testing(
     returns = [res["return"] for res in all_window_results]
     portfolio_values = [res["portfolio_value"] for res in all_window_results]
     trade_counts = [res["trade_count"] for res in all_window_results]
+    sortinos = [res.get("sortino_ratio", 0.0) for res in all_window_results]
     
     # Also aggregate hit rates if that metric is used
     hit_rates = [res.get("hit_rate", 0) for res in all_window_results]
@@ -1284,6 +1308,7 @@ def walk_forward_testing(
     avg_return = np.mean(returns)
     avg_portfolio = np.mean(portfolio_values)
     avg_trades = np.mean(trade_counts)
+    avg_sortino = float(np.mean(sortinos)) if sortinos else 0.0
     avg_hit_rate = np.mean(hit_rates) if hit_rates else 0
     avg_profitable_trades = np.mean(profitable_trades) if profitable_trades else 0
     avg_prediction_accuracy = np.mean(prediction_accuracies) if prediction_accuracies else 0
@@ -1292,7 +1317,8 @@ def walk_forward_testing(
     
     logger.info(f"\n{'='*80}\nWalk-Forward Testing Summary\n{'='*80}")
     logger.info(f"Number of windows: {num_windows}")
-    logger.info(f"Average return: {avg_return:.2f}%")
+    logger.info(f"Average return: {color_pct(avg_return)}")
+    logger.info(f"Average Sortino: {bold(f'{avg_sortino:.2f}')}")
     
     if eval_metric == "hit_rate":
         logger.info(f"Average hit rate: {avg_hit_rate:.2f}%")
@@ -1307,6 +1333,7 @@ def walk_forward_testing(
     # Save summary results
     summary_results = {
         "avg_return": avg_return,
+        "avg_sortino": avg_sortino,
         "avg_hit_rate": avg_hit_rate,
         "avg_prediction_accuracy": avg_prediction_accuracy,
         "avg_portfolio": avg_portfolio,
@@ -1637,9 +1664,11 @@ def hyperparameter_tuning(
 
         composite_score = (calmar * 0.45) + (sortino * 0.30) + (return_pct * 0.15) - (max_dd * 0.40)
 
-        # Log trial results
+        # Log trial results (return color-coded, sortino bold)
+        action_dist = format_action_distribution(results.get("action_history"))
         log_msg = f"Trial {trial.number}: composite={composite_score:.2f}, "
-        log_msg += f"return={return_pct:.2f}%, sortino={sortino:.2f}, calmar={calmar:.2f}, maxDD={max_dd:.2f}%, "
+        log_msg += f"return={color_pct(return_pct)}, sortino={bold(f'{sortino:.2f}')}, calmar={calmar:.2f}, maxDD={max_dd:.2f}%, "
+        log_msg += f"actions=[{action_dist}], "
         log_msg += f"lr={learning_rate:.6f}, n_steps={n_steps}, ent_coef={ent_coef:.4f}, batch={batch_size}, "
         log_msg += f"gamma={gamma:.4f}, gae_lambda={gae_lambda:.3f}"
         # Log reward/augmentation params if they were tuned
@@ -2205,7 +2234,9 @@ def main():
     # Print summary
     print("\nWalk-Forward Testing Summary:")
     print(f"Number of windows: {results['num_windows']}")
-    print(f"Average return: {results['avg_return']:.2f}%")
+    print(f"Average return: {color_pct(results['avg_return'])}")
+    _avg_sortino_str = f"{results.get('avg_sortino', 0.0):.2f}"
+    print(f"Average Sortino: {bold(_avg_sortino_str)}")
     
     # Display hit rate metrics if that evaluation metric was used
     if eval_metric == "hit_rate":

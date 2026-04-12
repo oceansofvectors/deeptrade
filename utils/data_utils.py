@@ -14,6 +14,29 @@ import pytz
 
 logger = logging.getLogger(__name__)
 
+EASTERN = pytz.timezone("US/Eastern")
+MARKET_OPEN = time(9, 30)
+MARKET_CLOSE = time(16, 0)
+
+
+def is_rth_bar(ts) -> bool:
+    """Return True if the given timestamp lies within NYSE regular trading
+    hours (9:30-16:00 Eastern, Mon-Fri). Accepts any tz-aware or tz-naive
+    datetime/pd.Timestamp; naive values are assumed to be UTC.
+
+    This is the single-timestamp counterpart to `filter_market_hours` — both
+    must use the same spec so training and live agree on what "a bar" means.
+    """
+    if ts is None:
+        return False
+    if not hasattr(ts, "tzinfo") or ts.tzinfo is None:
+        ts = pd.Timestamp(ts).tz_localize("UTC")
+    et = ts.astimezone(EASTERN)
+    if et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    t = et.time()
+    return MARKET_OPEN <= t <= MARKET_CLOSE
+
 
 def filter_market_hours(data: pd.DataFrame) -> pd.DataFrame:
     """

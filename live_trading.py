@@ -11,6 +11,7 @@ import argparse
 
 # Import utility functions
 from trading.utils import get_most_recent_contract
+from utils.data_utils import is_rth_bar, EASTERN as ET_TZ
 
 # Import bar handling functions and variables
 from trading.bar_handler import (
@@ -254,43 +255,50 @@ def onBar(bars, hasNewBar):
     is_data_flowing = True
     
     try:
-        # Check if it's a new trading day
-        current_day = datetime.now().date()
-        stored_last_day = load_last_trading_day()
-        
-        if stored_last_day != current_day:
-            # Reset daily tracking variables
-            daily_pnl = 0.0
-            realized_pnl = 0.0
-            unrealized_pnl = 0.0
-            daily_trading_stopped = False
-            last_trading_day = current_day
-            save_last_trading_day(current_day)
-            logger.info(f"New trading day started: {current_day}")
-
-            # Reset LSTM states for recurrent models at day boundary
-            if model_trader and model_trader.is_recurrent_model:
-                model_trader.reset_lstm_state()
-                logger.info("Reset LSTM hidden states for new trading day")
-
         # Only process bar completion logic if we have a new bar
         if not hasNewBar:
             return
-            
+
         # With RealTimeBarList, get the latest bar directly
         if len(bars) == 0:
             logger.warning("Received empty bar update")
             return
-            
+
         # Get the latest bar
         latest_bar = bars[-1]
-        
+
         # Ensure the bar time is timezone-aware (UTC)
         bar_time = latest_bar.time
         if bar_time.tzinfo is None:
             bar_time = bar_time.replace(tzinfo=pytz.UTC)
         else:
             bar_time = bar_time.astimezone(pytz.UTC)
+
+        # RTH gate: training only ever saw 9:30-16:00 ET weekday bars, so we must
+        # never feed overnight bars to the model. Skip before any aggregation or
+        # state mutation so bar_buckets stays clean.
+        if not is_rth_bar(bar_time):
+            logger.debug(f"Skipping non-RTH bar {bar_time}")
+            return
+
+        # New-trading-day reset keyed on the Eastern date of this bar (not
+        # datetime.now().date() UTC). First RTH bar of a new ET date triggers
+        # the daily reset, which aligns with how training segmented sessions.
+        current_day = bar_time.astimezone(ET_TZ).date()
+        stored_last_day = load_last_trading_day()
+
+        if stored_last_day != current_day:
+            daily_pnl = 0.0
+            realized_pnl = 0.0
+            unrealized_pnl = 0.0
+            daily_trading_stopped = False
+            last_trading_day = current_day
+            save_last_trading_day(current_day)
+            logger.info(f"New trading day started (ET): {current_day}")
+
+            if model_trader and model_trader.is_recurrent_model:
+                model_trader.reset_lstm_state()
+                logger.info("Reset LSTM hidden states for new trading day")
         
         # Convert bar to dictionary format - using the actual field names from IB API
         bar_dict = {
@@ -398,8 +406,8 @@ def heartbeat_monitor():
                     if reconnected and contract:
                         if ib.isConnected():
                             try:
-                                logger.info(f"Re-subscribing to real-time bars for {contract.localSymbol}")
-                                bars_subscription = ib.reqRealTimeBars(contract, barSize=5, whatToShow='TRADES', useRTH=False)
+                                logger.info(f"Re-subscribing to real-time bars for {contract.localSymbol} (RTH-only)")
+                                bars_subscription = ib.reqRealTimeBars(contract, barSize=5, whatToShow='TRADES', useRTH=True)
                                 bars_subscription.updateEvent += onBar
                                 logger.info(f"Re-subscribed to real-time bars for {contract.localSymbol}")
                                 is_data_flowing = True
@@ -674,9 +682,13 @@ if __name__ == "__main__":
             logger.error("Model failed to load! Check model path and integrity.")
             sys.exit(1)
         
-        # Set up real-time bar subscription (5 second bars)
-        logger.info(f"Setting up real-time bar subscription for {contract_obj.localSymbol}")
-        bars_subscription = ib.reqRealTimeBars(contract_obj, 5, 'TRADES', False)
+        # Set up real-time bar subscription (5 second bars).
+        # useRTH=True tells IB to deliver only regular-hours bars, matching the
+        # training distribution. The onBar handler also has a Python-side RTH
+        # guard (is_rth_bar) as belt-and-suspenders because IB's RTH filter can
+        # be imprecise around session open/close.
+        logger.info(f"Setting up real-time bar subscription for {contract_obj.localSymbol} (RTH-only)")
+        bars_subscription = ib.reqRealTimeBars(contract_obj, 5, 'TRADES', True)
         bars_subscription.updateEvent += onBar
         
         # Set up PnL monitoring

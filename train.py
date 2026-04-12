@@ -29,6 +29,14 @@ from get_data import get_data
 from utils.seeding import set_global_seed
 from utils.device import get_device
 import money
+from utils.log_format import (
+    ANSI_BOLD,
+    ANSI_GREEN,
+    ANSI_RESET,
+    bold,
+    color_value,
+    format_action_distribution,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -436,9 +444,12 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Save the initial model as the best model so far
     best_model.save(os.path.join(window_folder, "best_model"))
     
-    # Log evaluation results based on metric
-    logger.info(f"{window_label}Initial training completed. Validation {metric_name.replace('_', ' ').title()}: {best_metric_value:.2f}%, "
-                f"Validation Portfolio: ${results['final_portfolio_value']:.2f}")
+    # Log evaluation results based on metric (color-coded by sign)
+    logger.info(
+        f"{window_label}Initial training completed. "
+        f"Validation {metric_name.replace('_', ' ').title()}: {color_value(best_metric_value)}, "
+        f"Validation Portfolio: ${results['final_portfolio_value']:.2f}"
+    )
     
     # Store all results for comparison
     all_results = [results]
@@ -508,16 +519,32 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             results["is_best"] = True
             metric_stagnant_counter = 0  # Reset stagnation counter on improvement
 
-            logger.info(f"{window_label}Iter {iteration} - New best (val {metric_name}={current_metric_value:.2f}): Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}")
+            new_best_tag = f"{ANSI_BOLD}{ANSI_GREEN}\u2713 New best{ANSI_RESET}"
+            best_val_str = f"{ANSI_BOLD}{ANSI_GREEN}{current_metric_value:.2f}{ANSI_RESET}"
+            logger.info(
+                f"{window_label}Iter {iteration} - {new_best_tag} "
+                f"(val {metric_name}={best_val_str}): "
+                f"Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}, "
+                f"Trades={results['trade_count']}, Actions={{{format_action_distribution(results['action_counts'])}}}"
+            )
         elif current_metric_value > best_metric_value and not has_enough_trades:
             metric_stagnant_counter += 1
-            logger.info(f"{window_label}Iter {iteration} - Val {metric_name}={current_metric_value:.2f} but too few trades ({results['trade_count']}<{min_trades}) [no improvement {metric_stagnant_counter}/{n_stagnant_loops}]")
+            logger.info(
+                f"{window_label}Iter {iteration} - Val {metric_name}={color_value(current_metric_value)} "
+                f"but too few trades ({results['trade_count']}<{min_trades}) "
+                f"[no improvement {metric_stagnant_counter}/{n_stagnant_loops}]"
+            )
 
             # Save the best model
             best_model.save(os.path.join(window_folder, "best_model"))
         else:
             metric_stagnant_counter += 1
-            logger.info(f"{window_label}Iter {iteration} - Val {metric_name}={current_metric_value:.2f}, Train loss={current_loss:.4f} [no improvement {metric_stagnant_counter}/{n_stagnant_loops}], Portfolio=${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}, Actions={results['action_counts']}")
+            logger.info(
+                f"{window_label}Iter {iteration} - Val {metric_name}={color_value(current_metric_value)}, "
+                f"Train loss={current_loss:.4f} [no improvement {metric_stagnant_counter}/{n_stagnant_loops}], "
+                f"Portfolio=${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}, "
+                f"Actions={{{format_action_distribution(results['action_counts'])}}}"
+            )
 
         # Early stopping based on validation metric plateau (not loss)
         if metric_stagnant_counter >= n_stagnant_loops:
