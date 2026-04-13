@@ -208,9 +208,10 @@ class LSTMFeatureGenerator:
         self.pretrain_batch_size = pretrain_batch_size
         self.pretrain_patience = pretrain_patience
 
-        # Determine device (use centralized logic, avoid MPS for LSTM)
+        # Determine device for the standalone autoencoder. This path is separate
+        # from SB3 recurrent PPO, so MPS can be used when explicitly requested.
         from utils.device import get_device
-        resolved = get_device(device, for_recurrent=True)
+        resolved = get_device(device, for_recurrent=False)
         self.device = torch.device(resolved)
 
         # Input features: returns, high-low range, close-open, volume change, volatility
@@ -281,7 +282,8 @@ class LSTMFeatureGenerator:
         Pre-train the autoencoder to learn meaningful representations.
 
         Uses reconstruction loss to train the encoder to capture
-        important patterns in the data.
+        important patterns in the data. Early stopping is based on a
+        held-out validation split (20%) to prevent overfitting.
 
         Args:
             sequences: Training sequences
@@ -289,14 +291,22 @@ class LSTMFeatureGenerator:
         """
         logger.info(f"Pre-training LSTM autoencoder for up to {self.pretrain_epochs} epochs...")
 
-        # Create dataset
-        x_tensor = torch.FloatTensor(sequences).to(self.device)
-        dataset = TensorDataset(x_tensor)
-        dataloader = DataLoader(
-            dataset,
+        # Split into train/val (80/20) for early stopping on held-out data
+        split_idx = int(len(sequences) * 0.8)
+        train_sequences = sequences[:split_idx]
+        val_sequences = sequences[split_idx:]
+
+        # Create training dataset
+        x_train = torch.FloatTensor(train_sequences).to(self.device)
+        train_dataset = TensorDataset(x_train)
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=self.pretrain_batch_size,
             shuffle=True
         )
+
+        # Create validation tensor
+        x_val = torch.FloatTensor(val_sequences).to(self.device)
 
         # Optimizer and loss
         optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self.pretrain_lr)
@@ -304,19 +314,23 @@ class LSTMFeatureGenerator:
 
         # Training loop
         self.autoencoder.train()
-        best_loss = float('inf')
+        best_val_loss = float('inf')
         best_state = None
         patience_counter = 0
         patience = self.pretrain_patience
-        avg_loss = 0.0
+        min_improvement = 0.001  # Require meaningful improvement to reset patience
+
+        logger.info(f"  Train sequences: {len(train_sequences)}, Val sequences: {len(val_sequences)}")
 
         for epoch in range(self.pretrain_epochs):
-            total_loss = 0
-            num_batches = len(dataloader)
+            # --- Training phase ---
+            self.autoencoder.train()
+            total_train_loss = 0
+            num_batches = len(train_loader)
 
             # Progress bar for batches within epoch
             batch_pbar = tqdm(
-                dataloader,
+                train_loader,
                 desc=f"Epoch {epoch + 1}/{self.pretrain_epochs}",
                 unit="batch",
                 leave=False
@@ -335,20 +349,29 @@ class LSTMFeatureGenerator:
                 loss.backward()
                 optimizer.step()
 
-                total_loss += loss.item()
+                total_train_loss += loss.item()
 
                 # Update batch progress bar
                 batch_pbar.set_postfix({"batch_loss": f"{loss.item():.6f}"})
 
             batch_pbar.close()
-            avg_loss = total_loss / num_batches
+            avg_train_loss = total_train_loss / num_batches
+
+            # --- Validation phase ---
+            self.autoencoder.eval()
+            with torch.no_grad():
+                val_reconstructed, _ = self.autoencoder(x_val)
+                val_loss = criterion(val_reconstructed, x_val).item()
 
             # Log epoch results
-            logger.info(f"  Epoch {epoch + 1}/{self.pretrain_epochs} - Loss: {avg_loss:.6f} (best: {best_loss:.6f})")
+            logger.info(
+                f"  Epoch {epoch + 1}/{self.pretrain_epochs} - "
+                f"Train loss: {avg_train_loss:.6f}, Val loss: {val_loss:.6f} (best: {best_val_loss:.6f})"
+            )
 
-            # Early stopping check and checkpointing
-            if avg_loss < best_loss - 0.0001:
-                best_loss = avg_loss
+            # Early stopping based on validation loss with meaningful improvement threshold
+            if val_loss < best_val_loss - min_improvement:
+                best_val_loss = val_loss
                 patience_counter = 0
                 # Save best model state
                 best_state = {k: v.cpu().clone() for k, v in self.autoencoder.state_dict().items()}
@@ -356,19 +379,19 @@ class LSTMFeatureGenerator:
                 patience_counter += 1
 
             if patience_counter >= patience:
-                logger.info(f"  Early stopping at epoch {epoch + 1}")
+                logger.info(f"  Early stopping at epoch {epoch + 1} (val loss plateaued for {patience} epochs)")
                 break
 
         # Restore best model
         if best_state is not None:
             self.autoencoder.load_state_dict(best_state)
-            logger.info(f"Restored best model with loss: {best_loss:.6f}")
+            logger.info(f"Restored best model with val loss: {best_val_loss:.6f}")
 
         # Save checkpoint if path provided
         if checkpoint_path:
-            self._save_checkpoint(checkpoint_path, best_loss)
+            self._save_checkpoint(checkpoint_path, best_val_loss)
 
-        logger.info(f"Pre-training complete. Best loss: {best_loss:.6f}")
+        logger.info(f"Pre-training complete. Best val loss: {best_val_loss:.6f}")
         self.is_pretrained = True
 
     def _save_checkpoint(self, path: str, loss: float):
@@ -598,9 +621,10 @@ def tune_lstm_hyperparameters(
     n_trials = tuning_config.get("n_trials", 20)
     params_config = tuning_config.get("parameters", {})
 
-    # Determine device once (use centralized logic, avoid MPS for LSTM)
+    # Determine device once for the standalone LSTM autoencoder tuner.
+    preferred_device = base_config.get("device", "auto")
     from utils.device import get_device
-    device = torch.device(get_device("auto", for_recurrent=True))
+    device = torch.device(get_device(preferred_device, for_recurrent=False))
 
     logger.info(f"Starting LSTM hyperparameter tuning with {n_trials} trials on {device}")
 

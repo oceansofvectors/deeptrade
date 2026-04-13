@@ -60,6 +60,16 @@ class TradingEnv(gym.Env):
         self.data = data.reset_index(drop=True)
         self.total_steps = len(self.data) - 1  # Last valid index
 
+        reward_overrides = dict(kwargs.pop("reward_overrides", {}) or {})
+        override_mapping = {
+            "reward_loss_multiplier": "loss_multiplier",
+            "reward_turnover_penalty": "turnover_penalty",
+            "reward_calm_holding_bonus": "calm_holding_bonus",
+        }
+        for kwarg_name, reward_key in override_mapping.items():
+            if kwarg_name in kwargs and kwargs[kwarg_name] is not None:
+                reward_overrides[reward_key] = kwargs.pop(kwarg_name)
+
         # Dynamic SL/TP configuration
         dynamic_sl_tp_config = config.get("risk_management", {}).get("dynamic_sl_tp", {})
         self.dynamic_sl_tp_enabled = dynamic_sl_tp_config.get("enabled", False)
@@ -287,6 +297,8 @@ class TradingEnv(gym.Env):
 
         # Cache reward config lookups (avoid repeated config.get() in per-step reward loop)
         reward_config = config.get("reward", {})
+        if reward_overrides:
+            reward_config = {**reward_config, **reward_overrides}
         self._reward_base_scale = reward_config.get("base_scale", 500.0)
         self._reward_loss_multiplier = reward_config.get("loss_multiplier", 0.7)
         self._reward_dd_threshold = reward_config.get("drawdown_penalty_threshold", 0.03)

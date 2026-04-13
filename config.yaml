@@ -109,16 +109,17 @@ indicators:
     window: 60
   lstm_features:
     enabled: true
+    device: cpu
     lookback: 20
     hidden_size: 32
     num_layers: 1
     output_size: 8
     pretrain_epochs: 50
     pretrain_lr: 0.001
-    pretrain_batch_size: 64
+    pretrain_batch_size: 16
     pretrain_patience: 10
     tuning:
-      enabled: false
+      enabled: true
       n_trials: 20
       parameters:
         hidden_size:
@@ -148,7 +149,7 @@ indicators:
 augmentation:
   synthetic_bears:
     enabled: true
-    oversample_ratio: 0.315
+    oversample_ratio: 0.1874339780937165
     segment_length_pct: 0.13
 environment:
   initial_balance: 100000.0
@@ -159,25 +160,25 @@ execution_costs:
   base_slippage_points: 0.0
 reward:
   base_scale: 500.0
-  loss_multiplier: 0.769  # Tuned: losses at 1.77x gains
+  loss_multiplier: 0.6703325676607239
   drawdown_penalty_threshold: 0.025
   drawdown_penalty: 2.2
-  turnover_penalty: 0.011  # Tuned: low penalty to allow good entries
-  calm_holding_bonus: 0.0026  # Tuned: strong bonus for holding long in calm regimes
+  turnover_penalty: 0.02123548221376562
+  calm_holding_bonus: 0.0009554562089958106
 model:
-  ent_coef: 0.15  # Tuned
+  ent_coef: 0.11460145740744243
   ent_coef_decay: true
   final_ent_coef: 0.045
-  learning_rate: 0.000229  # Tuned
-  n_steps: 311  # Tuned
-  batch_size: 83  # Tuned
-  gamma: 0.9958  # Tuned
-  gae_lambda: 0.85
+  learning_rate: 9.671388243898781e-05
+  n_steps: 320.0
+  batch_size: 104.0
+  gamma: 0.9953645826736581
+  gae_lambda: 0.8720531198833741
   use_lr_decay: true
 sequence_model:
   enabled: true
-  lstm_hidden_size: 512  # Tuned
-  n_lstm_layers: 2  # Tuned
+  lstm_hidden_size: 64
+  n_lstm_layers: 1
   shared_lstm: false
   reset_on_new_day: false
   device: auto
@@ -219,20 +220,48 @@ walk_forward:
   enabled: true
   window_size: 120
   step_size: 24
-  max_windows: 0  # 0 = no limit
+  max_windows: 0
   parallel_processing:
     enabled: true
     n_processes: 0
     max_workers: 0
 hyperparameter_tuning:
-  enabled: false
+  enabled: true
   n_trials: 40
   tuning_timesteps: 12000
+  scope:
+    mode: dedicated_global
+    global_period:
+      start_date: null
+      end_date: null
+    train_period:
+      start_date: '2020-01-01'
+      end_date: '2023-06-30'
+    validation_period:
+      start_date: '2023-07-01'
+      end_date: '2024-06-30'
+    train_ratio: 0.8
+    validation_ratio: 0.2
+  stages:
+    reward_and_augmentation:
+      enabled: true
+      n_trials: 20
+      tuning_timesteps: 30000
+    ppo_and_sequence:
+      enabled: true
+      n_trials: 20
+      tuning_timesteps: 30000
   parallel_processing:
     enabled: true
-    n_jobs: 0  # 0 = auto-detect all CPU cores
+    n_jobs: 0
+  pruner:
+    type: median
+    n_startup_trials: 5
+    n_warmup_reports: 2
+  reporting:
+    save_trials_csv: true
+    save_trials_json: true
   parameters:
-    # Core PPO parameters
     learning_rate:
       min: 5.0e-06
       max: 0.0008
@@ -242,27 +271,33 @@ hyperparameter_tuning:
       max: 768
       log: true
     ent_coef:
-      min: 0.10
+      min: 0.1
       max: 0.25
       log: false
-    gamma:
-      min: 0.992
-      max: 0.997
+    batch_size:
+      min: 32
+      max: 128
       log: false
-    # Reward shaping (most critical)
+    gamma:
+      min: 0.98
+      max: 0.999
+      log: false
+    gae_lambda:
+      min: 0.85
+      max: 0.99
+      log: false
     reward_loss_multiplier:
-      min: 0.30
-      max: 0.80
+      min: 0.3
+      max: 0.8
       log: false
     reward_turnover_penalty:
       min: 0.008
-      max: 0.040
+      max: 0.04
       log: false
     reward_calm_holding_bonus:
       min: 0.0006
       max: 0.0032
       log: false
-    # Synthetic bears
     synthetic_oversample_ratio:
       min: 0.12
       max: 0.32

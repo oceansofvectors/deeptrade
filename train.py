@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import multiprocessing as mp
 from decimal import Decimal
 
 # Third-party imports
@@ -42,6 +43,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FEE_RATE = 0.0  # No trading fees
+
+
+def _should_avoid_subproc_vec_env(n_envs: int):
+    """Return whether SubprocVecEnv should be avoided in the current process."""
+    if n_envs <= 1:
+        return True, "n_envs <= 1"
+
+    current_process = mp.current_process()
+    if current_process.name != "MainProcess":
+        return True, f"nested worker process ({current_process.name})"
+
+    return False, None
+
+
+def _build_vectorized_env(data, env_kwargs, n_envs: int, window_label: str = ""):
+    """Build a vectorized env, falling back to DummyVecEnv when subprocesses are unsafe."""
+    def make_env(source_data, **kwargs):
+        return lambda: TradingEnv(source_data.copy(), **kwargs)
+
+    avoid_subproc, reason = _should_avoid_subproc_vec_env(n_envs)
+    env_fns = [make_env(data, **env_kwargs) for _ in range(max(1, n_envs))]
+
+    if avoid_subproc:
+        logger.info(
+            f"{window_label}Using DummyVecEnv with {len(env_fns)} envs "
+            f"(SubprocVecEnv disabled: {reason})"
+        )
+        return DummyVecEnv(env_fns)
+
+    try:
+        env = SubprocVecEnv(env_fns)
+        logger.info(f"{window_label}Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+        return env
+    except Exception as exc:
+        logger.warning(
+            f"{window_label}SubprocVecEnv startup failed ({exc.__class__.__name__}: {exc}). "
+            "Falling back to DummyVecEnv."
+        )
+        return DummyVecEnv(env_fns)
 
 
 class LossTrackingCallback(BaseCallback):
@@ -143,11 +183,7 @@ def train_agent(train_data, total_timesteps: int):
     n_envs = config.get("training", {}).get("n_envs", 4)
     env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
 
-    def make_env(data, **kwargs):
-        return lambda: TradingEnv(data.copy(), **kwargs)
-
-    env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
-    logger.info(f"Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+    env = _build_vectorized_env(train_data, env_kwargs, n_envs)
 
     # Get sequence model config
     seq_config = config.get("sequence_model", {})
@@ -272,11 +308,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     n_envs = config.get("training", {}).get("n_envs", 4)
     env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
 
-    def make_env(data, **kwargs):
-        return lambda: TradingEnv(data.copy(), **kwargs)
-
-    train_env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
-    logger.info(f"{window_label}Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+    train_env = _build_vectorized_env(train_data, env_kwargs, n_envs, window_label=window_label)
     
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
@@ -1229,4 +1261,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

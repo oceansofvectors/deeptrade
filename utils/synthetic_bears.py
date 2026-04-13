@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 def augment_with_synthetic_bears(train_df: pd.DataFrame,
                                  oversample_ratio: float = 0.3,
-                                 segment_length_pct: float = 0.15) -> pd.DataFrame:
+                                 segment_length_pct: float = 0.15,
+                                 seed: int = 42) -> pd.DataFrame:
     """
     Create synthetic bear episodes by inverting segments of the training data
     and appending them to the original training set.
@@ -31,6 +32,7 @@ def augment_with_synthetic_bears(train_df: pd.DataFrame,
                           the original training data length (default: 0.3 = 30%)
         segment_length_pct: Length of each synthetic segment as a fraction of
                             the total training data (default: 0.15 = 15%)
+        seed: Random seed for deterministic augmentation
 
     Returns:
         DataFrame: Original training data with synthetic bear segments appended
@@ -60,7 +62,7 @@ def augment_with_synthetic_bears(train_df: pd.DataFrame,
         return train_df
 
     augmented_segments = []
-    rng = np.random.default_rng(seed=42)
+    rng = np.random.default_rng(seed=seed)
 
     for i in range(num_segments):
         # Pick a random segment from the training data
@@ -97,7 +99,7 @@ def augment_with_synthetic_bears(train_df: pd.DataFrame,
     # Concatenate original + synthetic, then shuffle to avoid the model
     # learning temporal position of synthetic data
     result = pd.concat([train_df] + augmented_segments, ignore_index=True)
-    result = result.sample(frac=1.0, random_state=42).reset_index(drop=True)
+    result = result.sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
     logger.info(f"Augmented training data: {n} -> {len(result)} rows "
                 f"(+{len(result) - n} synthetic)")
