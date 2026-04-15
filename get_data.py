@@ -32,12 +32,12 @@ from indicators.minutes_since_open import calculate_minutes_since_open
 from indicators.obv import calculate_obv
 from indicators.psar import calculate_psar
 from indicators.roc import calculate_roc
-from indicators.rrcf_anomaly import calculate_rrcf_anomaly
 from indicators.rsi import calculate_rsi
 from indicators.sma import calculate_sma
 from indicators.stochastic import calculate_stochastic
 from indicators.supertrend import calculate_supertrend
 from indicators.vwap import calculate_vwap
+from indicators.opening_range import calculate_opening_range_features
 from indicators.volume import calculate_volume_indicator
 from indicators.williams_r import calculate_williams_r
 from indicators.z_score import calculate_zscore
@@ -47,6 +47,10 @@ from indicators.vol_percentile import calculate_vol_percentile
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _session_feature_config() -> dict:
+    return config.get("data", {}).get("session", {})
 
 # Helper function to ensure numeric values
 def ensure_numeric(df, columns):
@@ -302,7 +306,19 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         
         # VWAP (Volume Weighted Average Price)
         if config["indicators"].get("vwap", {}).get("enabled", False):
-            df = calculate_vwap(df, target_col='VWAP')
+            df = calculate_vwap(
+                df,
+                target_col='VWAP',
+                session_config=_session_feature_config(),
+            )
+
+        # Opening range and gap context for the configured trading session
+        if config["indicators"].get("opening_range", {}).get("enabled", False):
+            df = calculate_opening_range_features(
+                df,
+                opening_range_minutes=config["indicators"]["opening_range"].get("minutes", 30),
+                session_config=_session_feature_config(),
+            )
         
         # Calculate Supertrend indicator
         if 'supertrend' in config["indicators"] and config["indicators"]["supertrend"]["enabled"]:
@@ -315,12 +331,18 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         if config["indicators"].get("day_of_week", {}).get("enabled", True):
             df = calculate_day_of_week(df, dow_col='DOW', sin_col='DOW_SIN', cos_col='DOW_COS')
             
-        # Add minutes since cash open indicator (9:30 AM ET)
+        # Add minutes-since-session-open encoding
         if config["indicators"].get("minutes_since_open", {}).get("enabled", False):
-            df = calculate_minutes_since_open(df, sin_col='MSO_SIN', cos_col='MSO_COS')
+            df = calculate_minutes_since_open(
+                df,
+                sin_col='MSO_SIN',
+                cos_col='MSO_COS',
+                session_config=_session_feature_config(),
+            )
         
         # Add RRCF anomaly detection indicator
         if config["indicators"].get("rrcf_anomaly", {}).get("enabled", False):
+            from indicators.rrcf_anomaly import calculate_rrcf_anomaly
             rrcf_config = config["indicators"]["rrcf_anomaly"]
             df = calculate_rrcf_anomaly(
                 df, 
@@ -374,13 +396,18 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
         for indicator in ['RSI', 'CCI', 'ADX', 'ADX_POS', 'ADX_NEG', 'STOCH_K', 'STOCH_D',
                          'MACD', 'MACD_SIGNAL', 'MACD_HIST', 'ROC', 'WILLIAMS_R',
                          'SMA', 'EMA', 'DISPARITY', 'ATR', 'OBV',
-                         'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM', 'RRCF_ANOMALY', 'ZScore',
+                         'CMF', 'PSAR_DIR', 'VOLUME_NORM', 'VWAP_NORM', 'VWAP_DIST_PCT', 'VWAP_DIST_Z',
+                         'VWAP_SLOPE', 'VWAP_ABOVE', 'RRCF_ANOMALY', 'ZScore',
+                         'OPENING_RANGE_HIGH', 'OPENING_RANGE_LOW', 'OPENING_RANGE_WIDTH_PCT',
+                         'DIST_TO_OR_HIGH_PCT', 'DIST_TO_OR_LOW_PCT', 'OR_BREAKOUT_DIR',
+                         'OR_BREAKOUT_ACTIVE', 'OVERNIGHT_GAP_PCT', 'OPEN_TO_PRIOR_RANGE_PCT',
+                         'POST_OPEN_VOL_PCT',
                          'ROLLING_DD', 'VOL_PERCENTILE']:
             if indicator in df.columns:
                 model_columns.append(indicator)
 
                 # Skip indicators that are already guaranteed to be within bounds
-                if indicator not in ['supertrend', 'RSI', 'PSAR_DIR', 'RRCF_ANOMALY']:
+                if indicator not in ['supertrend', 'RSI', 'PSAR_DIR', 'RRCF_ANOMALY', 'VWAP_ABOVE', 'OR_BREAKOUT_DIR', 'OR_BREAKOUT_ACTIVE']:
                     indicators_to_normalize.append(indicator)
 
         # Note: LSTM features (LSTM_F0, LSTM_F1, etc.) are added in walk_forward.py
@@ -444,6 +471,8 @@ def get_data(symbol: str = "NQ=F",
         logger.info(f"Data split: train={train_ratio}, validation={validation_ratio}, test={1-train_ratio-validation_ratio}")
         
         # Option 1: Download data directly from Yahoo Finance
+        csv_path = config.get("data", {}).get("csv_path", "data/NQ_2024_unix.csv")
+
         if use_yfinance:
             logger.info(f"Step 1: Downloading data directly from Yahoo Finance: {symbol}")
             df = download_data(symbol, period, interval)
@@ -454,21 +483,28 @@ def get_data(symbol: str = "NQ=F",
             if df is None:
                 logger.error("Failed to download data from Yahoo Finance.")
                 # Try to fall back to CSV if available
-                if os.path.exists('data/NQ_2024_unix.csv'):
-                    logger.info("Falling back to local CSV file: data/NQ_2024_unix.csv")
-                    df = pd.read_csv('data/NQ_2024_unix.csv')
+                if os.path.exists(csv_path):
+                    logger.info(f"Falling back to local CSV file: {csv_path}")
+                    df = pd.read_csv(csv_path)
                 else:
                     return None, None, None
         
         # Option 2: Load from local CSV if download is disabled
-        elif os.path.exists('data/NQ_2024_unix.csv'):
-            logger.info("Step 1: Loading data from local CSV file: data/NQ_2024_unix.csv")
+        elif os.path.exists(csv_path):
+            logger.info(f"Step 1: Loading data from local CSV file: {csv_path}")
             # Read the CSV file, explicitly convert numeric columns
-            df = pd.read_csv('data/NQ_2024_unix.csv')
+            df = pd.read_csv(csv_path)
                 
         else:
-            logger.error("CSV file not found: data/NQ_2024_unix.csv and use_yfinance is False")
+            logger.error(f"CSV file not found: {csv_path} and use_yfinance is False")
             return None, None, None
+
+        # Normalize supported timestamp column names to the existing internal contract.
+        if 'timestamp' not in df.columns:
+            for candidate in ('ts_event', 'time'):
+                if candidate in df.columns:
+                    df = df.rename(columns={candidate: 'timestamp'})
+                    break
             
         # Ensure we have required columns
         required_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
@@ -510,6 +546,11 @@ def get_data(symbol: str = "NQ=F",
                 
             # Set timestamp as index
             df = df.set_index('timestamp')
+            df = df.sort_index()
+            if df.index.has_duplicates:
+                dup_count = int(df.index.duplicated(keep='last').sum())
+                logger.warning(f"Dropping {dup_count} duplicate timestamp rows from source CSV")
+                df = df[~df.index.duplicated(keep='last')]
             logger.info("Successfully converted timestamp column to datetime index")
         except Exception as e:
             logger.error(f"Error converting timestamp column: {e}")

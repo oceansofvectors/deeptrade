@@ -39,7 +39,12 @@ def calculate_vol_percentile(df, window=60, target_col='VOL_PERCENTILE'):
             df[target_col] = 50.0
             return df
 
-        returns = np.log(df[close_col] / df[close_col].shift(1))
+        close_series = pd.to_numeric(df[close_col], errors='coerce').astype(float)
+        prior_close = close_series.shift(1)
+        safe_ratio = close_series.divide(prior_close.replace(0.0, np.nan))
+        safe_ratio = safe_ratio.where(safe_ratio > 0.0)
+        safe_ratio = safe_ratio.replace([np.inf, -np.inf], np.nan)
+        returns = np.log(safe_ratio).replace([np.inf, -np.inf], np.nan)
         rolling_std = returns.rolling(window=window, min_periods=1).std()
         # Rank current vol vs trailing distribution, output 0-100
         df[target_col] = rolling_std.rolling(window=window, min_periods=1).rank(pct=True) * 100

@@ -6,8 +6,17 @@ making it easier to maintain and modify settings.
 """
 
 # Futures contract specifications
-NQ_POINT_VALUE = 20.0  # Dollar value per point for NQ/MNQ futures
-ES_POINT_VALUE = 50.0  # Dollar value per point for ES futures
+# Current project instrument: CME Micro Bitcoin futures (MBT).
+# Contract unit = 0.10 bitcoin, so a $1 move in quoted BTC price is worth $0.10 per contract.
+CONTRACT_SYMBOL = "MBT"
+CONTRACT_NAME = "CME Micro Bitcoin futures"
+CONTRACT_POINT_VALUE = 0.10
+CONTRACT_TICK_SIZE = 5.0
+CONTRACT_TICK_VALUE = 0.50
+
+# Legacy aliases retained for older code paths.
+NQ_POINT_VALUE = CONTRACT_POINT_VALUE
+ES_POINT_VALUE = 50.0
 
 # Trading constraints
 MIN_BALANCE_PERCENTAGE = 0.01  # Minimum balance as percentage of initial

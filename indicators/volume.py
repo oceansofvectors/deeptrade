@@ -34,6 +34,13 @@ def calculate_volume_indicator(df, ma_length=20, target_col='VOLUME_RATIO'):
 
         # Calculate volume moving average
         volume_ma = ta.sma(df[volume_col], length=ma_length)
+        if volume_ma is None:
+            logger.info(
+                "Volume MA warmup incomplete for %d rows; emitting neutral volume ratio",
+                len(df),
+            )
+            df[target_col] = 1.0
+            return df
 
         # Calculate volume ratio compared to moving average
         # volume / average => 1 means average volume, >1 is above avg, <1 is below
@@ -44,7 +51,7 @@ def calculate_volume_indicator(df, ma_length=20, target_col='VOLUME_RATIO'):
 
         return df
     except Exception as e:
-        logger.error(f"Error calculating Volume indicator: {e}")
+        logger.warning(f"Error calculating Volume indicator, falling back to neutral values: {e}")
         if target_col not in df.columns:
             df[target_col] = 1
         return df 

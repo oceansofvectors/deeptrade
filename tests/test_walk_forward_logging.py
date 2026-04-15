@@ -59,8 +59,8 @@ class TestActionDistribution(unittest.TestCase):
     def test_action_names_mapping(self):
         self.assertEqual(ACTION_NAMES[0], "BUY")
         self.assertEqual(ACTION_NAMES[1], "SELL")
-        self.assertEqual(ACTION_NAMES[2], "HOLD")
-        self.assertEqual(ACTION_NAMES[3], "FLAT")
+        self.assertEqual(ACTION_NAMES[2], "FLAT")
+        self.assertEqual(ACTION_NAMES[3], "HOLD")
 
     def test_empty_history(self):
         self.assertEqual(format_action_distribution([]), "no actions")
@@ -71,8 +71,8 @@ class TestActionDistribution(unittest.TestCase):
         s = format_action_distribution(history)
         self.assertIn("BUY=2", s)
         self.assertIn("SELL=1", s)
-        self.assertIn("HOLD=3", s)
-        self.assertIn("FLAT=1", s)
+        self.assertIn("FLAT=3", s)
+        self.assertIn("HOLD=1", s)
 
     def test_numpy_array_input(self):
         import numpy as np
@@ -80,16 +80,16 @@ class TestActionDistribution(unittest.TestCase):
         s = format_action_distribution(history)
         self.assertIn("BUY=1", s)
         self.assertIn("SELL=2", s)
-        self.assertIn("HOLD=1", s)
-        self.assertIn("FLAT=0", s)
+        self.assertIn("FLAT=1", s)
+        self.assertIn("HOLD=0", s)
 
     def test_dict_input(self):
         counts = {0: 5, 1: 0, 2: 3}
         s = format_action_distribution(counts)
         self.assertIn("BUY=5", s)
         self.assertIn("SELL=0", s)
-        self.assertIn("HOLD=3", s)
-        self.assertIn("FLAT=0", s)
+        self.assertIn("FLAT=3", s)
+        self.assertIn("HOLD=0", s)
 
 
 class TestColorValue(unittest.TestCase):

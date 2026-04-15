@@ -34,6 +34,13 @@ def calculate_adx(df, length=14, adx_col='ADX'):
 
         # Calculate ADX
         adx_result = ta.adx(df[cols['high']], df[cols['low']], df[cols['close']], length=length)
+        if adx_result is None or adx_result.empty:
+            logger.info(
+                "ADX warmup incomplete for %d rows; emitting zero-filled ADX column",
+                len(df),
+            )
+            df[adx_col] = 0.0
+            return df
 
         # Extract ADX value - handle different column naming conventions
         if f'ADX_{length}' in adx_result.columns:
@@ -46,7 +53,7 @@ def calculate_adx(df, length=14, adx_col='ADX'):
 
         return df
     except Exception as e:
-        logger.error(f"Error calculating ADX: {e}")
+        logger.warning(f"Error calculating ADX, falling back to zeros: {e}")
         if adx_col not in df.columns:
             df[adx_col] = 0.0
         return df

@@ -1,35 +1,46 @@
-# Walk-Forward Testing Scenarios
-# Each scenario defines a date-filtered slice of NQ_5min_2020_2025.csv
-# to run walk-forward testing on. All dates are inclusive.
-#
-# Volatility regimes were identified from monthly std of 5-min returns.
-# "Normal" = within 25th-75th percentile (~0.000577 to ~0.001032).
+# Walk-forward Testing Scenarios
+# BTC-oriented scenarios for the micro Bitcoin futures source dataset:
+# data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
 
 scenarios:
-  steady_bull_2021:
-    description: "2021 steady bull market - low/normal volatility"
-    data_file: data/NQ_5min_2020_2025.csv
-    start_date: "2021-01-01"
-    end_date: "2021-09-30"
+  btc_blowoff_top_2021:
+    description: "Post-May 2021 recovery into late-2021 BTC run-up and reversal"
+    data_file: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
+    start_date: "2021-05-03"
+    end_date: "2021-11-30"
 
-  post_bear_recovery_2023:
-    description: "2023 post-bear recovery - normal volatility"
-    data_file: data/NQ_5min_2020_2025.csv
+  btc_bear_market_2022:
+    description: "2022 BTC bear market and deleveraging regime"
+    data_file: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
+    start_date: "2022-01-01"
+    end_date: "2022-12-31"
+
+  btc_recovery_2023:
+    description: "2023 BTC recovery regime"
+    data_file: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
     start_date: "2023-01-01"
-    end_date: "2023-10-31"
+    end_date: "2023-12-31"
 
-  pre_aug_calm_2024:
-    description: "2024 pre-August calm - low/normal volatility"
-    data_file: data/NQ_5min_2020_2025.csv
+  btc_etf_runup_2024:
+    description: "2024 ETF-era BTC momentum and event-driven trend"
+    data_file: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
     start_date: "2024-01-01"
-    end_date: "2024-07-31"
+    end_date: "2024-06-30"
 
-  high_vol_crash_2020:
-    description: "March 2020 crash + volatility spike (extended for walk-forward window)"
-    data_file: data/NQ_5min_2020_2025.csv
-    start_date: "2020-01-02"
-    end_date: "2020-08-31"
+  btc_post_run_chop_2024:
+    description: "Late-2024 BTC chop after the ETF-driven run-up"
+    data_file: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
+    start_date: "2024-07-01"
+    end_date: "2024-12-31"
 
-  full_2020_2025:
-    description: "Full dataset - all regimes 2020-2025"
-    data_file: data/NQ_5min_2020_2025.csv
+  btc_bull_continuation_2025:
+    description: "2025 BTC continuation / expansion regime"
+    data_file: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
+    start_date: "2025-01-01"
+    end_date: "2025-12-31"
+
+  btc_full_cycle_2021_2026:
+    description: "Full available BTC micro futures dataset across multiple regimes"
+    data_file: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
+    start_date: "2021-05-03"
+    end_date: "2026-04-13"

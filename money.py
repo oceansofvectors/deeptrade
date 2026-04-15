@@ -7,9 +7,9 @@ import logging
 getcontext().prec = 28
 getcontext().rounding = ROUND_HALF_UP
 
-# Constants
-POINT_VALUE = Decimal('20.0')  # $20 per point for NQ futures
-TICK_SIZE = Decimal('0.25')    # NQ futures have 0.25 point ticks
+# Constants for the active contract.
+POINT_VALUE = Decimal('0.10')  # MBT: $0.10 per $1 bitcoin price move
+TICK_SIZE = Decimal('5.0')     # MBT: minimum outright tick is 5.0 quoted price points
 
 def to_decimal(value):
     """
@@ -54,7 +54,7 @@ def calculate_dollar_change(price_change, contracts):
     """
     Calculate dollar change based on price change and number of contracts.
     
-    For NQ futures, each full point is worth $20.
+    For MBT, each full quoted price point is worth $0.10 per contract.
     The price_change should be the raw difference between prices.
     
     Args:
@@ -67,8 +67,6 @@ def calculate_dollar_change(price_change, contracts):
     price_change = to_decimal(price_change)
     contracts = to_decimal(contracts)
     
-    # For NQ futures, each point is $20
-    # Ensure we're calculating based on the exact price difference
     return price_change * POINT_VALUE * contracts
 
 def calculate_transaction_cost(price, contracts, transaction_cost_pct):
@@ -212,7 +210,7 @@ def calculate_trailing_stop_price(reference_price, trailing_stop_pct, position):
     else:  # Short position
         return reference_price * (Decimal('1') + trailing_stop_pct / Decimal('100'))
 
-def calculate_portfolio_stop_loss_price(entry_price, stop_loss_pct, position, portfolio_value, contracts, initial_price_per_point=20.0):
+def calculate_portfolio_stop_loss_price(entry_price, stop_loss_pct, position, portfolio_value, contracts, initial_price_per_point=0.10):
     """
     Calculate stop loss price based on a percentage of the portfolio value instead of entry price.
     
@@ -222,7 +220,7 @@ def calculate_portfolio_stop_loss_price(entry_price, stop_loss_pct, position, po
         position: Position (1 for long, -1 for short)
         portfolio_value: Current portfolio value
         contracts: Number of contracts
-        initial_price_per_point: Dollar value per point (default: $20 for NQ futures)
+        initial_price_per_point: Dollar value per quoted price point (default: $0.10 for MBT)
         
     Returns:
         Decimal: Stop loss price
@@ -245,7 +243,7 @@ def calculate_portfolio_stop_loss_price(entry_price, stop_loss_pct, position, po
     else:  # Short position
         return entry_price + max_loss_points
 
-def calculate_portfolio_take_profit_price(entry_price, take_profit_pct, position, portfolio_value, contracts, initial_price_per_point=20.0):
+def calculate_portfolio_take_profit_price(entry_price, take_profit_pct, position, portfolio_value, contracts, initial_price_per_point=0.10):
     """
     Calculate take profit price based on a percentage of the portfolio value instead of entry price.
     
@@ -255,7 +253,7 @@ def calculate_portfolio_take_profit_price(entry_price, take_profit_pct, position
         position: Position (1 for long, -1 for short)
         portfolio_value: Current portfolio value
         contracts: Number of contracts
-        initial_price_per_point: Dollar value per point (default: $20 for NQ futures)
+        initial_price_per_point: Dollar value per quoted price point (default: $0.10 for MBT)
         
     Returns:
         Decimal: Take profit price

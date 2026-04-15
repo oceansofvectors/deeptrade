@@ -10,6 +10,7 @@ import pandas as pd
 import pytz
 from stable_baselines3 import PPO
 from ib_insync import MarketOrder, Order, LimitOrder, StopOrder, BracketOrder # Future, Contract may not be needed directly if ib_instance handles it
+import constants
 
 # RecurrentPPO for LSTM support
 try:
@@ -21,6 +22,7 @@ except ImportError:
 from config import config
 from get_data import process_technical_indicators # ensure_numeric is a dependency of this
 from normalization import load_scaler, normalize_data, get_standardized_column_names
+from utils.session_context import build_session_context, session_config_from_mapping
 
 try:
     from indicators.lstm_features import LSTMFeatureGenerator
@@ -113,7 +115,7 @@ class ModelTrader:
         self.time_in_position = 0
         self.last_obs_position = 0
         self.unrealized_pnl = 0.0
-        self.point_value = float(config.get("environment", {}).get("point_value", 20.0))
+        self.point_value = float(config.get("environment", {}).get("point_value", constants.CONTRACT_POINT_VALUE))
         initial_balance = float(config.get("environment", {}).get("initial_balance", 100000.0))
         self.realized_cash = initial_balance
         self.session_peak_equity = initial_balance
@@ -465,6 +467,7 @@ class ModelTrader:
             logger.info(f"Loaded LSTMFeatureGenerator with output_size={self.lstm_generator.output_size}")
         except Exception as e:
             logger.error(f"Failed to load lstm_generator.pkl: {e}")
+            logger.error("Regenerate the model bundle so lstm_generator.pkl is saved in the new LSTM VAE format.")
             self.lstm_generator = None
 
     def reset_lstm_state(self):
@@ -1214,8 +1217,7 @@ class ModelTrader:
                         # Calculate stop loss and take profit prices based on portfolio percentage
                         # For futures, we need to convert portfolio percentage to price points
                         
-                        # Point value for NQ futures ($20 per point)
-                        point_value = 20.0
+                        point_value = self.point_value
                         
                         # Calculate stop loss and take profit prices
                         stop_loss_price = None
@@ -1373,8 +1375,7 @@ class ModelTrader:
                         # Calculate stop loss and take profit prices based on portfolio percentage
                         # For futures, we need to convert portfolio percentage to price points
                         
-                        # Point value for NQ futures ($20 per point)
-                        point_value = 20.0
+                        point_value = self.point_value
                         
                         # Calculate stop loss and take profit prices
                         stop_loss_price = None
@@ -1800,42 +1801,14 @@ class ModelTrader:
                 result_df['DOW_COS'] = df.index.dayofweek.map(lambda x: np.cos(2 * np.pi * x / 7))
                 logger.info("Added DOW_SIN and DOW_COS features based on config")
             
-            # Add minutes since market open (MSO) if enabled
+            # Add minutes since configured session open (MSO) if enabled
             if config.get("indicators", {}).get("minutes_since_open", {}).get("enabled", False):
-                # Calculate minutes since market open (9:30am Eastern)
-                def minutes_since_open(dt):
-                    # Convert to Eastern time
-                    eastern = pytz.timezone('US/Eastern')
-                    # Ensure dt is timezone-aware before converting
-                    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None: # If naive
-                         dt_eastern = eastern.localize(dt) # Localize if naive (assuming it's local time to be made aware)
-                    else: # If aware
-                         dt_eastern = dt.astimezone(eastern) # Convert if already aware
-                    
-                    # Market opens at 9:30 AM ET
-                    market_open = dt_eastern.replace(hour=9, minute=30, second=0, microsecond=0)
-                    
-                    # If before market open, return 0
-                    if dt_eastern < market_open:
-                        return 0
-                        
-                    # Calculate minutes since open
-                    delta = dt_eastern - market_open
-                    minutes = delta.total_seconds() / 60
-                    
-                    # Normalize to a daily cycle (0-390, market open for 6.5 hours = 390 minutes)
-                    return min(minutes, 390)
-                
-                # Apply to each timestamp
-                # df.index might be timezone-aware (UTC from bar processing) or naive.
-                # The original code had: dt.tz_localize(pytz.UTC).tz_convert(eastern) if dt.tzinfo else eastern.localize(dt)
-                # This was problematic if dt was already localized.
-                # The updated minutes_since_open handles this.
-                mso_values = [minutes_since_open(idx.to_pydatetime()) for idx in df.index] # Convert Pandas Timestamp to python datetime
-
-                # Create cyclical features (sin/cos) for better representation
-                result_df['MSO_SIN'] = [np.sin(2 * np.pi * m / 390) for m in mso_values]
-                result_df['MSO_COS'] = [np.cos(2 * np.pi * m / 390) for m in mso_values]
+                session_cfg = session_config_from_mapping(config.get("data", {}).get("session", {}))
+                session_ctx = build_session_context(df.index, session_cfg)
+                duration = float(max(1, session_ctx["config"].session_duration_minutes))
+                minutes_norm = session_ctx["minutes_since_open"] / duration
+                result_df['MSO_SIN'] = np.sin(2 * np.pi * minutes_norm)
+                result_df['MSO_COS'] = np.cos(2 * np.pi * minutes_norm)
                 logger.info("Added MSO_SIN and MSO_COS features based on config")
             
             return result_df

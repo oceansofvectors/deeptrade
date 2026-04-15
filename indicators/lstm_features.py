@@ -26,16 +26,11 @@ import pickle
 logger = logging.getLogger(__name__)
 
 
-class LSTMAutoencoder(nn.Module):
-    """
-    LSTM Autoencoder for pre-training feature extraction.
+MODEL_FORMAT_VERSION = "lstm_vae_v2"
 
-    Architecture:
-    - Encoder: LSTM that compresses sequence into latent representation
-    - Decoder: LSTM that reconstructs the original sequence
 
-    The encoder's latent representation becomes our learned features.
-    """
+class LSTMVAE(nn.Module):
+    """LSTM variational autoencoder used for pre-training feature extraction."""
 
     def __init__(
         self,
@@ -61,8 +56,9 @@ class LSTMAutoencoder(nn.Module):
             dropout=dropout if num_layers > 1 else 0
         )
 
-        # Latent projection (encoder output)
-        self.encoder_fc = nn.Linear(hidden_size, latent_size)
+        # Latent posterior heads
+        self.encoder_mu = nn.Linear(hidden_size, latent_size)
+        self.encoder_logvar = nn.Linear(hidden_size, latent_size)
 
         # Decoder input projection
         self.decoder_fc = nn.Linear(latent_size, hidden_size)
@@ -79,32 +75,24 @@ class LSTMAutoencoder(nn.Module):
         # Output projection
         self.output_fc = nn.Linear(hidden_size, input_size)
 
-        # Activation for bounded latent space
-        self.tanh = nn.Tanh()
+    def encode_stats(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode input sequence to posterior parameters."""
+        _, (h_n, _) = self.encoder_lstm(x)
+        last_hidden = h_n[-1]
+        mu = self.encoder_mu(last_hidden)
+        logvar = torch.clamp(self.encoder_logvar(last_hidden), min=-10.0, max=10.0)
+        return mu, logvar
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Sample latent vector using the reparameterization trick."""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Encode input sequence to latent representation.
-
-        Args:
-            x: Input tensor of shape (batch, seq_len, input_size)
-
-        Returns:
-            Latent tensor of shape (batch, latent_size)
-        """
-        # Encode sequence
-        _, (h_n, _) = self.encoder_lstm(x)
-
-        # Use last hidden state
-        last_hidden = h_n[-1]  # (batch, hidden_size)
-
-        # Project to latent space
-        latent = self.encoder_fc(last_hidden)
-
-        # Bound to [-1, 1]
-        latent = self.tanh(latent)
-
-        return latent
+        """Encode input sequence deterministically to posterior mean."""
+        mu, _ = self.encode_stats(x)
+        return mu
 
     def decode(self, latent: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
@@ -133,20 +121,13 @@ class LSTMAutoencoder(nn.Module):
 
         return output
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Full forward pass: encode then decode.
-
-        Args:
-            x: Input tensor of shape (batch, seq_len, input_size)
-
-        Returns:
-            Tuple of (reconstructed, latent)
-        """
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full VAE forward pass returning reconstruction and posterior stats."""
         seq_len = x.shape[1]
-        latent = self.encode(x)
+        mu, logvar = self.encode_stats(x)
+        latent = self.reparameterize(mu, logvar)
         reconstructed = self.decode(latent, seq_len)
-        return reconstructed, latent
+        return reconstructed, mu, logvar
 
 
 class LSTMFeatureExtractor(nn.Module):
@@ -154,7 +135,7 @@ class LSTMFeatureExtractor(nn.Module):
     Wrapper that uses the encoder part of a trained autoencoder.
     """
 
-    def __init__(self, autoencoder: LSTMAutoencoder):
+    def __init__(self, autoencoder: LSTMVAE):
         super().__init__()
         self.autoencoder = autoencoder
 
@@ -183,7 +164,11 @@ class LSTMFeatureGenerator:
         pretrain_epochs: int = 50,
         pretrain_lr: float = 0.001,
         pretrain_batch_size: int = 64,
-        pretrain_patience: int = 10
+        pretrain_patience: int = 10,
+        pretrain_min_delta: float = 0.0001,
+        pretrain_verbose: bool = True,
+        beta: float = 0.001,
+        kl_warmup_epochs: int = 10,
     ):
         """
         Initialize the LSTM feature generator.
@@ -198,6 +183,10 @@ class LSTMFeatureGenerator:
             pretrain_lr: Learning rate for pre-training
             pretrain_batch_size: Batch size for pre-training
             pretrain_patience: Early stopping patience (epochs without improvement)
+            pretrain_min_delta: Minimum loss improvement required to reset patience
+            pretrain_verbose: Whether to log per-epoch autoencoder progress
+            beta: KL divergence weight for Beta-VAE pretraining
+            kl_warmup_epochs: Number of epochs to ramp KL weight from 0 to beta
         """
         self.lookback = lookback
         self.hidden_size = hidden_size
@@ -207,6 +196,10 @@ class LSTMFeatureGenerator:
         self.pretrain_lr = pretrain_lr
         self.pretrain_batch_size = pretrain_batch_size
         self.pretrain_patience = pretrain_patience
+        self.pretrain_min_delta = pretrain_min_delta
+        self.pretrain_verbose = pretrain_verbose
+        self.beta = beta
+        self.kl_warmup_epochs = kl_warmup_epochs
 
         # Determine device (use centralized logic, avoid MPS for LSTM)
         from utils.device import get_device
@@ -216,8 +209,8 @@ class LSTMFeatureGenerator:
         # Input features: returns, high-low range, close-open, volume change, volatility
         self.input_size = 5
 
-        # Initialize autoencoder
-        self.autoencoder = LSTMAutoencoder(
+        # Initialize VAE
+        self.autoencoder = LSTMVAE(
             input_size=self.input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
@@ -228,6 +221,27 @@ class LSTMFeatureGenerator:
         self.input_mean = None
         self.input_std = None
         self.is_pretrained = False
+
+    def _current_kl_weight(self, epoch_idx: int) -> float:
+        """Return the epoch-specific KL weight."""
+        if self.kl_warmup_epochs <= 0:
+            return self.beta
+        progress = min(1.0, float(epoch_idx + 1) / float(self.kl_warmup_epochs))
+        return self.beta * progress
+
+    @staticmethod
+    def _vae_loss(
+        reconstructed: torch.Tensor,
+        target: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        kl_weight: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return total, reconstruction, and KL losses."""
+        recon_loss = nn.functional.mse_loss(reconstructed, target)
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        total_loss = recon_loss + (kl_weight * kl_loss)
+        return total_loss, recon_loss, kl_loss
 
     def _prepare_input(self, df: pd.DataFrame) -> np.ndarray:
         """
@@ -243,17 +257,36 @@ class LSTMFeatureGenerator:
         low_col = 'low' if 'low' in df.columns else 'Low'
         vol_col = 'volume' if 'volume' in df.columns else 'Volume'
 
-        # Calculate normalized features
-        returns = df[close_col].pct_change().fillna(0).values
-        hl_range = ((df[high_col] - df[low_col]) / df[close_col]).fillna(0).values
-        co_diff = ((df[close_col] - df[open_col]) / df[close_col]).fillna(0).values
-        vol_change = df[vol_col].pct_change().fillna(0).values
+        close = pd.to_numeric(df[close_col], errors='coerce').astype(float)
+        open_ = pd.to_numeric(df[open_col], errors='coerce').astype(float)
+        high = pd.to_numeric(df[high_col], errors='coerce').astype(float)
+        low = pd.to_numeric(df[low_col], errors='coerce').astype(float)
+        volume = pd.to_numeric(df[vol_col], errors='coerce').astype(float)
+
+        safe_close = close.replace(0.0, np.nan)
+
+        # Calculate normalized features with finite-value cleanup.
+        returns = close.pct_change()
+        hl_range = (high - low) / safe_close
+        co_diff = (close - open_) / safe_close
+        vol_change = volume.pct_change()
 
         # Rolling volatility (std of returns over short window)
-        volatility = pd.Series(returns).rolling(5, min_periods=1).std().fillna(0).values
+        volatility = pd.Series(returns).rolling(5, min_periods=1).std()
+
+        def _clean(series: pd.Series) -> np.ndarray:
+            cleaned = series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            return cleaned.to_numpy(dtype=np.float32, copy=False)
 
         # Stack features
-        features = np.column_stack([returns, hl_range, co_diff, vol_change, volatility])
+        features = np.column_stack([
+            _clean(returns),
+            _clean(hl_range),
+            _clean(co_diff),
+            _clean(vol_change),
+            _clean(volatility),
+        ])
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
         return features
 
@@ -276,7 +309,52 @@ class LSTMFeatureGenerator:
 
         return np.array(sequences)
 
-    def _pretrain_autoencoder(self, sequences: np.ndarray, checkpoint_path: str = None):
+    def _normalize_features(self, features: np.ndarray) -> np.ndarray:
+        """Normalize raw features using train-only statistics."""
+        if self.input_mean is None or self.input_std is None:
+            raise ValueError("Normalization statistics are not initialized")
+
+        features_norm = (features - self.input_mean) / self.input_std
+        features_norm = np.nan_to_num(features_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.clip(features_norm, -5, 5)
+
+    def _prepare_sequence_splits(
+        self,
+        train_df: pd.DataFrame,
+        validation_df: Optional[pd.DataFrame] = None,
+        fallback_validation_ratio: float = 0.2
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Build train/validation sequences using normalization statistics fit on train only.
+
+        If validation_df is not provided, keep a tail slice of the training sequences for
+        validation so callers that only provide one frame still use a standard train/val flow.
+        """
+        train_features = self._prepare_input(train_df)
+        self.input_mean = np.nan_to_num(np.mean(train_features, axis=0), nan=0.0, posinf=0.0, neginf=0.0)
+        self.input_std = np.nan_to_num(np.std(train_features, axis=0), nan=1.0, posinf=1.0, neginf=1.0)
+        self.input_std = np.where(self.input_std < 1e-8, 1.0, self.input_std)
+
+        train_sequences = self._create_sequences(self._normalize_features(train_features))
+        validation_sequences = None
+
+        if validation_df is not None and len(validation_df) >= self.lookback:
+            validation_features = self._prepare_input(validation_df)
+            validation_sequences = self._create_sequences(self._normalize_features(validation_features))
+        elif len(train_sequences) >= 10:
+            split_idx = max(1, int(len(train_sequences) * (1 - fallback_validation_ratio)))
+            split_idx = min(split_idx, len(train_sequences) - 1)
+            validation_sequences = train_sequences[split_idx:]
+            train_sequences = train_sequences[:split_idx]
+
+        return train_sequences, validation_sequences
+
+    def _pretrain_autoencoder(
+        self,
+        train_sequences: np.ndarray,
+        validation_sequences: Optional[np.ndarray] = None,
+        checkpoint_path: str = None
+    ) -> float:
         """
         Pre-train the autoencoder to learn meaningful representations.
 
@@ -284,71 +362,100 @@ class LSTMFeatureGenerator:
         important patterns in the data.
 
         Args:
-            sequences: Training sequences
+            train_sequences: Training sequences
+            validation_sequences: Optional validation sequences for early stopping
             checkpoint_path: Path to save best model checkpoint
         """
-        logger.info(f"Pre-training LSTM autoencoder for up to {self.pretrain_epochs} epochs...")
+        logger.info(f"Pre-training LSTM VAE for up to {self.pretrain_epochs} epochs...")
 
-        # Create dataset
-        x_tensor = torch.FloatTensor(sequences).to(self.device)
-        dataset = TensorDataset(x_tensor)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.pretrain_batch_size,
-            shuffle=True
-        )
+        if len(train_sequences) == 0:
+            raise ValueError("Not enough data to build LSTM training sequences")
+
+        train_tensor = torch.FloatTensor(train_sequences).to(self.device)
+        train_dataset = TensorDataset(train_tensor)
+        train_loader = DataLoader(train_dataset, batch_size=self.pretrain_batch_size, shuffle=True)
+
+        val_tensor = None
+        if validation_sequences is not None and len(validation_sequences) > 0:
+            val_tensor = torch.FloatTensor(validation_sequences).to(self.device)
 
         # Optimizer and loss
         optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self.pretrain_lr)
-        criterion = nn.MSELoss()
-
         # Training loop
         self.autoencoder.train()
-        best_loss = float('inf')
         best_state = None
         patience_counter = 0
         patience = self.pretrain_patience
-        avg_loss = 0.0
+        min_delta = self.pretrain_min_delta
+        best_metric = float('inf')
 
         for epoch in range(self.pretrain_epochs):
-            total_loss = 0
-            num_batches = len(dataloader)
+            total_train_loss = 0.0
+            num_batches = len(train_loader)
 
             # Progress bar for batches within epoch
             batch_pbar = tqdm(
-                dataloader,
+                train_loader,
                 desc=f"Epoch {epoch + 1}/{self.pretrain_epochs}",
                 unit="batch",
-                leave=False
+                leave=False,
+                disable=not self.pretrain_verbose,
             )
 
             for (batch_x,) in batch_pbar:
                 optimizer.zero_grad()
 
                 # Forward pass
-                reconstructed, latent = self.autoencoder(batch_x)
-
-                # Reconstruction loss
-                loss = criterion(reconstructed, batch_x)
+                reconstructed, mu, logvar = self.autoencoder(batch_x)
+                kl_weight = self._current_kl_weight(epoch)
+                loss, _, _ = self._vae_loss(reconstructed, batch_x, mu, logvar, kl_weight)
 
                 # Backward pass
                 loss.backward()
                 optimizer.step()
 
-                total_loss += loss.item()
+                total_train_loss += loss.item()
 
                 # Update batch progress bar
-                batch_pbar.set_postfix({"batch_loss": f"{loss.item():.6f}"})
+                if self.pretrain_verbose:
+                    batch_pbar.set_postfix({"batch_loss": f"{loss.item():.6f}"})
 
             batch_pbar.close()
-            avg_loss = total_loss / num_batches
+            avg_train_loss = total_train_loss / num_batches
+
+            val_loss = None
+            if val_tensor is not None:
+                self.autoencoder.eval()
+                with torch.no_grad():
+                    reconstructed_val, mu_val, logvar_val = self.autoencoder(val_tensor)
+                    val_loss = self._vae_loss(
+                        reconstructed_val,
+                        val_tensor,
+                        mu_val,
+                        logvar_val,
+                        self.beta,
+                    )[0].item()
+                self.autoencoder.train()
+
+            monitor_loss = val_loss if val_loss is not None else avg_train_loss
 
             # Log epoch results
-            logger.info(f"  Epoch {epoch + 1}/{self.pretrain_epochs} - Loss: {avg_loss:.6f} (best: {best_loss:.6f})")
+            if self.pretrain_verbose:
+                if val_loss is not None:
+                    logger.info(
+                        f"  Epoch {epoch + 1}/{self.pretrain_epochs} - "
+                        f"Train VAE Loss: {avg_train_loss:.6f}, Val VAE Loss: {val_loss:.6f} "
+                        f"(best val: {best_metric:.6f})"
+                    )
+                else:
+                    logger.info(
+                        f"  Epoch {epoch + 1}/{self.pretrain_epochs} - "
+                        f"Train VAE Loss: {avg_train_loss:.6f} (best: {best_metric:.6f})"
+                    )
 
             # Early stopping check and checkpointing
-            if avg_loss < best_loss - 0.0001:
-                best_loss = avg_loss
+            if monitor_loss < best_metric - min_delta:
+                best_metric = monitor_loss
                 patience_counter = 0
                 # Save best model state
                 best_state = {k: v.cpu().clone() for k, v in self.autoencoder.state_dict().items()}
@@ -362,20 +469,22 @@ class LSTMFeatureGenerator:
         # Restore best model
         if best_state is not None:
             self.autoencoder.load_state_dict(best_state)
-            logger.info(f"Restored best model with loss: {best_loss:.6f}")
+            logger.info(f"Restored best model with monitored loss: {best_metric:.6f}")
 
         # Save checkpoint if path provided
         if checkpoint_path:
-            self._save_checkpoint(checkpoint_path, best_loss)
+            self._save_checkpoint(checkpoint_path, best_metric)
 
-        logger.info(f"Pre-training complete. Best loss: {best_loss:.6f}")
+        logger.info(f"Pre-training complete. Best monitored VAE loss: {best_metric:.6f}")
         self.is_pretrained = True
+        return best_metric
 
     def _save_checkpoint(self, path: str, loss: float):
         """Save a training checkpoint."""
         import os
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
         checkpoint = {
+            'model_format': MODEL_FORMAT_VERSION,
             'autoencoder_state': self.autoencoder.state_dict(),
             'input_mean': self.input_mean,
             'input_std': self.input_std,
@@ -385,53 +494,45 @@ class LSTMFeatureGenerator:
             'output_size': self.output_size,
             'input_size': self.input_size,
             'is_pretrained': self.is_pretrained,
+            'pretrain_min_delta': self.pretrain_min_delta,
+            'beta': self.beta,
+            'kl_warmup_epochs': self.kl_warmup_epochs,
             'best_loss': loss
         }
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path} (loss: {loss:.6f})")
 
-    def fit(self, df: pd.DataFrame, checkpoint_path: str = None, warm_start_path: str = None):
+    def fit(
+        self,
+        train_df: pd.DataFrame,
+        validation_df: Optional[pd.DataFrame] = None,
+        checkpoint_path: str = None
+    ):
         """
         Fit the feature extractor on training data.
 
         This includes:
-        1. Computing normalization statistics (always from current data)
-        2. Optionally warm-starting from a previous window's weights
-        3. Pre-training the autoencoder
+        1. Computing normalization statistics from train data only
+        2. Pre-training the autoencoder from scratch on train sequences
+        3. Early stopping/model selection on validation sequences
         4. Saving checkpoint if path provided
 
         Args:
-            df: Training DataFrame with OHLCV data
+            train_df: Training DataFrame with OHLCV data
+            validation_df: Optional validation DataFrame for monitored pretraining
             checkpoint_path: Optional path to save the trained model checkpoint
-            warm_start_path: Optional path to previous window's checkpoint to initialize weights from
         """
-        # Prepare input features
-        features = self._prepare_input(df)
-
-        # Compute normalization statistics (always from current data, never inherited)
-        self.input_mean = np.mean(features, axis=0)
-        self.input_std = np.std(features, axis=0) + 1e-8
-
-        # Warm-start from previous window's weights if available
-        if warm_start_path and os.path.exists(warm_start_path):
-            try:
-                checkpoint = torch.load(warm_start_path, map_location=self.device, weights_only=False)
-                self.autoencoder.load_state_dict(checkpoint['autoencoder_state'])
-                logger.info(f"Warm-started LSTM from {warm_start_path} (prev loss: {checkpoint.get('best_loss', 'N/A')})")
-            except Exception as e:
-                logger.warning(f"Failed to warm-start LSTM from {warm_start_path}: {e}. Training from scratch.")
-
-        # Normalize
-        features_norm = (features - self.input_mean) / self.input_std
-        features_norm = np.clip(features_norm, -5, 5)
-
-        # Create sequences
-        sequences = self._create_sequences(features_norm)
-
-        # Pre-train the autoencoder
-        self._pretrain_autoencoder(sequences, checkpoint_path=checkpoint_path)
-
-        logger.info(f"LSTM feature extractor fitted and pre-trained on {len(df)} samples")
+        train_sequences, validation_sequences = self._prepare_sequence_splits(train_df, validation_df)
+        self._pretrain_autoencoder(
+            train_sequences=train_sequences,
+            validation_sequences=validation_sequences,
+            checkpoint_path=checkpoint_path
+        )
+        logger.info(
+            "LSTM feature extractor fitted on %d train samples%s",
+            len(train_df),
+            f" with {len(validation_df)} validation samples" if validation_df is not None else ""
+        )
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -496,6 +597,7 @@ class LSTMFeatureGenerator:
     def save(self, path: str):
         """Save the model and normalizer statistics."""
         state = {
+            'model_format': MODEL_FORMAT_VERSION,
             'autoencoder_state': self.autoencoder.state_dict(),
             'input_mean': self.input_mean,
             'input_std': self.input_std,
@@ -504,7 +606,10 @@ class LSTMFeatureGenerator:
             'num_layers': self.num_layers,
             'output_size': self.output_size,
             'input_size': self.input_size,
-            'is_pretrained': self.is_pretrained
+            'is_pretrained': self.is_pretrained,
+            'pretrain_min_delta': self.pretrain_min_delta,
+            'beta': self.beta,
+            'kl_warmup_epochs': self.kl_warmup_epochs,
         }
         with open(path, 'wb') as f:
             pickle.dump(state, f)
@@ -515,6 +620,11 @@ class LSTMFeatureGenerator:
         with open(path, 'rb') as f:
             state = pickle.load(f)
 
+        if state.get('model_format') != MODEL_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported LSTM generator bundle format. Regenerate LSTM artifacts with the new VAE feature generator."
+            )
+
         self.input_mean = state['input_mean']
         self.input_std = state['input_std']
         self.lookback = state['lookback']
@@ -523,9 +633,12 @@ class LSTMFeatureGenerator:
         self.output_size = state['output_size']
         self.input_size = state['input_size']
         self.is_pretrained = state.get('is_pretrained', False)
+        self.pretrain_min_delta = state.get('pretrain_min_delta', 0.0001)
+        self.beta = state.get('beta', 0.001)
+        self.kl_warmup_epochs = state.get('kl_warmup_epochs', 10)
 
-        # Recreate autoencoder with correct dimensions
-        self.autoencoder = LSTMAutoencoder(
+        # Recreate VAE with correct dimensions
+        self.autoencoder = LSTMVAE(
             input_size=self.input_size,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
@@ -576,6 +689,7 @@ def calculate_lstm_features(
 
 def tune_lstm_hyperparameters(
     train_data: pd.DataFrame,
+    validation_data: Optional[pd.DataFrame],
     tuning_config: dict,
     base_config: dict,
     window_folder: str = None
@@ -585,6 +699,7 @@ def tune_lstm_hyperparameters(
 
     Args:
         train_data: Training DataFrame with OHLCV data
+        validation_data: Validation DataFrame with OHLCV data
         tuning_config: Tuning configuration with parameters to search
         base_config: Base LSTM config for defaults
         window_folder: Optional folder to save study results
@@ -641,6 +756,17 @@ def tune_lstm_hyperparameters(
         else:
             pretrain_lr = base_config.get("pretrain_lr", 0.001)
 
+        beta_config = params_config.get("beta", {})
+        if "min" in beta_config:
+            beta = trial.suggest_float(
+                "beta",
+                beta_config["min"],
+                beta_config["max"],
+                log=beta_config.get("log", True)
+            )
+        else:
+            beta = base_config.get("beta", 0.001)
+
         # Create generator with trial parameters
         generator = LSTMFeatureGenerator(
             lookback=lookback,
@@ -651,68 +777,31 @@ def tune_lstm_hyperparameters(
             pretrain_epochs=base_config.get("pretrain_epochs", 50),
             pretrain_lr=pretrain_lr,
             pretrain_batch_size=base_config.get("pretrain_batch_size", 64),
-            pretrain_patience=base_config.get("pretrain_patience", 10)
+            pretrain_patience=base_config.get("pretrain_patience", 10),
+            pretrain_min_delta=base_config.get("pretrain_min_delta", 0.0001),
+            pretrain_verbose=False,
+            beta=beta,
+            kl_warmup_epochs=base_config.get("kl_warmup_epochs", 10),
         )
 
-        # Prepare data for training
-        features = generator._prepare_input(train_data)
-        generator.input_mean = np.mean(features, axis=0)
-        generator.input_std = np.std(features, axis=0) + 1e-8
-        features_norm = (features - generator.input_mean) / generator.input_std
-        features_norm = np.clip(features_norm, -5, 5)
-        sequences = generator._create_sequences(features_norm)
-
-        # Split into train/val for tuning
-        split_idx = int(len(sequences) * 0.8)
-        train_seq = sequences[:split_idx]
-        val_seq = sequences[split_idx:]
-
         # Train with reduced epochs for tuning
-        tuning_epochs = min(20, base_config.get("pretrain_epochs", 50))
+        generator.pretrain_epochs = min(20, base_config.get("pretrain_epochs", 50))
+        generator.pretrain_patience = min(5, base_config.get("pretrain_patience", 10))
 
-        x_train = torch.FloatTensor(train_seq).to(device)
-        x_val = torch.FloatTensor(val_seq).to(device)
+        train_sequences, validation_sequences = generator._prepare_sequence_splits(
+            train_df=train_data,
+            validation_df=validation_data
+        )
 
-        train_dataset = TensorDataset(x_train)
-        train_loader = DataLoader(train_dataset, batch_size=generator.pretrain_batch_size, shuffle=True)
+        best_val_loss = generator._pretrain_autoencoder(
+            train_sequences=train_sequences,
+            validation_sequences=validation_sequences,
+            checkpoint_path=None
+        )
 
-        optimizer = torch.optim.Adam(generator.autoencoder.parameters(), lr=pretrain_lr)
-        criterion = nn.MSELoss()
-
-        generator.autoencoder.train()
-        best_val_loss = float('inf')
-        patience_counter = 0
-
-        for epoch in range(tuning_epochs):
-            # Training
-            for (batch_x,) in train_loader:
-                optimizer.zero_grad()
-                reconstructed, _ = generator.autoencoder(batch_x)
-                loss = criterion(reconstructed, batch_x)
-                loss.backward()
-                optimizer.step()
-
-            # Validation
-            generator.autoencoder.eval()
-            with torch.no_grad():
-                val_reconstructed, _ = generator.autoencoder(x_val)
-                val_loss = criterion(val_reconstructed, x_val).item()
-            generator.autoencoder.train()
-
-            # Early stopping
-            if val_loss < best_val_loss - 0.0001:
-                best_val_loss = val_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if patience_counter >= 5:
-                break
-
-            # Report intermediate value for pruning
-            trial.report(val_loss, epoch)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
+        trial.report(best_val_loss, generator.pretrain_epochs)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
 
         return best_val_loss
 
@@ -752,9 +841,12 @@ def tune_lstm_hyperparameters(
         "num_layers": best_params.get("num_layers", base_config.get("num_layers", 1)),
         "output_size": best_params.get("output_size", base_config.get("output_size", 8)),
         "pretrain_lr": best_params.get("pretrain_lr", base_config.get("pretrain_lr", 0.001)),
+        "beta": best_params.get("beta", base_config.get("beta", 0.001)),
         "pretrain_epochs": base_config.get("pretrain_epochs", 50),
         "pretrain_batch_size": base_config.get("pretrain_batch_size", 64),
-        "pretrain_patience": base_config.get("pretrain_patience", 10)
+        "pretrain_patience": base_config.get("pretrain_patience", 10),
+        "pretrain_min_delta": base_config.get("pretrain_min_delta", 0.0001),
+        "kl_warmup_epochs": base_config.get("kl_warmup_epochs", 10),
     }
 
     return final_params

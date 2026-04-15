@@ -98,9 +98,13 @@ class TestNormalization(unittest.TestCase):
         self.assertTrue(train_scaled['indicator2'].min() >= -1)
         self.assertTrue(train_scaled['indicator2'].max() <= 1)
         
-        # Out-of-range values may exist in test data since it has more extreme values
-        self.assertTrue(test_scaled['indicator1'].min() < -1 or test_scaled['indicator1'].max() > 1 or
-                       test_scaled['indicator2'].min() < -1 or test_scaled['indicator2'].max() > 1)
+        # With the default robust scaler + tanh clipping, test values should remain bounded.
+        self.assertTrue(np.isfinite(test_scaled['indicator1']).all())
+        self.assertTrue(np.isfinite(test_scaled['indicator2']).all())
+        self.assertTrue(test_scaled['indicator1'].min() >= -1)
+        self.assertTrue(test_scaled['indicator1'].max() <= 1)
+        self.assertTrue(test_scaled['indicator2'].min() >= -1)
+        self.assertTrue(test_scaled['indicator2'].max() <= 1)
         
         # Check that non-scaled columns are unchanged
         np.testing.assert_array_equal(self.train_data['close'].values, train_scaled['close'].values)

@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepTrade White Paper</title>
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #5b6670;
+      --line: #cfd6dd;
+      --accent: #17324d;
+      --paper: #ffffff;
+      --shade: #f4f7fa;
+    }
+
+    @page {
+      margin: 0.8in;
+      size: Letter;
+    }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: "Liberation Serif", Georgia, serif;
+      font-size: 11pt;
+      line-height: 1.45;
+    }
+
+    main {
+      max-width: 8.2in;
+      margin: 0 auto;
+      padding: 0.2in 0.15in 0.4in;
+    }
+
+    h1, h2, h3 {
+      color: var(--accent);
+      margin: 0 0 0.15rem;
+      font-weight: 700;
+    }
+
+    h1 {
+      font-size: 20pt;
+      text-align: center;
+      margin-top: 0.2rem;
+    }
+
+    h2 {
+      font-size: 13.5pt;
+      margin-top: 1rem;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 0.12rem;
+    }
+
+    h3 {
+      font-size: 11.5pt;
+      margin-top: 0.7rem;
+    }
+
+    p {
+      margin: 0.28rem 0;
+      text-align: justify;
+    }
+
+    .subtitle, .meta {
+      text-align: center;
+      color: var(--muted);
+    }
+
+    .subtitle {
+      font-style: italic;
+      margin-top: 0.15rem;
+    }
+
+    .meta {
+      font-size: 9.5pt;
+      margin-top: 0.25rem;
+    }
+
+    .abstract, .box {
+      background: var(--shade);
+      border: 1px solid var(--line);
+      padding: 0.55rem 0.7rem;
+      margin: 0.8rem 0;
+    }
+
+    .abstract strong {
+      color: var(--accent);
+    }
+
+    ul, ol {
+      margin: 0.35rem 0 0.45rem 1.25rem;
+    }
+
+    li {
+      margin: 0.18rem 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0.45rem 0 0.7rem;
+      font-size: 10pt;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 0.35rem 0.45rem;
+      vertical-align: top;
+    }
+
+    th {
+      background: #e9eef4;
+      text-align: left;
+      color: var(--accent);
+    }
+
+    code {
+      font-family: "Liberation Mono", "Courier New", monospace;
+      font-size: 9.3pt;
+      background: #eef2f6;
+      padding: 0.03rem 0.16rem;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 9.4pt;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DeepTrade</h1>
+    <div class="subtitle">A Reinforcement-Learning Trading System for Intraday Nasdaq Futures</div>
+    <div class="meta">Technical white paper prepared from repository inspection on April 13, 2026</div>
+
+    <section class="abstract">
+      <p><strong>Abstract.</strong> DeepTrade is an intraday algorithmic trading research system centered on a custom reinforcement-learning environment for Nasdaq futures data. The project combines engineered technical indicators, per-window normalization, optional sequence features from an LSTM autoencoder, policy optimization with PPO or RecurrentPPO, Optuna-based hyperparameter search, and anchored walk-forward evaluation. The implementation is designed to learn directional position control rather than supervised next-bar labels alone: at each bar the policy decides whether to be long, short, or flat, while the environment converts that decision into portfolio evolution under commissions, spread assumptions, drawdown-aware rewards, and optional stop-loss or take-profit logic. This paper documents the implemented pipeline, the current configuration, the evaluation methodology, and the major strengths and limitations visible in the codebase.</p>
+    </section>
+
+    <h2>1. Introduction</h2>
+    <p>The repository implements a full research loop for short-horizon systematic trading. Its goal is not merely to predict price direction but to produce a deployable policy that can manage position state over time under transaction frictions and risk controls. The primary target instrument in the current code is Nasdaq futures data, with the environment using the configured point value for NQ contracts and a default starting balance of USD 100,000.</p>
+    <p>The project architecture is modular. Data ingestion and indicator computation live in <code>get_data.py</code>, normalization in <code>normalization.py</code>, the custom trading simulator in <code>environment.py</code>, model training in <code>train.py</code>, walk-forward evaluation and tuning in <code>walk_forward.py</code>, and optional ex-post risk overlays in <code>trade.py</code> and <code>risk_model.py</code>. The resulting system is closer to a research platform than a single standalone model.</p>
+
+    <h2>2. System Overview</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Component</th>
+          <th>Role in the pipeline</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Data ingestion</td>
+          <td>Loads TradingView or Yahoo Finance OHLCV data, converts timestamps, verifies schema, and filters to market hours when configured.</td>
+        </tr>
+        <tr>
+          <td>Feature engineering</td>
+          <td>Computes a configurable set of technical indicators and regime features, and optionally learns compressed temporal features with an LSTM autoencoder.</td>
+        </tr>
+        <tr>
+          <td>Normalization</td>
+          <td>Fits scaling transforms on training data only within each walk-forward window to reduce leakage and stabilize learning.</td>
+        </tr>
+        <tr>
+          <td>RL environment</td>
+          <td>Maps actions to long, short, or flat position control; tracks P&amp;L, turnover, drawdown, execution costs, and reward shaping.</td>
+        </tr>
+        <tr>
+          <td>Policy learning</td>
+          <td>Uses PPO or RecurrentPPO with configurable entropy and learning-rate decay, multi-environment rollouts, and iterative validation-based model selection.</td>
+        </tr>
+        <tr>
+          <td>Hyperparameter optimization</td>
+          <td>Uses Optuna to search policy, reward, and augmentation parameters against a validation objective.</td>
+        </tr>
+        <tr>
+          <td>Walk-forward testing</td>
+          <td>Performs anchored windowed training and out-of-sample testing, aggregates metrics, and saves reports and plots.</td>
+        </tr>
+        <tr>
+          <td>Risk overlays</td>
+          <td>Supports stop loss, take profit, trailing stop, position sizing, and a separate experimental risk-filter model.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>3. Data Pipeline and Feature Space</h2>
+    <h3>3.1 Data sources and preprocessing</h3>
+    <p>The default workflow loads a local TradingView export or CSV file containing intraday OHLCV bars. The processing layer standardizes timestamps, converts price columns to numeric types, removes incomplete rows, computes indicators, trims early warm-up rows, and then splits the resulting series into training, validation, and testing segments. The code can also download fresh data with Yahoo Finance, although the main walk-forward entry point is structured around local TradingView-format data.</p>
+    <p>The current configuration applies market-hours filtering and an embargo between validation and test segments inside the walk-forward loop. This is materially important: it makes the reported performance closer to a realistic intraday evaluation protocol than a naïve contiguous train-test split.</p>
+
+    <h3>3.2 Technical indicators</h3>
+    <p>The feature pipeline is intentionally configurable. The inspected configuration enables RSI, ADX, MACD, ATR, a volume-derived feature, day-of-week encoding, minutes-since-open encoding, rolling drawdown, volatility percentile, and learned LSTM features. Other indicators such as CCI, stochastic oscillators, OBV, VWAP, Williams %R, and anomaly features exist in the repository and can be switched on without architectural changes.</p>
+    <p>Two regime-aware features deserve emphasis. Rolling drawdown gives the model a compact measure of local market stress or distance from recent highs, while volatility percentile gives a normalized estimate of how calm or turbulent the recent market regime has been. These features are used not only in the observation space but also indirectly in reward shaping.</p>
+
+    <h3>3.3 Learned sequence features</h3>
+    <p>The project includes an LSTM feature generator trained as an autoencoder on each window’s training data. That generator compresses a lookback sequence into a lower-dimensional latent representation that is appended to the engineered indicators as <code>LSTM_F0</code>, <code>LSTM_F1</code>, and related columns. This is distinct from the policy model’s recurrent memory: DeepTrade can use learned temporal embeddings, a recurrent trading policy, or both simultaneously.</p>
+
+    <h3>3.4 Normalization and leakage control</h3>
+    <p>Normalization is handled per walk-forward window with statistics fit on the training subset only. The default scaler in the current configuration is a robust scaler followed by smooth clipping with a hyperbolic tangent. This design is sensible for financial indicators because intraday feature distributions are frequently heavy-tailed, non-stationary, and contaminated by outliers. Price normalization for <code>close_norm</code> is also derived from training-window extrema only, then applied to validation and test data. This is one of the stronger design choices in the repository because it directly addresses look-ahead leakage.</p>
+
+    <h2>4. Trading Environment and Policy Interface</h2>
+    <h3>4.1 Observation space</h3>
+    <p>The custom environment in <code>environment.py</code> presents the policy with a vector containing the normalized close price, the selected technical indicators, current position, normalized unrealized P&amp;L, normalized time in position, and normalized drawdown from the equity peak. The observation space is bounded, which fits the expectations of PPO-based policy optimization and reduces the effect of uncontrolled feature magnitudes.</p>
+
+    <h3>4.2 Action space</h3>
+    <p>The baseline action space is discrete with three actions: long, short, and flat. When dynamic stop-loss and take-profit selection is enabled, the action space becomes multi-discrete and augments the directional action with indices for ATR-based stop-loss and take-profit multipliers. This is conceptually important because it elevates risk control from a hard-coded post-processing rule to part of the decision policy itself.</p>
+
+    <h3>4.3 Execution model</h3>
+    <p>Portfolio evolution uses NQ point-value arithmetic and tracks commissions, spread costs, and optional time-of-day slippage. The environment charges spread and fill costs only when positions change, which is appropriate because repeated “stay long” or “stay short” decisions should not incur turnover penalties equivalent to a fresh entry. The implementation also clamps net worth to a minimum fraction of initial balance to prevent pathological negative-equity dynamics from destabilizing learning.</p>
+
+    <h2>5. Reward Design</h2>
+    <p>The reward function is not based on raw one-step price prediction accuracy. Instead, DeepTrade uses a portfolio-return-based objective aligned with risk-adjusted trading performance. The primary term is the log change in net worth between steps, scaled by a configurable factor. This creates a reward directly tied to economic outcomes and naturally respects compounding.</p>
+    <p>Several additional shaping terms are present:</p>
+    <ul>
+      <li>An asymmetric downside penalty increases the cost of losing equity changes relative to gains.</li>
+      <li>A drawdown penalty activates when equity falls sufficiently far below the running peak.</li>
+      <li>A turnover penalty discourages unnecessary position changes even after explicit transaction costs are already applied.</li>
+      <li>A “calm holding bonus” rewards remaining long in low-volatility, low-drawdown conditions, which is a deliberate bias toward capturing persistent upward intraday regimes.</li>
+    </ul>
+    <p>This reward structure reveals the project’s thesis clearly: the model is being optimized for a blend of return generation, drawdown containment, and resistance to overtrading, not for classification accuracy in isolation.</p>
+
+    <h2>6. Model Architecture and Training</h2>
+    <h3>6.1 Base learners</h3>
+    <p>The repository supports two primary policy variants. The non-recurrent baseline is Stable-Baselines3 PPO with an MLP policy and a two-layer architecture of sizes 128 and 64. The recurrent variant uses <code>sb3_contrib.RecurrentPPO</code> with <code>MlpLstmPolicy</code>, configurable LSTM hidden state size and number of LSTM layers, and separate policy and value heads. In the inspected configuration, the recurrent path is enabled with a hidden size of 512 and two LSTM layers.</p>
+
+    <h3>6.2 Parallelized environment rollouts</h3>
+    <p>Training uses either a single dummy vectorized environment or a subprocess-based vectorized environment. The current configuration sets four rollout environments, each with a randomized episode start drawn from the first 20% of the training data. This randomization increases trajectory diversity and reduces the tendency of multiple environments to produce identical episodes.</p>
+
+    <h3>6.3 Optimization schedule</h3>
+    <p>The implementation supports learning-rate decay and entropy-coefficient decay. For recurrent policies, entropy decay is handled via a callback because the recurrent implementation does not support a callable entropy schedule directly. The configured training process is iterative: it performs an initial training block, evaluates on a validation segment, then continues with additional timesteps until the chosen validation metric stops improving for a specified number of iterations.</p>
+
+    <h3>6.4 Independent window training</h3>
+    <p>In the current walk-forward implementation, each window is trained independently. The LSTM feature autoencoder and the trading policy are both fit from that window’s own training data rather than being warm-started from the prior window. This keeps the sequential walk-forward process cleaner methodologically because model state is not carried forward across adjacent evaluation windows.</p>
+
+    <h2>7. Hyperparameter Tuning</h2>
+    <p>The main hyperparameter search logic lives in <code>walk_forward.py</code> and uses Optuna with a TPE sampler, median pruning, and optional parallel execution backed by SQLite storage. The search space is broader than standard PPO tuning. In addition to learning rate, number of rollout steps, entropy coefficient, batch size, discount factor, and GAE lambda, the system can also tune:</p>
+    <ul>
+      <li>Reward asymmetry for losses.</li>
+      <li>Turnover penalty strength.</li>
+      <li>Calm-market holding bonus.</li>
+      <li>Synthetic bear-market augmentation ratio.</li>
+      <li>Recurrent policy width and depth when the recurrent model is enabled.</li>
+    </ul>
+    <p>That design is notable. The project treats reward shaping and data augmentation as first-class hyperparameters rather than immovable constants, which is often the correct approach in financial RL where objective design is as important as model architecture.</p>
+    <p>The tuner evaluates each trial on the validation set and computes a composite objective dominated by Calmar ratio and Sortino ratio, with additional weight on raw return and a penalty for maximum drawdown. In the current codebase, hyperparameter tuning is run once on the first walk-forward window and the best parameters are then reused for later windows.</p>
+
+    <h2>8. Walk-Forward Evaluation Protocol</h2>
+    <p>The project’s most important methodological component is anchored walk-forward evaluation. Instead of training once and reporting a single static test result, the code divides the full sample into multiple overlapping windows measured in trading days. Within each window, the data are split into train, validation, embargo, and test segments. The model is trained on the training portion, selected using the validation portion, and scored on the out-of-sample test portion.</p>
+    <p>The inspected configuration uses a 120-trading-day window stepped every 24 trading days, with 60% of each window used for training, 20% for validation, and 20% for testing, plus a one-day embargo between validation and test. The session-level reports aggregate average return, average final portfolio value, average trade count, average Sortino ratio, and optional hit-rate or prediction-accuracy statistics across windows.</p>
+    <p>This design is much stronger than a single holdout because it measures stability across market subperiods, not just performance on one lucky slice.</p>
+
+    <h2>9. Evaluation Metrics</h2>
+    <p>The core evaluation path in <code>train.py</code> computes final portfolio value, total return, trade count, hit rate, maximum drawdown, Calmar ratio, and Sortino ratio from the simulated portfolio path. In the currently inspected configuration, the training loop selects models using Sortino ratio on the validation set. That choice is consistent with the repository’s risk-sensitive design because Sortino penalizes harmful downside volatility more directly than raw return.</p>
+    <p>The codebase also contains auxiliary evaluation paths for hit rate and prediction accuracy. These are useful diagnostic metrics, but they are secondary to the economic metrics. A trading policy can be profitable with a modest hit rate if gains are larger than losses, and a policy can have high directional accuracy while still underperforming after costs and drawdowns are considered. DeepTrade’s main training path correctly prioritizes portfolio metrics over classification metrics.</p>
+
+    <h2>10. Risk Management Layers</h2>
+    <h3>10.1 Rule-based overlays</h3>
+    <p>The project contains a <code>RiskManager</code> that supports percentage-based or ATR-based stop loss, take profit, trailing stops, daily loss caps, and dynamic position sizing. These controls can be applied during trading-style evaluation through <code>trade_with_risk_management</code>. In the current configuration, risk management is disabled, which means the baseline walk-forward results reflect the raw policy rather than an overlay-constrained strategy.</p>
+
+    <h3>10.2 Dynamic stop-loss and take-profit selection</h3>
+    <p>When enabled, the environment can expand the action space so the policy itself chooses ATR-based stop-loss and take-profit multipliers at trade entry. This is an advanced feature because it turns risk parameter selection into part of the learning problem rather than a fixed external heuristic.</p>
+
+    <h3>10.3 Separate risk model</h3>
+    <p>The repository also contains an experimental secondary RL model that acts as a gatekeeper for trades proposed by the primary trading policy. This risk model is trained on trade histories produced by the trading model and decides whether to allow or block a trade. Conceptually, this creates a two-stage architecture: the trading model generates opportunities, and the risk model suppresses those that appear dangerous based on portfolio state and recent outcomes. The module is not the default production path, but it is a substantive extension of the core research design.</p>
+
+    <h2>11. Current Configured System</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Category</th>
+          <th>Current inspected configuration</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Instrument / frequency</td>
+          <td>Nasdaq futures-style intraday bars, market-hours-only processing</td>
+        </tr>
+        <tr>
+          <td>Initial capital</td>
+          <td>USD 100,000</td>
+        </tr>
+        <tr>
+          <td>Execution assumptions</td>
+          <td>USD 2.50 transaction cost, 0.125-point half spread, zero base slippage</td>
+        </tr>
+        <tr>
+          <td>Primary learner</td>
+          <td>RecurrentPPO enabled, LSTM hidden size 512, 2 layers</td>
+        </tr>
+        <tr>
+          <td>Optimization</td>
+          <td>Learning rate decay and entropy decay enabled</td>
+        </tr>
+        <tr>
+          <td>Training rollout setup</td>
+          <td>4 parallel environments</td>
+        </tr>
+        <tr>
+          <td>Validation metric</td>
+          <td>Sortino ratio</td>
+        </tr>
+        <tr>
+          <td>Walk-forward setup</td>
+          <td>120-day windows stepped by 24 trading days</td>
+        </tr>
+        <tr>
+          <td>Normalization</td>
+          <td>Robust scaling fitted on each window’s training subset only</td>
+        </tr>
+        <tr>
+          <td>Augmentation</td>
+          <td>Synthetic bear-segment oversampling enabled</td>
+        </tr>
+        <tr>
+          <td>Risk overlay</td>
+          <td>Disabled in the current default configuration</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>12. Strengths of the Project</h2>
+    <ul>
+      <li>The repository is not a toy example; it includes end-to-end infrastructure from data ingestion through out-of-sample evaluation.</li>
+      <li>The use of per-window scaling and embargoed walk-forward testing is methodologically stronger than many retail trading-model codebases.</li>
+      <li>The reward function is economically grounded and explicitly risk-aware.</li>
+      <li>The architecture supports both engineered and learned sequence features.</li>
+      <li>Hyperparameter tuning extends beyond PPO knobs to reward shaping and data augmentation, which is appropriate for this problem class.</li>
+      <li>The codebase includes a path toward layered risk control through both rule-based overlays and a separate risk policy.</li>
+    </ul>
+
+    <h2>13. Limitations and Implementation Caveats</h2>
+    <p>A white paper should distinguish between conceptual intent and exact implementation. The codebase is ambitious and generally coherent, but several caveats are visible from inspection.</p>
+    <ul>
+      <li>There are multiple tuning and evaluation paths in the repository, and they do not all use the same objective definitions. The main walk-forward tuner is more advanced than the standalone <code>hyperparameter_tuning.py</code> module.</li>
+      <li>Some auxiliary evaluation code uses inconsistent action semantics, especially around “hold” versus “flat” states in prediction-accuracy and risk-management-related paths. The environment itself uses three baseline actions, but some helpers reference four-action logic.</li>
+      <li>The reward contains an explicit long-side bias via the calm-holding bonus. That may be useful for bullish intraday regimes but should be described as a deliberate prior, not as a market-neutral design.</li>
+      <li>Warm-starting across walk-forward windows improves practicality but reduces statistical independence between adjacent windows.</li>
+      <li>The current execution-cost model includes fixed spread and commission assumptions but minimal slippage by default. Production expectations should therefore be more conservative than simulated results.</li>
+    </ul>
+    <p>These caveats do not invalidate the project. They do, however, matter when converting research findings into claims about live trading readiness.</p>
+
+    <h2>14. Conclusion</h2>
+    <p>DeepTrade is best understood as a reinforcement-learning trading research framework with a strong emphasis on realistic evaluation. Its main contribution is the integration of feature engineering, risk-sensitive reward shaping, recurrent policy learning, leakage-aware normalization, hyperparameter tuning, and anchored walk-forward analysis into a single reproducible workflow. The project is not simply trying to forecast the next bar; it is trying to learn a sequential position-management policy that survives costs and varying market regimes.</p>
+    <p>From a research perspective, the project’s strongest qualities are its out-of-sample discipline and its willingness to optimize the full trading objective rather than proxy classification metrics. From an engineering perspective, the next maturation steps would be to tighten action-space consistency across all auxiliary evaluation paths, unify duplicated tuning modules, and validate the live-trading assumptions under more conservative slippage and latency conditions. Even with those caveats, the repository already represents a serious applied RL trading stack rather than a minimal prototype.</p>
+
+    <section class="box small">
+      <p><strong>Primary implementation files reviewed.</strong> <code>environment.py</code>, <code>train.py</code>, <code>walk_forward.py</code>, <code>hyperparameter_tuning.py</code>, <code>trade.py</code>, <code>risk_model.py</code>, <code>train_risk_model.py</code>, <code>get_data.py</code>, <code>normalization.py</code>, and <code>config.yaml</code>.</p>
+    </section>
+  </main>
+</body>
+</html>

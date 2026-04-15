@@ -9,6 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trade import RiskManager
 import money
+import constants
 
 class TestMoneyIntegration(unittest.TestCase):
     """
@@ -26,6 +27,7 @@ class TestMoneyIntegration(unittest.TestCase):
         self.eastern = pytz.timezone('US/Eastern')
         self.entry_date = pd.Timestamp(datetime(2023, 1, 1, 10, 0, 0), tz=self.eastern)
         self.exit_date = pd.Timestamp(datetime(2023, 1, 1, 11, 0, 0), tz=self.eastern)
+        self.point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
         
     def test_money_conversion_in_risk_manager(self):
         """
@@ -79,8 +81,7 @@ class TestMoneyIntegration(unittest.TestCase):
         risk_manager.exit_position(exit_price, self.exit_date, "stop_loss")
         
         # Calculate expected loss
-        # 200 points * $20/point * 1 contract = $4,000 loss
-        expected_loss = money.to_decimal(200) * money.to_decimal(20)
+        expected_loss = money.to_decimal(200) * self.point_value
         expected_portfolio = initial_portfolio - expected_loss
         
         # Check portfolio value
@@ -118,8 +119,7 @@ class TestMoneyIntegration(unittest.TestCase):
         risk_manager.exit_position(exit_price, self.exit_date, "take_profit")
         
         # Calculate expected profit
-        # 200 points * $20/point * 1 contract = $4,000 profit
-        expected_profit = money.to_decimal(200) * money.to_decimal(20)
+        expected_profit = money.to_decimal(200) * self.point_value
         expected_portfolio = initial_portfolio + expected_profit
         
         # Check portfolio value
@@ -162,8 +162,7 @@ class TestMoneyIntegration(unittest.TestCase):
         risk_manager.exit_position(exit_price, self.exit_date, "trailing_stop")
         
         # Calculate expected profit
-        # 150 points * $20/point * 1 contract = $3,000 profit
-        expected_profit = money.to_decimal(150) * money.to_decimal(20)
+        expected_profit = money.to_decimal(150) * self.point_value
         expected_portfolio = initial_portfolio + expected_profit
         
         # Check portfolio value
@@ -202,11 +201,9 @@ class TestMoneyIntegration(unittest.TestCase):
         risk_manager.exit_position(exit_price, self.exit_date, "stop_loss")
         
         # Calculate expected loss with transaction costs
-        # 200 points * $20/point * 1 contract = $4,000 loss
-        price_loss = money.to_decimal(200) * money.to_decimal(20)
+        price_loss = money.to_decimal(200) * self.point_value
         
-        # Transaction cost = 14800 * 1 * 20 * 0.1% = $29.6
-        trans_cost = money.to_decimal(exit_price) * money.to_decimal(20) * (transaction_cost / Decimal('100'))
+        trans_cost = money.to_decimal(exit_price) * self.point_value * (transaction_cost / Decimal('100'))
         
         expected_total_loss = price_loss + trans_cost
         expected_portfolio = initial_portfolio - expected_total_loss
@@ -250,8 +247,7 @@ class TestMoneyIntegration(unittest.TestCase):
         risk_manager.exit_position(exit_price, self.exit_date, "take_profit")
         
         # Calculate expected profit with multiple contracts
-        # 100 points * $20/point * 2 contracts = $4,000 profit
-        expected_profit = money.to_decimal(100) * money.to_decimal(20) * money.to_decimal(contracts)
+        expected_profit = money.to_decimal(100) * self.point_value * money.to_decimal(contracts)
         expected_portfolio = initial_portfolio + expected_profit
         
         # Check portfolio value

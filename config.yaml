@@ -1,13 +1,16 @@
 seed: 42
+reproducibility:
+  deterministic_mode: true
 training:
   total_timesteps: 100000
   fee_rate: 0.0
   max_iterations: 20
   improvement_threshold: 0.01
-  additional_timesteps: 20000
-  n_stagnant_loops: 7
-  n_envs: 4
-  eval_frequency: 2
+  additional_timesteps: 10000
+  n_stagnant_loops: 4
+  n_envs: 4  # Parallel envs for faster rollouts (safe with sequential windows)
+  random_start_pct: 1.0
+  eval_frequency: 1
   verbose: 0
   evaluation:
     metric: sortino
@@ -16,11 +19,19 @@ training:
     patience: 7
     min_delta: 0.1
 data:
+  csv_path: data/glbx-mdp3-20210414-20260413.ohlcv-1m.csv
+  interval: 1m
+  session:
+    timezone: America/Chicago
+    open_hour: 17
+    open_minute: 0
+    close_hour: 16
+    close_minute: 0
   train_ratio: 0.6
   validation_ratio: 0.2
   test_ratio: 0.2
   embargo_days: 1
-  market_hours_only: true
+  market_hours_only: false
 normalization:
   scaler_type: robust
 indicators:
@@ -85,7 +96,10 @@ indicators:
     enabled: true
     ma_length: 20
   vwap:
-    enabled: false
+    enabled: true
+  opening_range:
+    enabled: true
+    minutes: 30
   day_of_week:
     enabled: true
   minutes_since_open:
@@ -109,14 +123,17 @@ indicators:
     window: 60
   lstm_features:
     enabled: true
-    lookback: 20
+    lookback: 10
     hidden_size: 32
-    num_layers: 1
-    output_size: 8
-    pretrain_epochs: 50
-    pretrain_lr: 0.001
+    num_layers: 2
+    output_size: 4
+    beta: 0.0008266502663726915
+    kl_warmup_epochs: 10
+    pretrain_epochs: 100
+    pretrain_lr: 0.0075741650324583016
     pretrain_batch_size: 64
     pretrain_patience: 10
+    pretrain_min_delta: 0.001
     tuning:
       enabled: false
       n_trials: 20
@@ -145,39 +162,54 @@ indicators:
           min: 0.0001
           max: 0.01
           log: true
+        beta:
+          min: 1.0e-05
+          max: 0.01
+          log: true
 augmentation:
   synthetic_bears:
     enabled: true
-    oversample_ratio: 0.315
+    oversample_ratio: 0.18
     segment_length_pct: 0.13
+  tuning:
+    candidate_oversample_ratios:
+    - 0.0
+    - 0.08
+    - 0.12
+    - 0.18
+    - 0.24
+    max_windows: 3
+    timesteps: 10000
 environment:
   initial_balance: 100000.0
-  position_size: 1
-  transaction_cost: 2.5
+  position_size: 10
+  transaction_cost: 0.75
 execution_costs:
-  half_spread_points: 0.125
+  half_spread_points: 2.5
   base_slippage_points: 0.0
 reward:
   base_scale: 500.0
-  loss_multiplier: 0.769  # Tuned: losses at 1.77x gains
+  loss_multiplier: 0.7494921246671704  # Latest walk-forward tuning
   drawdown_penalty_threshold: 0.025
   drawdown_penalty: 2.2
-  turnover_penalty: 0.011  # Tuned: low penalty to allow good entries
-  calm_holding_bonus: 0.0026  # Tuned: strong bonus for holding long in calm regimes
+  turnover_penalty: 0.0100
+  calm_holding_bonus: 0.001380767344043113  # Latest walk-forward tuning
+  flat_time_penalty: 0.0040
+  flat_time_grace_steps: 3
 model:
-  ent_coef: 0.15  # Tuned
+  ent_coef: 0.16239021973061413  # Latest walk-forward tuning
   ent_coef_decay: true
   final_ent_coef: 0.045
-  learning_rate: 0.000229  # Tuned
-  n_steps: 311  # Tuned
+  learning_rate: 0.00029570465033637995  # Latest walk-forward tuning
+  n_steps: 753  # Latest walk-forward tuning
   batch_size: 83  # Tuned
-  gamma: 0.9958  # Tuned
+  gamma: 0.9949826964778363  # Latest walk-forward tuning
   gae_lambda: 0.85
   use_lr_decay: true
 sequence_model:
   enabled: true
-  lstm_hidden_size: 512  # Tuned
-  n_lstm_layers: 2  # Tuned
+  lstm_hidden_size: 256  # Latest walk-forward tuning
+  n_lstm_layers: 1  # Latest walk-forward tuning
   shared_lstm: false
   reset_on_new_day: false
   device: auto
@@ -219,18 +251,32 @@ walk_forward:
   enabled: true
   window_size: 120
   step_size: 24
-  max_windows: 0  # 0 = no limit
+  max_windows: 4
   parallel_processing:
-    enabled: true
+    enabled: false
     n_processes: 0
     max_workers: 0
 hyperparameter_tuning:
-  enabled: false
+  enabled: true
   n_trials: 40
-  tuning_timesteps: 12000
+  stage1_trials: 24
+  stage2_trials: 16
+  stage1_timesteps: 10000
+  stage2_timesteps: 20000
+  stage2_window_shrink: 0.35
+  tuning_timesteps: 20000
+  pruning_eval_steps: 5000
+  holdout_windows: 2  # Additional validation windows scored after the primary tuning window
+  baseline_margin: 0.25
+  early_prune_zero_trade: true
+  early_prune_flat_action_pct: 99.0
+  early_prune_single_action: true
+  n_envs: 1  # Keep each Optuna trial single-process to avoid n_jobs * n_envs overload
   parallel_processing:
-    enabled: true
-    n_jobs: 0  # 0 = auto-detect all CPU cores
+    enabled: false
+    n_jobs: 1  # Deterministic mode forces sequential Optuna suggestions
+    max_auto_jobs: 2  # Applied only when n_jobs is set to 0
+    reserve_cores: 2  # Leave headroom for the OS/UI when auto-detecting
   parameters:
     # Core PPO parameters
     learning_rate:
@@ -245,34 +291,11 @@ hyperparameter_tuning:
       min: 0.10
       max: 0.25
       log: false
-    gamma:
-      min: 0.992
-      max: 0.997
-      log: false
-    # Reward shaping (most critical)
-    reward_loss_multiplier:
-      min: 0.30
-      max: 0.80
-      log: false
     reward_turnover_penalty:
-      min: 0.008
-      max: 0.040
+      min: 0.006
+      max: 0.018
       log: false
     reward_calm_holding_bonus:
-      min: 0.0006
-      max: 0.0032
+      min: 0.0008
+      max: 0.0022
       log: false
-    # Synthetic bears
-    synthetic_oversample_ratio:
-      min: 0.12
-      max: 0.32
-      log: false
-    lstm_hidden_size:
-      choices:
-      - 64
-      - 128
-      - 256
-      - 512
-    n_lstm_layers:
-      min: 1
-      max: 2

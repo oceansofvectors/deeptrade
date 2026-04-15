@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import tempfile
 from decimal import Decimal
 
 # Third-party imports
@@ -26,12 +27,13 @@ except ImportError:
 from config import config
 from environment import TradingEnv
 from get_data import get_data
-from utils.seeding import set_global_seed
+from utils.seeding import enable_full_determinism, set_global_seed
 from utils.device import get_device
 import money
 from utils.log_format import (
     ANSI_BOLD,
     ANSI_GREEN,
+    ANSI_RED,
     ANSI_RESET,
     bold,
     color_value,
@@ -42,6 +44,166 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FEE_RATE = 0.0  # No trading fees
+
+
+def _checkpoint_prefix(window_folder: str | None) -> str:
+    """Return a writable prefix for transient best-model checkpoints."""
+    if window_folder:
+        os.makedirs(window_folder, exist_ok=True)
+        return os.path.join(window_folder, "best_model")
+
+    tmpdir = tempfile.mkdtemp(prefix="deeptrade_best_model_")
+    return os.path.join(tmpdir, "best_model")
+
+
+def _extract_metric_value(results: dict, evaluation_metric: str) -> tuple[float, str]:
+    """Map the configured evaluation metric to its corresponding result field."""
+    if evaluation_metric == "prediction_accuracy":
+        return results["prediction_accuracy"], "prediction_accuracy"
+    if evaluation_metric == "hit_rate":
+        return results["hit_rate"], "hit_rate"
+    if evaluation_metric == "calmar":
+        return results["calmar_ratio"], "calmar"
+    if evaluation_metric == "sortino":
+        return results["sortino_ratio"], "sortino"
+    return results["total_return_pct"], "return"
+
+
+def _with_training_diagnostics(
+    results: dict,
+    *,
+    metric_name: str,
+    metric_value: float,
+    loss_info: dict,
+    min_trades: int,
+    best_metric_value: float | None = None,
+) -> dict:
+    """Attach policy-collapse diagnostics to an evaluation result."""
+    enriched = dict(results)
+    action_counts = {int(k): int(v) for k, v in enriched.get("action_counts", {}).items()}
+    total_actions = max(1, sum(action_counts.values()))
+    long_action_pct = 100.0 * action_counts.get(0, 0) / total_actions
+    short_action_pct = 100.0 * action_counts.get(1, 0) / total_actions
+    flat_action_pct = 100.0 * action_counts.get(2, 0) / total_actions
+    dominant_action_pct = max(long_action_pct, short_action_pct, flat_action_pct)
+    active_actions = sum(1 for count in action_counts.values() if count > 0)
+    max_flat_action_pct = float(config.get("training", {}).get("max_flat_action_pct", 80.0))
+    metric_drop_from_best = None if best_metric_value is None else metric_value - best_metric_value
+
+    collapse_flags = []
+    if dominant_action_pct >= 90.0:
+        collapse_flags.append("dominant_action")
+    if flat_action_pct >= max_flat_action_pct:
+        collapse_flags.append("flat_dominance")
+    if active_actions <= 1:
+        collapse_flags.append("single_action_policy")
+    if enriched.get("trade_count", 0) < min_trades:
+        collapse_flags.append("too_few_trades")
+    if metric_drop_from_best is not None and metric_drop_from_best <= -2.0:
+        collapse_flags.append("metric_drop")
+
+    has_enough_action_mix = (
+        flat_action_pct < max_flat_action_pct
+        and active_actions > 1
+        and dominant_action_pct < 95.0
+    )
+
+    enriched.update({
+        "metric_used": metric_name,
+        "loss_info": loss_info,
+        "has_enough_trades": enriched.get("trade_count", 0) >= min_trades,
+        "has_enough_action_mix": has_enough_action_mix,
+        "min_trades_required": min_trades,
+        "max_flat_action_pct": max_flat_action_pct,
+        "action_counts": action_counts,
+        "long_action_pct": long_action_pct,
+        "short_action_pct": short_action_pct,
+        "flat_action_pct": flat_action_pct,
+        "dominant_action_pct": dominant_action_pct,
+        "active_action_count": active_actions,
+        "metric_drop_from_best": metric_drop_from_best,
+        "collapse_flags": collapse_flags,
+        "warning_policy_collapse": any(
+            flag in collapse_flags for flag in ("dominant_action", "flat_dominance", "single_action_policy")
+        ),
+        "warning_metric_drop": "metric_drop" in collapse_flags,
+    })
+    return enriched
+
+
+def _infer_periods_per_year(index) -> float:
+    """Infer evaluation periods per year from a datetime index."""
+    if index is None or len(index) < 2:
+        return 252.0
+
+    dt_index = pd.DatetimeIndex(index)
+    deltas = dt_index.to_series().diff().dropna().dt.total_seconds()
+    deltas = deltas[deltas > 0]
+    if deltas.empty:
+        return 252.0
+
+    median_seconds = float(deltas.median())
+    if median_seconds <= 0:
+        return 252.0
+    seconds_per_year = 365.25 * 24 * 60 * 60
+    return seconds_per_year / median_seconds
+
+
+def _calculate_sortino_ratio(portfolio_array: np.ndarray, index) -> float:
+    """Calculate a frequency-aware Sortino ratio from the portfolio path."""
+    if portfolio_array is None or len(portfolio_array) < 2:
+        return 0.0
+
+    portfolio_returns = np.diff(portfolio_array) / portfolio_array[:-1]
+    portfolio_returns = portfolio_returns[np.isfinite(portfolio_returns)]
+    if portfolio_returns.size == 0:
+        return 0.0
+
+    periods_per_year = _infer_periods_per_year(index)
+    downside_component = np.minimum(portfolio_returns, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(np.square(downside_component))))
+
+    positive_portfolio = portfolio_array[portfolio_array > 0]
+    if positive_portfolio.size >= 2:
+        log_returns = np.diff(np.log(positive_portfolio))
+        log_returns = log_returns[np.isfinite(log_returns)]
+        annualized_return = float(np.mean(log_returns)) * periods_per_year if log_returns.size > 0 else 0.0
+    else:
+        annualized_return = float(np.mean(portfolio_returns)) * periods_per_year
+
+    if downside_deviation <= 0:
+        return max(0.0, annualized_return * 100.0)
+
+    annualized_downside = downside_deviation * np.sqrt(periods_per_year)
+    if annualized_downside <= 0:
+        return 0.0
+
+    return float(annualized_return / annualized_downside)
+
+
+def _fallback_candidate_score(results: dict) -> float:
+    """Score invalid checkpoints so we can still pick the least-bad fallback."""
+    metric_value = float(
+        results.get("sortino_ratio", results.get("calmar_ratio", results.get("total_return_pct", 0.0)))
+    )
+    trade_count = float(results.get("trade_count", 0))
+    flat_action_pct = float(results.get("flat_action_pct", 100.0))
+    active_action_count = float(results.get("active_action_count", 0))
+    collapse_flags = set(results.get("collapse_flags", []))
+
+    score = metric_value
+    score += min(trade_count, 100.0) * 0.05
+    score -= max(0.0, flat_action_pct - 70.0) * 0.15
+    score += active_action_count * 0.5
+
+    if "single_action_policy" in collapse_flags:
+        score -= 4.0
+    if "too_few_trades" in collapse_flags:
+        score -= 2.0
+    if "dominant_action" in collapse_flags:
+        score -= 1.5
+
+    return float(score)
 
 
 class LossTrackingCallback(BaseCallback):
@@ -129,6 +291,8 @@ def train_agent(train_data, total_timesteps: int):
     Returns:
         model: Trained PPO or RecurrentPPO model.
     """
+    base_seed = int(config.get("seed", 42))
+
     env_kwargs = dict(
         initial_balance=config["environment"]["initial_balance"],
         transaction_cost=config["environment"].get("transaction_cost", 2.50),
@@ -141,17 +305,24 @@ def train_agent(train_data, total_timesteps: int):
 
     # Create vectorized environment for faster rollout collection
     n_envs = config.get("training", {}).get("n_envs", 4)
-    env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
+    env_kwargs["random_start_pct"] = float(config.get("training", {}).get("random_start_pct", 0.2))
 
     def make_env(data, **kwargs):
         return lambda: TradingEnv(data.copy(), **kwargs)
 
-    env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
-    logger.info(f"Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+    if n_envs > 1:
+        env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
+        logger.info(f"Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+    else:
+        env = DummyVecEnv([make_env(train_data, **env_kwargs)])
+        logger.info(f"Using DummyVecEnv (single process)")
+    env.seed(base_seed)
 
     # Get sequence model config
     seq_config = config.get("sequence_model", {})
     use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+    if use_recurrent:
+        env_kwargs["min_episode_steps"] = max(2, int(config["model"].get("n_steps", 2048)))
 
     # Get device configuration (use CPU for recurrent models due to MPS LSTM bugs)
     device_config = seq_config.get("device", "auto")
@@ -236,7 +407,7 @@ def train_agent(train_data, total_timesteps: int):
 def train_agent_iteratively(train_data, validation_data, initial_timesteps: int, max_iterations: int = 20,
                            n_stagnant_loops: int = 3, improvement_threshold: float = 0.1, additional_timesteps: int = 10000,
                            evaluation_metric: str = "return", model_params: dict = None, window_folder: str = None,
-                           window_label: str = "", prev_model_path: str = None):
+                           window_label: str = ""):
     """
     Train a PPO model iteratively based on validation performance.
     
@@ -255,6 +426,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     Returns:
         tuple: (best_model, best_results, all_results)
     """
+    base_seed = int(config.get("seed", 42))
+
     # Initialize training environment with realistic transaction costs
     env_kwargs = dict(
         initial_balance=config["environment"]["initial_balance"],
@@ -265,18 +438,23 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Validate with a single env first
     single_env = TradingEnv(train_data, **env_kwargs)
     check_env(single_env, skip_render_check=True)
-    obs, _ = single_env.reset()
+    obs, _ = single_env.reset(seed=base_seed)
     logger.debug(f"Observation space: {single_env.observation_space.shape}, indicators: {len(single_env.technical_indicators)}")
 
     # Create vectorized environment for faster rollout collection
     n_envs = config.get("training", {}).get("n_envs", 4)
-    env_kwargs["random_start_pct"] = 0.2  # Each env starts at a random point in first 20% of data
+    env_kwargs["random_start_pct"] = float(config.get("training", {}).get("random_start_pct", 0.2))
 
     def make_env(data, **kwargs):
         return lambda: TradingEnv(data.copy(), **kwargs)
 
-    train_env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
-    logger.info(f"{window_label}Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+    if n_envs > 1:
+        train_env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
+        logger.info(f"{window_label}Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+    else:
+        train_env = DummyVecEnv([make_env(train_data, **env_kwargs)])
+        logger.info(f"{window_label}Using DummyVecEnv (single process)")
+    train_env.seed(base_seed)
     
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
@@ -292,6 +470,11 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             "gae_lambda": config["model"].get("gae_lambda", 0.95),
         }
     
+    best_model_path = _checkpoint_prefix(window_folder)
+    fallback_model_path = f"{best_model_path}_fallback"
+    fallback_score = float("-inf")
+    fallback_results = None
+
     # Get learning rate decay parameters from config or use defaults
     use_lr_decay = config["model"].get("use_lr_decay", False)
     # Total timesteps for decay is initial + additional * max iterations
@@ -313,6 +496,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Get sequence model config (need this before entropy coef setup)
     seq_config = config.get("sequence_model", {})
     use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+    if use_recurrent:
+        env_kwargs["min_episode_steps"] = max(2, int(model_params.get("n_steps", config["model"].get("n_steps", 2048))))
 
     # Get entropy coefficient decay parameters from config or use defaults
     use_ent_decay = config["model"].get("ent_coef_decay", False)
@@ -381,14 +566,6 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             policy_kwargs={"net_arch": [128, 64]},
         )
 
-    # Warm-start from previous window's best model if available
-    if prev_model_path and os.path.exists(f"{prev_model_path}.zip"):
-        logger.info(f"{window_label}Warm-starting policy from previous window: {prev_model_path}")
-        if use_recurrent:
-            model = RecurrentPPO.load(f"{prev_model_path}", env=train_env, device=device)
-        else:
-            model = PPO.load(f"{prev_model_path}", env=train_env, device=device)
-
     # Create callbacks
     loss_callback = LossTrackingCallback(verbose=verbose_level)
     callbacks = [loss_callback]
@@ -412,38 +589,34 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     # Evaluate initial model on validation data using the specified metric
     if verbose_level > 0:
         logger.info(f"Evaluating model on validation data with {evaluation_metric} metric")
-    
+
     # Use the appropriate evaluation function based on the metric
     if evaluation_metric == "prediction_accuracy":
-        # Need to import from walk_forward module
         from walk_forward import evaluate_agent_prediction_accuracy
         results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=verbose_level, deterministic=True)
-        best_metric_value = results["prediction_accuracy"]
-        metric_name = "prediction_accuracy"
-    elif evaluation_metric == "hit_rate":
-        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-        best_metric_value = results["hit_rate"]
-        metric_name = "hit_rate"
-    elif evaluation_metric == "calmar":
-        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-        best_metric_value = results["calmar_ratio"]
-        metric_name = "calmar"
-    elif evaluation_metric == "sortino":
-        results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-        best_metric_value = results["sortino_ratio"]
-        metric_name = "sortino"
     else:  # Default to "return"
         results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-        best_metric_value = results["total_return_pct"]
-        metric_name = "return"
-    
-    # Store best model and results
-    best_model = model
-    best_results = results
-    
-    # Save the initial model as the best model so far
-    best_model.save(os.path.join(window_folder, "best_model"))
-    
+    best_metric_value, metric_name = _extract_metric_value(results, evaluation_metric)
+
+    # Store best model via checkpoint, not by mutable object reference.
+    min_trades = max(20, len(validation_data) // 200)  # At least 1 trade per 200 bars
+    results = _with_training_diagnostics(
+        results,
+        metric_name=metric_name,
+        metric_value=best_metric_value,
+        loss_info=initial_losses,
+        min_trades=min_trades,
+    )
+    initial_candidate_ok = results["has_enough_trades"] and results["has_enough_action_mix"]
+    results["is_best"] = initial_candidate_ok
+    best_results = dict(results)
+    fallback_score = _fallback_candidate_score(results)
+    fallback_results = dict(results)
+    model.save(fallback_model_path)
+    if not initial_candidate_ok:
+        best_metric_value = float("-inf")
+    model.save(best_model_path)
+
     # Log evaluation results based on metric (color-coded by sign)
     logger.info(
         f"{window_label}Initial training completed. "
@@ -452,12 +625,9 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     )
     
     # Store all results for comparison
-    all_results = [results]
-    
-    # Add metric information to results
-    results["metric_used"] = metric_name
+    all_results = [dict(results)]
 
-    # Evaluation frequency: evaluate every N iterations to reduce overhead
+    # Evaluate every iteration by default to catch sharp post-peak degradation.
     eval_frequency = config.get("training", {}).get("eval_frequency", 1)
 
     # Continue training until max_iterations or loss plateau
@@ -483,68 +653,82 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         if evaluation_metric == "prediction_accuracy":
             from walk_forward import evaluate_agent_prediction_accuracy
             results = evaluate_agent_prediction_accuracy(model, validation_data, verbose=verbose_level, deterministic=True)
-            current_metric_value = results["prediction_accuracy"]
-        elif evaluation_metric == "hit_rate":
-            results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-            current_metric_value = results["hit_rate"]
-        elif evaluation_metric == "calmar":
-            results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-            current_metric_value = results["calmar_ratio"]
-        elif evaluation_metric == "sortino":
-            results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-            current_metric_value = results["sortino_ratio"]
         else:  # Default to "return"
             results = evaluate_agent(model, validation_data, verbose=verbose_level, deterministic=True)
-            current_metric_value = results["total_return_pct"]
+        current_metric_value, _ = _extract_metric_value(results, evaluation_metric)
 
-        # Add metric and loss information to results
-        results["metric_used"] = metric_name
+        results = _with_training_diagnostics(
+            results,
+            metric_name=metric_name,
+            metric_value=current_metric_value,
+            loss_info=iter_losses,
+            min_trades=min_trades,
+            best_metric_value=best_metric_value,
+        )
         results["is_best"] = False  # Will update this if it becomes the best model
-        results["loss_info"] = iter_losses
 
-        all_results.append(results)
+        current_fallback_score = _fallback_candidate_score(results)
+        if current_fallback_score > fallback_score:
+            fallback_score = current_fallback_score
+            fallback_results = dict(results)
+            model.save(fallback_model_path)
 
         # Track best loss (for logging only)
         if current_loss < best_loss:
             best_loss = current_loss
 
         # Model selection AND early stopping based on VALIDATION metric (higher is better for calmar/return)
-        # Require minimum trade count to prevent selecting near-static models
-        min_trades = max(20, len(validation_data) // 200)  # At least 1 trade per 200 bars
-        has_enough_trades = results['trade_count'] >= min_trades
-        if current_metric_value > best_metric_value and has_enough_trades:
+        # Require minimum trade count to prevent selecting near-static models.
+        has_enough_trades = results["has_enough_trades"]
+        has_enough_action_mix = results["has_enough_action_mix"]
+        if current_metric_value > best_metric_value and has_enough_trades and has_enough_action_mix:
             best_metric_value = current_metric_value
-            best_model = model
-            best_results = results
             results["is_best"] = True
+            best_results = dict(results)
             metric_stagnant_counter = 0  # Reset stagnation counter on improvement
+            model.save(best_model_path)
 
-            new_best_tag = f"{ANSI_BOLD}{ANSI_GREEN}\u2713 New best{ANSI_RESET}"
-            best_val_str = f"{ANSI_BOLD}{ANSI_GREEN}{current_metric_value:.2f}{ANSI_RESET}"
+            best_color = ANSI_GREEN if current_metric_value >= 0 else ANSI_RED
+            new_best_tag = f"{ANSI_BOLD}{best_color}\u2713 New best{ANSI_RESET}"
+            best_val_str = f"{ANSI_BOLD}{best_color}{current_metric_value:.2f}{ANSI_RESET}"
+            collapse_warning = ""
+            if results["warning_policy_collapse"]:
+                collapse_warning = f", Warnings={results['collapse_flags']}"
             logger.info(
                 f"{window_label}Iter {iteration} - {new_best_tag} "
                 f"(val {metric_name}={best_val_str}): "
                 f"Train loss={current_loss:.4f}, Portfolio: ${results['final_portfolio_value']:.2f}, "
-                f"Trades={results['trade_count']}, Actions={{{format_action_distribution(results['action_counts'])}}}"
+                f"Trades={results['trade_count']}, Actions={{{format_action_distribution(results['action_counts'])}}}, "
+                f"ActionPct(L/S/F)=({results['long_action_pct']:.1f}/{results['short_action_pct']:.1f}/{results['flat_action_pct']:.1f})"
+                f"{collapse_warning}"
             )
-        elif current_metric_value > best_metric_value and not has_enough_trades:
+        elif current_metric_value > best_metric_value and (not has_enough_trades or not has_enough_action_mix):
             metric_stagnant_counter += 1
+            reject_reasons = []
+            if not has_enough_trades:
+                reject_reasons.append(f"too few trades ({results['trade_count']}<{min_trades})")
+            if not has_enough_action_mix:
+                reject_reasons.append(
+                    f"degenerate action mix (flat={results['flat_action_pct']:.1f}%, active_actions={results['active_action_count']})"
+                )
             logger.info(
                 f"{window_label}Iter {iteration} - Val {metric_name}={color_value(current_metric_value)} "
-                f"but too few trades ({results['trade_count']}<{min_trades}) "
+                f"but rejected for {'; '.join(reject_reasons)} "
                 f"[no improvement {metric_stagnant_counter}/{n_stagnant_loops}]"
             )
-
-            # Save the best model
-            best_model.save(os.path.join(window_folder, "best_model"))
         else:
             metric_stagnant_counter += 1
+            warnings = f", Warnings={results['collapse_flags']}" if results["collapse_flags"] else ""
             logger.info(
                 f"{window_label}Iter {iteration} - Val {metric_name}={color_value(current_metric_value)}, "
                 f"Train loss={current_loss:.4f} [no improvement {metric_stagnant_counter}/{n_stagnant_loops}], "
                 f"Portfolio=${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}, "
-                f"Actions={{{format_action_distribution(results['action_counts'])}}}"
+                f"Actions={{{format_action_distribution(results['action_counts'])}}}, "
+                f"ActionPct(L/S/F)=({results['long_action_pct']:.1f}/{results['short_action_pct']:.1f}/{results['flat_action_pct']:.1f})"
+                f"{warnings}"
             )
+
+        all_results.append(dict(results))
 
         # Early stopping based on validation metric plateau (not loss)
         if metric_stagnant_counter >= n_stagnant_loops:
@@ -553,6 +737,18 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
 
     # Add loss history to best_results for saving
     best_results["loss_history"] = loss_history
+    if best_metric_value == float("-inf"):
+        logger.warning(
+            f"{window_label}No validation checkpoint satisfied trade/action-mix gates. "
+            f"Using least-bad fallback checkpoint instead."
+        )
+        best_results = dict(fallback_results or best_results)
+        best_results["selected_via_fallback"] = True
+        best_results["fallback_score"] = fallback_score
+        best_model = model.__class__.load(fallback_model_path, env=train_env, device=device)
+    else:
+        best_results["selected_via_fallback"] = False
+        best_model = model.__class__.load(best_model_path, env=train_env, device=device)
 
     total_iterations = iteration if 'iteration' in dir() else 0
     logger.info(f"{window_label}Training complete after {total_iterations} iterations. Best {metric_name}: {best_metric_value:.2f}")
@@ -598,7 +794,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     )
 
     # Reset environment and store initial net worth
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=int(config.get("seed", 42)))
     initial_net_worth = env.net_worth  # STORE INITIAL NET WORTH HERE
 
     # Check if model is RecurrentPPO (has LSTM)
@@ -611,6 +807,10 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     # Track portfolio values and actions over time
     portfolio_history = [float(env.net_worth)]
     action_history = []
+    position_history = [int(env.position)]
+    drawdown_history = [0.0]
+    evaluation_dates = []
+    price_history = []
 
     # Start evaluation
     done = False
@@ -653,6 +853,9 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
             current_price = round(float(test_data.loc[test_data.index[current_step], close_col]), 2)
         else:
             current_price = current_price_initial  # Fallback if index out of bounds
+        current_timestamp = test_data.index[current_step] if current_step < len(test_data) else test_data.index[-1]
+        evaluation_dates.append(current_timestamp)
+        price_history.append(current_price)
 
         # Get current action (handle both recurrent and non-recurrent models)
         if is_recurrent:
@@ -683,6 +886,11 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         # Get portfolio value AFTER the step
         portfolio_value_after = float(money.format_money(env.net_worth, 2))
         portfolio_history.append(portfolio_value_after)
+        position_history.append(int(env.position))
+        if env.max_net_worth > 0:
+            drawdown_history.append(float((env.net_worth - env.max_net_worth) / env.max_net_worth * 100))
+        else:
+            drawdown_history.append(0.0)
 
         # Track trade history based on position changes from the environment
         old_position = current_position
@@ -803,22 +1011,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     else:
         calmar_ratio = total_return_pct / abs(max_drawdown)
 
-    # Calculate Sortino ratio (annualized return / annualized downside deviation)
-    # Proper annualization: multiply mean by N, multiply downside_std by sqrt(N)
-    # where N = number of bars per year (252 days * 78 five-min bars/day)
-    portfolio_returns = np.diff(portfolio_array) / portfolio_array[:-1]
-    downside_returns = portfolio_returns[portfolio_returns < 0]
-    if len(downside_returns) > 0:
-        downside_std = float(np.std(downside_returns))
-        if downside_std > 0:
-            bars_per_year = 252 * 78  # 5-min bars
-            annualized_mean = float(np.mean(portfolio_returns)) * bars_per_year
-            annualized_downside_std = downside_std * np.sqrt(bars_per_year)
-            sortino_ratio = float(annualized_mean / annualized_downside_std)
-        else:
-            sortino_ratio = total_return_pct if total_return_pct > 0 else 0.0
-    else:
-        sortino_ratio = total_return_pct if total_return_pct > 0 else 0.0
+    sortino_ratio = _calculate_sortino_ratio(portfolio_array, evaluation_dates)
 
     # Prepare results
     results = {
@@ -827,9 +1020,11 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         "trade_count": trade_count,
         "hit_rate": hit_rate,
         "final_position": env.position,
-        "dates": [test_data.index[env.current_step]],
-        "price_history": [current_price],
+        "dates": evaluation_dates,
+        "price_history": price_history,
         "portfolio_history": portfolio_history,
+        "position_history": position_history,
+        "drawdown_history": drawdown_history,
         "trade_history": trade_history_df.to_dict(orient="records"),
         "buy_dates": [],
         "buy_prices": [],
@@ -861,6 +1056,11 @@ def plot_results(results):
     dates = results["dates"]
     price_history = results["price_history"]
     portfolio_history = results["portfolio_history"]
+    portfolio_dates = dates
+    if len(portfolio_history) == len(dates) + 1 and dates:
+        portfolio_dates = [dates[0]] + list(dates)
+    elif len(portfolio_history) != len(dates):
+        portfolio_dates = list(dates)[:len(portfolio_history)]
 
     # Create subplots with 2 rows in one column and shared X-axis
     fig = make_subplots(
@@ -906,7 +1106,7 @@ def plot_results(results):
     # Plot Portfolio Value in the second row
     fig.add_trace(
         go.Scatter(
-            x=dates, 
+            x=portfolio_dates,
             y=portfolio_history, 
             name="Portfolio Value", 
             line=dict(color="purple"),
@@ -1000,7 +1200,7 @@ def save_trade_history(trade_history, filename="trade_history.csv"):
 def train_walk_forward_model(train_data, validation_data, initial_timesteps=20000, additional_timesteps=10000,
                          max_iterations=200, n_stagnant_loops=10, improvement_threshold=0.05, window_folder=None,
                          run_hyperparameter_tuning=False, tuning_trials=30, tuning_folder=None, model_params=None,
-                         window_label: str = "", prev_model_path=None):
+                         window_label: str = ""):
     """
     Train a model using walk-forward optimization.
     
@@ -1079,8 +1279,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         evaluation_metric=evaluation_metric,
         model_params=model_params,
         window_folder=window_folder,
-        window_label=window_label,
-        prev_model_path=prev_model_path
+        window_label=window_label
     )
     
     # Save validation results
@@ -1116,8 +1315,26 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
                 "portfolio_value": result.get("final_portfolio_value", 0),
                 "hit_rate": result.get("hit_rate", 0),
                 "prediction_accuracy": result.get("prediction_accuracy", 0),
+                "sortino_ratio": result.get("sortino_ratio", 0),
+                "calmar_ratio": result.get("calmar_ratio", 0),
+                "max_drawdown": result.get("max_drawdown", 0),
+                "trade_count": result.get("trade_count", 0),
                 "is_best": result.get("is_best", False),
                 "metric_used": result.get("metric_used", evaluation_metric),
+                "has_enough_trades": result.get("has_enough_trades", False),
+                "has_enough_action_mix": result.get("has_enough_action_mix", False),
+                "min_trades_required": result.get("min_trades_required", 0),
+                "max_flat_action_pct": result.get("max_flat_action_pct", 0),
+                "action_counts": result.get("action_counts", {}),
+                "long_action_pct": result.get("long_action_pct", 0),
+                "short_action_pct": result.get("short_action_pct", 0),
+                "flat_action_pct": result.get("flat_action_pct", 0),
+                "dominant_action_pct": result.get("dominant_action_pct", 0),
+                "active_action_count": result.get("active_action_count", 0),
+                "metric_drop_from_best": result.get("metric_drop_from_best"),
+                "collapse_flags": result.get("collapse_flags", []),
+                "warning_policy_collapse": result.get("warning_policy_collapse", False),
+                "warning_metric_drop": result.get("warning_metric_drop", False),
                 "loss_info": result.get("loss_info", {})
             }
             training_stats.append(entry)
@@ -1135,11 +1352,7 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
     return model, result_dict
 
 def main():
-    import torch, os
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"   # CUDA 10.2+
-    set_global_seed(config["seed"])
+    enable_full_determinism(int(config["seed"]))
     
     # Ensure learning rate decay parameters exist in config
     if "model" not in config:
@@ -1229,4 +1442,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

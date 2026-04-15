@@ -31,7 +31,7 @@ class TradingEnv(gym.Env):
 
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None, random_start_pct: float = 0.0, **kwargs):
+    def __init__(self, data: pd.DataFrame, initial_balance: float = 1.0, transaction_cost: float = 0.0, position_size: int = 1, enabled_indicators: list = None, random_start_pct: float = 0.0, min_episode_steps: int = 2, **kwargs):
         """
         Initialize the trading environment.
 
@@ -105,71 +105,18 @@ class TradingEnv(gym.Env):
         if enabled_indicators is not None:
             self.technical_indicators = enabled_indicators
         else:
-            if 'supertrend' in self.data.columns:
-                self.technical_indicators.append('supertrend')
-            if 'RSI' in self.data.columns:
-                self.technical_indicators.append('RSI')
-            if 'CCI' in self.data.columns:
-                self.technical_indicators.append('CCI')
-            if 'ADX' in self.data.columns:
-                self.technical_indicators.append('ADX')
-            if 'ADX_POS' in self.data.columns:
-                self.technical_indicators.append('ADX_POS')
-            if 'ADX_NEG' in self.data.columns:
-                self.technical_indicators.append('ADX_NEG')
-            if 'STOCH_K' in self.data.columns:
-                self.technical_indicators.append('STOCH_K')
-            if 'STOCH_D' in self.data.columns:
-                self.technical_indicators.append('STOCH_D')
-            if 'MACD' in self.data.columns:
-                self.technical_indicators.append('MACD')
-            if 'MACD_SIGNAL' in self.data.columns:
-                self.technical_indicators.append('MACD_SIGNAL')
-            if 'MACD_HIST' in self.data.columns:
-                self.technical_indicators.append('MACD_HIST')
-            if 'ROC' in self.data.columns:
-                self.technical_indicators.append('ROC')
-            if 'WILLIAMS_R' in self.data.columns:
-                self.technical_indicators.append('WILLIAMS_R')
-            if 'SMA_NORM' in self.data.columns:
-                self.technical_indicators.append('SMA_NORM')
-            if 'EMA_NORM' in self.data.columns:
-                self.technical_indicators.append('EMA_NORM')
-            if 'DISPARITY' in self.data.columns:
-                self.technical_indicators.append('DISPARITY')
-            if 'ATR' in self.data.columns:
-                self.technical_indicators.append('ATR')
-            if 'OBV_NORM' in self.data.columns:
-                self.technical_indicators.append('OBV_NORM')
-            if 'CMF' in self.data.columns:
-                self.technical_indicators.append('CMF')
-            if 'PSAR_NORM' in self.data.columns:
-                self.technical_indicators.append('PSAR_NORM')
-            if 'PSAR_DIR' in self.data.columns:
-                self.technical_indicators.append('PSAR_DIR')
-            if 'VOLUME_MA' in self.data.columns:
-                self.technical_indicators.append('VOLUME_MA')
-            if 'VWAP_NORM' in self.data.columns:
-                self.technical_indicators.append('VWAP_NORM')
-            if 'DOW_SIN' in self.data.columns:
-                self.technical_indicators.append('DOW_SIN')
-            if 'DOW_COS' in self.data.columns:
-                self.technical_indicators.append('DOW_COS')
-            if 'MSO_SIN' in self.data.columns:
-                self.technical_indicators.append('MSO_SIN')
-            if 'MSO_COS' in self.data.columns:
-                self.technical_indicators.append('MSO_COS')
-            if 'ZScore' in self.data.columns:
-                self.technical_indicators.append('ZScore')
-            if 'ROLLING_DD' in self.data.columns:
-                self.technical_indicators.append('ROLLING_DD')
-            if 'VOL_PERCENTILE' in self.data.columns:
-                self.technical_indicators.append('VOL_PERCENTILE')
-            # Add LSTM-extracted features (LSTM_F0 through LSTM_F7 or more)
-            for i in range(16):  # Support up to 16 LSTM features
-                lstm_col = f'LSTM_F{i}'
-                if lstm_col in self.data.columns:
-                    self.technical_indicators.append(lstm_col)
+            excluded_cols = {
+                'time', 'timestamp', 'date', 'symbol', 'rtype', 'publisher_id', 'instrument_id',
+                'position', 'close_norm',
+                'open', 'high', 'low', 'close', 'volume',
+                'Open', 'High', 'Low', 'Close', 'Volume',
+                'OPEN', 'HIGH', 'LOW', 'CLOSE',
+            }
+            for col in self.data.columns:
+                if col in excluded_cols:
+                    continue
+                if pd.api.types.is_numeric_dtype(self.data[col]):
+                    self.technical_indicators.append(col)
             
         # Calculate observation space size: close_norm + all technical indicators + position + unrealized_pnl + time_in_position + drawdown_pct
         obs_size = 1 + len(self.technical_indicators) + 4  # +4 for position, unrealized_pnl, time_in_position, drawdown_pct
@@ -192,7 +139,10 @@ class TradingEnv(gym.Env):
         # Random start: on reset(), pick a random start within first random_start_pct of data
         # This gives vectorized envs trajectory diversity across episodes
         self.random_start_pct = random_start_pct
-        self._max_random_offset = int(self.total_steps * random_start_pct) if random_start_pct > 0 else 0
+        self.min_episode_steps = max(1, int(min_episode_steps))
+        random_window_max = int(self.total_steps * random_start_pct) if random_start_pct > 0 else 0
+        safe_offset_max = max(0, self.total_steps - self.min_episode_steps)
+        self._max_random_offset = min(random_window_max, safe_offset_max)
         self.time_in_position = 0  # Number of steps since position was opened
         self.time_flat = 0  # Number of steps with no position (for inactivity penalty)
         self.trade_count = 0  # Total number of trades made in episode
@@ -211,27 +161,21 @@ class TradingEnv(gym.Env):
         self.position_size = position_size
 
         # Pre-compute Decimal constants (avoid per-step conversions)
-        self._point_value_decimal = money.to_decimal(constants.NQ_POINT_VALUE)
+        self._point_value_decimal = money.to_decimal(constants.CONTRACT_POINT_VALUE)
         self._position_size_decimal = money.to_decimal(self.position_size)
         self._min_balance_pct_decimal = Decimal(str(constants.MIN_BALANCE_PERCENTAGE))
 
-        # Realistic execution cost model: spread + time-of-day slippage
-        # NQ tick = 0.25 pts ($5), typical half-spread = 0.25 pts during liquid hours
+        # Realistic execution cost model: fee + spread + time-of-day slippage.
+        # MBT outright tick = 5.0 quoted BTC price points = $0.50/contract.
         exec_config = config.get("execution_costs", {})
-        self._spread_points = Decimal(str(exec_config.get("half_spread_points", 0.25)))
+        self._spread_points = Decimal(str(exec_config.get("half_spread_points", 2.5)))
         base_slippage = exec_config.get("base_slippage_points", 0.10)
 
         # Pre-compute per-bar slippage in points (time-of-day dependent)
-        # For 1 NQ lot, slippage is near-zero during RTH due to massive liquidity
-        # Only meaningful if position_size scales up significantly
         if self._hours is not None and base_slippage > 0:
             slippage = np.full(len(self.data), base_slippage, dtype=np.float64)
-            # Open/close: slightly worse fills
-            slippage[(self._hours >= 13) & (self._hours < 14)] = base_slippage * 2.0
-            slippage[(self._hours >= 19) & (self._hours < 20)] = base_slippage * 2.0
-            # Overnight: wider spreads
-            slippage[(self._hours >= 0) & (self._hours < 13)] = base_slippage * 1.5
-            slippage[self._hours >= 21] = base_slippage * 1.5
+            slippage[(self._hours >= 21) | (self._hours < 1)] = base_slippage * 1.5
+            slippage[(self._hours >= 15) & (self._hours < 17)] = base_slippage * 1.25
             self._slippage_points = slippage
         else:
             self._slippage_points = np.full(len(self.data), base_slippage, dtype=np.float64)
@@ -293,6 +237,8 @@ class TradingEnv(gym.Env):
         self._reward_dd_penalty = reward_config.get("drawdown_penalty", 3.0)
         self._reward_turnover_pen = reward_config.get("turnover_penalty", 0.05)
         self._reward_calm_bonus = reward_config.get("calm_holding_bonus", 0.0005)
+        self._reward_flat_penalty = reward_config.get("flat_time_penalty", 0.0015)
+        self._reward_flat_grace = reward_config.get("flat_time_grace_steps", 6)
 
 
     def seed(self, seed=None):
@@ -817,6 +763,10 @@ class TradingEnv(gym.Env):
         # Turnover penalty: discourage excessive trading (cost already in net_worth, this is extra signal)
         if position_changed:
             reward -= turnover_pen
+
+        # Inactivity penalty: gently discourage staying flat for long stretches.
+        if self.position == 0 and self.time_flat > self._reward_flat_grace and self._reward_flat_penalty > 0:
+            reward -= self._reward_flat_penalty * float(self.time_flat - self._reward_flat_grace)
 
         # Clamp reward to prevent gradient explosion from extreme values
         return max(min(reward, 10.0), -10.0)

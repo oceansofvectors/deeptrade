@@ -115,13 +115,12 @@ class RiskManager:
         """
         # Convert price to Decimal for precise calculations
         price = money.to_decimal(price)
-        point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+        point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
         
         # Calculate max contracts based on position sizing parameter
         # Use the full position_size percentage of the portfolio
         max_position_value = self.net_worth * self.position_size
         
-        # For NQ futures, we need enough to cover the notional exposure
         # Each contract is worth price * point_value
         contract_value = price * point_value
         max_contracts = int(max_position_value / contract_value)
@@ -272,8 +271,7 @@ class RiskManager:
         
         # Percentage-based checks (original implementation)
         elif self.stop_loss_mode == "percentage" or self.take_profit_mode == "percentage":
-            # Point value for NQ futures ($20 per point)
-            point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+            point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
             
             # Calculate unrealized P&L for different scenarios
             if self.position == 1:  # Long position
@@ -320,7 +318,7 @@ class RiskManager:
             else:  # Short position
                 current_pnl_points = self.entry_price - close_price
                 
-            point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+            point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
             current_pnl_dollars = current_pnl_points * point_value * self.current_contracts
             current_pnl_pct = (current_pnl_dollars / self.entry_portfolio_value) * 100
             
@@ -359,8 +357,7 @@ class RiskManager:
         else:  # Short position
             unrealized_pnl_points = self.entry_price - close_price
             
-        # Convert to dollar value (each NQ point worth $20)
-        point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+        point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
         unrealized_pnl_dollars = unrealized_pnl_points * point_value * self.current_contracts
         
         # Calculate as percentage of entry portfolio value
@@ -397,19 +394,13 @@ class RiskManager:
         # Convert price to Decimal
         price_decimal = money.to_decimal(price)
         
-        # Calculate price change - this is the source of the issue
-        # We need to ensure this is calculated correctly for NQ futures
         price_change = money.calculate_price_change(self.entry_price, price_decimal, self.position)
         
         # Debug the price change calculation
         logging.debug(f"Exit calculation: Entry price: {self.entry_price}, Exit price: {price_decimal}")
         logging.debug(f"Position: {self.position}, Raw price change: {price_change}")
         
-        # For NQ futures:
-        # - Each full point is worth $20
-        # - The minimum tick size is 0.25 points, worth $5
-        # - Calculate contracts × points × $20/point
-        point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+        point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
         
         # Calculate dollar change - this is where we apply the point value
         # We use the raw price difference multiplied by the point value
@@ -705,7 +696,7 @@ def trade_with_risk_management(
                     logging.info(f"Stop loss (ATR) at price: {float(exit_price)}")
                 elif risk_manager.stop_loss_pct is not None:
                     # Percentage mode: calculate exact exit price from percentage
-                    point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+                    point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
                     target_loss_dollars = risk_manager.entry_portfolio_value * (risk_manager.stop_loss_pct / 100)
                     target_loss_points = target_loss_dollars / (point_value * risk_manager.current_contracts)
                     if risk_manager.position == 1:  # Long position
@@ -720,7 +711,7 @@ def trade_with_risk_management(
                     logging.info(f"Take profit (ATR) at price: {float(exit_price)}")
                 elif risk_manager.take_profit_pct is not None:
                     # Percentage mode: calculate exact exit price from percentage
-                    point_value = money.to_decimal(constants.NQ_POINT_VALUE)
+                    point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
                     target_profit_dollars = risk_manager.entry_portfolio_value * (risk_manager.take_profit_pct / 100)
                     target_profit_points = target_profit_dollars / (point_value * risk_manager.current_contracts)
                     if risk_manager.position == 1:  # Long position
@@ -742,7 +733,7 @@ def trade_with_risk_management(
             
             # Check for unrealistic profits
             price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-            expected_max_profit = price_diff * money.to_decimal(20)
+            expected_max_profit = price_diff * money.to_decimal(constants.CONTRACT_POINT_VALUE)
             
             if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
                 unrealistic_profit_count += 1
@@ -784,9 +775,9 @@ def trade_with_risk_management(
                     # Convert exit_price to Decimal to match entry_price type
                     exit_price_decimal = money.to_decimal(exit_price)
                     if risk_manager.position == 1:  # Long position
-                        unrealized_pnl = (exit_price_decimal - risk_manager.entry_price) * money.to_decimal(20) * risk_manager.current_contracts
+                        unrealized_pnl = (exit_price_decimal - risk_manager.entry_price) * money.to_decimal(constants.CONTRACT_POINT_VALUE) * risk_manager.current_contracts
                     else:  # Short position
-                        unrealized_pnl = (risk_manager.entry_price - exit_price_decimal) * money.to_decimal(20) * risk_manager.current_contracts
+                        unrealized_pnl = (risk_manager.entry_price - exit_price_decimal) * money.to_decimal(constants.CONTRACT_POINT_VALUE) * risk_manager.current_contracts
                     
                     # Log unrealized P&L before exit
                     logger.info(f"Unrealized P&L before second-to-last candle exit: ${float(unrealized_pnl):.2f}")
@@ -988,7 +979,7 @@ def trade_with_risk_management(
                 
                 # Check for unrealistic profits
                 price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-                expected_max_profit = price_diff * money.to_decimal(20)  # $20 per point for NQ
+                expected_max_profit = price_diff * money.to_decimal(constants.CONTRACT_POINT_VALUE)
                 
                 if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
                     unrealistic_profit_count += 1
@@ -1050,9 +1041,9 @@ def trade_with_risk_management(
                     # Convert exit_price to Decimal to match entry_price type
                     exit_price_decimal = money.to_decimal(exit_price)
                     if risk_manager.position == 1:  # Long position
-                        unrealized_pnl = (exit_price_decimal - risk_manager.entry_price) * money.to_decimal(20) * risk_manager.current_contracts
+                        unrealized_pnl = (exit_price_decimal - risk_manager.entry_price) * money.to_decimal(constants.CONTRACT_POINT_VALUE) * risk_manager.current_contracts
                     else:  # Short position
-                        unrealized_pnl = (risk_manager.entry_price - exit_price_decimal) * money.to_decimal(20) * risk_manager.current_contracts
+                        unrealized_pnl = (risk_manager.entry_price - exit_price_decimal) * money.to_decimal(constants.CONTRACT_POINT_VALUE) * risk_manager.current_contracts
                     
                     # Log unrealized P&L before exit
                     logger.info(f"Unrealized P&L before end-of-day exit: ${float(unrealized_pnl):.2f}")

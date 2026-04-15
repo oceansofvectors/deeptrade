@@ -14,7 +14,6 @@ import logging
 from typing import Optional, List
 import warnings
 from tqdm import tqdm
-import rrcf
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +43,8 @@ def calculate_rrcf_anomaly(df: pd.DataFrame,
         DataFrame: Original DataFrame with RRCF anomaly score column added (values in [0, 1])
     """
     try:
+        import rrcf
+
         logger.info(f"Calculating {target_col} with num_trees={num_trees}, tree_size={tree_size}")
 
         # Make a copy to avoid modifying the original

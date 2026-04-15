@@ -11,8 +11,9 @@ ANSI_GREEN = "\033[32m"
 ANSI_RED = "\033[31m"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# 0=BUY (long), 1=SELL (short), 2=HOLD, 3=FLAT (matches environment.TradingEnv)
-ACTION_NAMES = {0: "BUY", 1: "SELL", 2: "HOLD", 3: "FLAT"}
+# Standard discrete path in TradingEnv is 0=BUY/LONG, 1=SELL/SHORT, 2=FLAT.
+# Keep code 3 for legacy callers that still emit a separate HOLD-like value.
+ACTION_NAMES = {0: "BUY", 1: "SELL", 2: "FLAT", 3: "HOLD"}
 
 
 def color_value(value: float, fmt: str = ".2f", suffix: str = "") -> str:

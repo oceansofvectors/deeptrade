@@ -48,6 +48,15 @@ def calculate_macd(df, fast_period=12, slow_period=26, signal_period=9,
 
         # Calculate MACD using pandas_ta
         macd_result = ta.macd(result_df[close_col], fast=fast_period, slow=slow_period, signal=signal_period)
+        if macd_result is None or macd_result.empty:
+            logger.info(
+                "MACD warmup incomplete for %d rows; emitting zero-filled MACD columns",
+                len(result_df),
+            )
+            result_df[macd_col] = 0.0
+            result_df[signal_col] = 0.0
+            result_df[histogram_col] = 0.0
+            return result_df
 
         # Rename columns to match expected output
         result_df[macd_col] = macd_result[f'MACD_{fast_period}_{slow_period}_{signal_period}']
@@ -62,7 +71,7 @@ def calculate_macd(df, fast_period=12, slow_period=26, signal_period=9,
         return result_df
 
     except Exception as e:
-        logger.error(f"Error calculating MACD: {e}")
+        logger.warning(f"Error calculating MACD, falling back to zeros: {e}")
         if macd_col not in df.columns:
             df[macd_col] = 0
         if signal_col not in df.columns:

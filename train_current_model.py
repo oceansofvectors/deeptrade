@@ -52,6 +52,7 @@ import pytz
 
 from config import config
 from environment import TradingEnv
+from get_data import process_technical_indicators
 from indicators.lstm_features import LSTMFeatureGenerator
 from normalization import get_standardized_column_names, scale_window
 
@@ -70,7 +71,7 @@ if sys.platform == "darwin":
     _train_module.SubprocVecEnv = _fork_subproc
 from utils.data_utils import filter_market_hours
 from utils.seeding import set_global_seed
-from utils.synthetic_bears import augment_with_synthetic_bears
+from utils.synthetic_bears import augment_with_synthetic_bears, extract_ohlcv_frame
 from walk_forward import get_trading_days, load_tradingview_data
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -162,11 +163,16 @@ def maybe_apply_lstm_features(train_data, validation_data, test_data, output_dir
         "pretrain_lr": lstm_config.get("pretrain_lr", 0.001),
         "pretrain_batch_size": lstm_config.get("pretrain_batch_size", 64),
         "pretrain_patience": lstm_config.get("pretrain_patience", 10),
+        "pretrain_min_delta": lstm_config.get("pretrain_min_delta", 0.0001),
     }
     logger.info(f"Fitting LSTMFeatureGenerator: {lstm_params}")
     generator = LSTMFeatureGenerator(**lstm_params)
     checkpoint_path = str(output_dir / "lstm_autoencoder_checkpoint.pt")
-    generator.fit(train_data, checkpoint_path=checkpoint_path, warm_start_path=None)
+    generator.fit(
+        train_df=train_data,
+        validation_df=validation_data,
+        checkpoint_path=checkpoint_path
+    )
     train_data = generator.transform(train_data)
     validation_data = generator.transform(validation_data)
     test_data = generator.transform(test_data)
@@ -175,16 +181,26 @@ def maybe_apply_lstm_features(train_data, validation_data, test_data, output_dir
     return train_data, validation_data, test_data
 
 
-def maybe_apply_synthetic_bears(train_data: pd.DataFrame) -> pd.DataFrame:
+def maybe_apply_synthetic_bears(train_data: pd.DataFrame, output_dir: Path | None = None) -> pd.DataFrame:
     aug_config = config.get("augmentation", {}).get("synthetic_bears", {})
     if not aug_config.get("enabled", False):
         return train_data
-    train_data = augment_with_synthetic_bears(
-        train_data,
+    raw_train = extract_ohlcv_frame(train_data)
+    augmented_raw, metadata = augment_with_synthetic_bears(
+        raw_train,
         oversample_ratio=aug_config.get("oversample_ratio", 0.3),
         segment_length_pct=aug_config.get("segment_length_pct", 0.15),
+        seed=int(config.get("seed", 42)),
+        return_metadata=True,
     )
-    logger.info(f"Augmented train data to {len(train_data)} rows with synthetic bears")
+    train_data = process_technical_indicators(augmented_raw)
+    if metadata and output_dir is not None:
+        with open(output_dir / "synthetic_bears_report.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+    logger.info(
+        f"Augmented train data to {len(train_data)} rows with synthetic bears "
+        f"before LSTM/normalization"
+    )
     return train_data
 
 
@@ -249,7 +265,11 @@ def update_latest_symlink(output_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data", default="data/NQ_live.csv", help="Source CSV (OHLCV + timestamp)")
+    parser.add_argument(
+        "--data",
+        default=config.get("data", {}).get("csv_path", "data/NQ_live.csv"),
+        help="Source CSV (OHLCV + timestamp)",
+    )
     parser.add_argument("--output-dir", default=None, help="Bundle dir (default: models/current/<ts>)")
     parser.add_argument("--window-size", type=int, default=None, help="Trading days (default: config)")
     parser.add_argument("--seed", type=int, default=None, help="RNG seed (default: config.seed)")
@@ -297,11 +317,11 @@ def main():
         embargo_days=config["data"].get("embargo_days", 1),
     )
 
+    train_data = maybe_apply_synthetic_bears(train_data, output_dir)
+
     train_data, validation_data, test_data = maybe_apply_lstm_features(
         train_data, validation_data, test_data, output_dir
     )
-
-    train_data = maybe_apply_synthetic_bears(train_data)
 
     cols_to_scale = get_standardized_column_names(train_data)
     scaler_type = config.get("normalization", {}).get("scaler_type", "robust")
