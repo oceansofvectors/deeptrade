@@ -98,15 +98,15 @@ def _build_summary_metrics(payloads: List[Dict[str, Any]], summary_results: Dict
 
 
 def _aggregate_action_mix(payloads: List[Dict[str, Any]]) -> Dict[str, float]:
-    counts = {0: 0, 1: 0, 2: 0}
+    counts = {i: 0 for i in range(7)}
     for payload in payloads:
         for key, value in payload.get("action_counts", {}).items():
             counts[int(key)] = counts.get(int(key), 0) + int(value)
     total = max(1, sum(counts.values()))
     return {
-        "BUY": 100.0 * counts.get(0, 0) / total,
-        "SELL": 100.0 * counts.get(1, 0) / total,
-        "FLAT": 100.0 * counts.get(2, 0) / total,
+        "LONG": 100.0 * sum(counts.get(i, 0) for i in (0, 1, 2)) / total,
+        "SHORT": 100.0 * sum(counts.get(i, 0) for i in (3, 4, 5)) / total,
+        "FLAT": 100.0 * counts.get(6, 0) / total,
     }
 
 

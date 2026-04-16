@@ -1,5 +1,6 @@
-from decimal import Decimal, getcontext, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, getcontext, ROUND_HALF_UP, localcontext
 import logging
+import math
 
 # Configure decimal context for financial calculations
 # 28 digits of precision should be more than enough for any financial calculation
@@ -134,7 +135,31 @@ def format_money(value, decimal_places=2):
         Decimal: Formatted value
     """
     value = to_decimal(value)
-    return value.quantize(Decimal(f'0.{"0" * decimal_places}'))
+    if not value.is_finite():
+        logging.warning(f"Non-finite monetary value encountered during formatting: {value}")
+        return Decimal(f'0.{"0" * decimal_places}')
+    quantizer = Decimal(f'0.{"0" * decimal_places}')
+    try:
+        return value.quantize(quantizer)
+    except InvalidOperation:
+        logging.warning(f"Invalid monetary quantize for value: {value}")
+        try:
+            normalized = value.normalize()
+            digits = max(len(normalized.as_tuple().digits), 1)
+            precision = max(32, digits + decimal_places + 4)
+            with localcontext() as ctx:
+                ctx.prec = precision
+                ctx.rounding = ROUND_HALF_UP
+                return value.quantize(quantizer)
+        except InvalidOperation:
+            pass
+        try:
+            float_value = float(value)
+        except (OverflowError, ValueError):
+            return Decimal(f'0.{"0" * decimal_places}')
+        if not math.isfinite(float_value):
+            return Decimal(f'0.{"0" * decimal_places}')
+        return Decimal(f"{float_value:.{decimal_places}f}")
 
 def format_money_str(value, decimal_places=2):
     """

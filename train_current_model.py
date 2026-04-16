@@ -236,7 +236,7 @@ def build_feature_order(train_data: pd.DataFrame) -> dict:
     layout = {
         "close_norm": True,
         "indicators": indicators,
-        "state_features": ["position", "unrealized_pnl_norm", "time_in_position_norm", "drawdown_pct"],
+        "state_features": ["signed_exposure", "unrealized_pnl_norm", "time_in_position_norm", "drawdown_pct"],
         "observation_dim": int(env.observation_space.shape[0]),
     }
     expected_dim = 1 + len(indicators) + 4

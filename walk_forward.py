@@ -60,6 +60,7 @@ try:
 except ImportError:
     RECURRENT_PPO_AVAILABLE = False
 
+from action_space import action_direction, action_label
 from environment import TradingEnv
 from get_data import get_data, process_technical_indicators
 from train import evaluate_agent, plot_results, train_walk_forward_model
@@ -70,6 +71,9 @@ from utils.seeding import enable_full_determinism, seed_worker, set_global_seed 
 from utils.device import get_device  # Import device utility
 from normalization import scale_window, get_standardized_column_names  # Import both functions from normalization
 from indicators.lstm_features import LSTMFeatureGenerator, tune_lstm_hyperparameters
+from tuning_prune import normalize_action_counts as _normalize_action_counts
+from tuning_prune import should_hard_prune_trial as _should_hard_prune_trial
+from tuning_prune import tuning_prune_diagnostics as _tuning_prune_diagnostics
 from utils.synthetic_bears import augment_with_synthetic_bears, extract_ohlcv_frame
 from utils.session_context import build_session_context, session_config_from_mapping
 
@@ -138,46 +142,6 @@ def save_json(data, filepath):
     """Save data to JSON file with custom encoder for timestamps."""
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
-
-
-def _normalize_action_counts(action_counts: Dict | None) -> Dict[int, int]:
-    """Normalize action-count mappings to integer-keyed dictionaries."""
-    normalized = {0: 0, 1: 0, 2: 0}
-    if not action_counts:
-        return normalized
-    for raw_key, raw_value in action_counts.items():
-        try:
-            normalized[int(raw_key)] = int(raw_value)
-        except (TypeError, ValueError):
-            continue
-    return normalized
-
-
-def _tuning_prune_diagnostics(results: Dict) -> Dict[str, float | int | bool]:
-    """Extract simple collapse diagnostics used for early trial pruning."""
-    action_counts = _normalize_action_counts(results.get("action_counts"))
-    total_actions = max(1, sum(action_counts.values()))
-    flat_action_pct = 100.0 * action_counts.get(2, 0) / total_actions
-    active_action_count = sum(1 for count in action_counts.values() if count > 0)
-    trade_count = int(results.get("trade_count", results.get("num_trades", 0)))
-    return {
-        "trade_count": trade_count,
-        "flat_action_pct": flat_action_pct,
-        "active_action_count": active_action_count,
-    }
-
-
-def _should_hard_prune_trial(results: Dict, tuning_config: Dict) -> tuple[bool, list[str]]:
-    """Return whether a trial should be pruned immediately for degenerate behavior."""
-    diag = _tuning_prune_diagnostics(results)
-    reasons = []
-    if tuning_config.get("early_prune_zero_trade", True) and diag["trade_count"] == 0:
-        reasons.append("zero_trade")
-    if diag["flat_action_pct"] >= float(tuning_config.get("early_prune_flat_action_pct", 99.0)):
-        reasons.append("all_flat")
-    if tuning_config.get("early_prune_single_action", True) and diag["active_action_count"] <= 1:
-        reasons.append("single_action")
-    return bool(reasons), reasons
 
 
 def _narrow_hp_config(base_hp_config: Dict, best_params: Dict, shrink: float) -> Dict:
@@ -307,7 +271,7 @@ def _run_tuning_stage(
             random_start_pct=tuning_random_start_pct,
             min_episode_steps=min_episode_steps,
         )
-        batch_size = min(64, n_steps * n_envs)
+        batch_size = n_steps * n_envs if use_recurrent else min(64, n_steps * n_envs)
         device = get_device(seq_config.get("device", "auto"), for_recurrent=use_recurrent)
 
         if use_recurrent:
@@ -474,12 +438,13 @@ def _score_tuning_trial(results: Dict, validation_bars: int) -> Tuple[float, Dic
     calmar = float(results.get("calmar_ratio", 0.0))
     sortino = float(results.get("sortino_ratio", 0.0))
     max_dd = abs(float(results.get("max_drawdown", 0.0)))
+    max_allowed_drawdown_pct = float(config.get("training", {}).get("max_allowed_drawdown_pct", 40.0))
     trade_count = int(results.get("trade_count", results.get("num_trades", 0)))
     action_counts = _normalize_action_counts(results.get("action_counts"))
     total_actions = max(1, sum(action_counts.values()))
-    long_action_pct = 100.0 * action_counts.get(0, 0) / total_actions
-    short_action_pct = 100.0 * action_counts.get(1, 0) / total_actions
-    flat_action_pct = 100.0 * action_counts.get(2, 0) / total_actions
+    long_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (0, 1, 2)) / total_actions
+    short_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (3, 4, 5)) / total_actions
+    flat_action_pct = 100.0 * action_counts.get(6, 0) / total_actions
     dominant_action_pct = max(long_action_pct, short_action_pct, flat_action_pct)
     active_actions = sum(1 for count in action_counts.values() if count > 0)
     min_trades = max(5, validation_bars // 250)
@@ -509,6 +474,10 @@ def _score_tuning_trial(results: Dict, validation_bars: int) -> Tuple[float, Dic
     if flat_action_pct >= 95.0:
         penalties.append(("always_flat", 3.0))
         collapse_flags.append("always_flat")
+    if max_dd > max_allowed_drawdown_pct:
+        penalty = 6.0 + max(0.0, max_dd - max_allowed_drawdown_pct) * 0.2
+        penalties.append(("excessive_drawdown", penalty))
+        collapse_flags.append("excessive_drawdown")
 
     total_penalty = float(sum(penalty for _, penalty in penalties))
     composite_score = base_score - total_penalty
@@ -525,6 +494,7 @@ def _score_tuning_trial(results: Dict, validation_bars: int) -> Tuple[float, Dic
         "flat_action_pct": flat_action_pct,
         "dominant_action_pct": dominant_action_pct,
         "active_action_count": active_actions,
+        "max_allowed_drawdown_pct": max_allowed_drawdown_pct,
     }
     return composite_score, diagnostics
 
@@ -575,13 +545,24 @@ def _score_constant_action_baselines(
     evaluation_sets: List[pd.DataFrame],
     reference_columns: List[str],
 ) -> List[Dict[str, float]]:
-    """Score always-buy/sell/flat baselines once per evaluation set."""
+    """Score trivial constant policies across the full 7-action space."""
     baseline_scores = []
     for dataset in evaluation_sets:
         aligned = _align_feature_columns(reference_columns, dataset)
         action_scores = {}
-        for action in (0, 1, 2):
-            results = evaluate_agent(_ConstantActionModel(action), aligned, verbose=0, deterministic=True)
+        for action in range(7):
+            try:
+                results = evaluate_agent(_ConstantActionModel(action), aligned, verbose=0, deterministic=True)
+            except Exception as exc:
+                logger.warning(f"Constant-action baseline {action_label(action)} failed: {exc}")
+                results = {
+                    "total_return_pct": -100.0,
+                    "sortino_ratio": -10.0,
+                    "calmar_ratio": -1.0,
+                    "max_drawdown": -100.0,
+                    "trade_count": 0,
+                    "action_counts": {action: len(aligned)},
+                }
             score, _ = _score_tuning_trial(results, len(aligned))
             action_scores[action] = score
         baseline_scores.append(action_scores)
@@ -624,6 +605,86 @@ def _resolve_close_column(df: pd.DataFrame) -> str:
         if candidate in df.columns:
             return candidate
     raise KeyError("No close column found in dataframe")
+
+
+def _sanitize_ohlc_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace implausible OHLC outliers with nearby valid prices.
+
+    Some vendor files contain positive but obviously bad crypto prints
+    (for example BTC bars at 145.0 in an otherwise 25k-30k regime). Those
+    values do not trip simple non-finite/<=0 guards, but they blow up
+    contract sizing and downstream portfolio accounting. Clean them before
+    feature generation so both observations and valuation use the same price path.
+    """
+    if df.empty:
+        return df
+
+    close_col = _resolve_close_column(df)
+    sanitized = df.copy()
+    close_series = pd.to_numeric(sanitized[close_col], errors="coerce")
+    finite_positive = close_series[np.isfinite(close_series) & (close_series > 0)]
+    if finite_positive.empty:
+        return sanitized
+
+    median_price = float(finite_positive.median())
+    if not np.isfinite(median_price) or median_price <= 0:
+        return sanitized
+
+    low_cutoff = median_price * 0.1
+    high_cutoff = median_price * 10.0
+
+    def _clean_price_series(series: pd.Series, *, replacement: pd.Series | None = None) -> tuple[pd.Series, int]:
+        numeric = pd.to_numeric(series, errors="coerce")
+        invalid_mask = (~np.isfinite(numeric)) | (numeric <= 0) | (numeric < low_cutoff) | (numeric > high_cutoff)
+        invalid_count = int(invalid_mask.sum())
+        if not invalid_count:
+            return numeric, 0
+
+        cleaned = numeric.copy()
+        cleaned.loc[invalid_mask] = np.nan
+        cleaned = cleaned.ffill().bfill()
+        if replacement is not None:
+            cleaned.loc[cleaned.isna()] = replacement.loc[cleaned.isna()]
+        cleaned = cleaned.fillna(median_price)
+        return cleaned.astype(float), invalid_count
+
+    clean_close, invalid_close = _clean_price_series(close_series)
+    if invalid_close:
+        logger.warning(
+            "Sanitized %d implausible '%s' values outside [%s, %s]",
+            invalid_close,
+            close_col,
+            round(low_cutoff, 2),
+            round(high_cutoff, 2),
+        )
+    sanitized[close_col] = clean_close
+
+    ohlc_variants = {
+        close_col,
+        "open", "Open", "OPEN",
+        "high", "High", "HIGH",
+        "low", "Low", "LOW",
+    }
+    for col in [c for c in ohlc_variants if c in sanitized.columns and c != close_col]:
+        clean_col, invalid_count = _clean_price_series(sanitized[col], replacement=clean_close)
+        if invalid_count:
+            logger.warning(
+                "Sanitized %d implausible '%s' values outside [%s, %s]",
+                invalid_count,
+                col,
+                round(low_cutoff, 2),
+                round(high_cutoff, 2),
+            )
+        sanitized[col] = clean_col
+
+    return sanitized
+
+
+def _recompute_clean_slice(df: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild indicators from cleaned raw OHLCV for a window slice."""
+    raw = extract_ohlcv_frame(df)
+    raw = _sanitize_ohlc_outliers(raw)
+    return process_technical_indicators(raw)
 
 
 def build_window_report_payload(
@@ -733,10 +794,11 @@ def build_window_report_payload(
 def _augment_training_slice(train_data: pd.DataFrame, window_folder: str | None = None) -> Tuple[pd.DataFrame, Dict | None]:
     """Augment raw OHLCV and recompute indicators for the train slice."""
     aug_config = config.get("augmentation", {}).get("synthetic_bears", {})
-    if not aug_config.get("enabled", False):
-        return train_data, None
-
     raw_train = extract_ohlcv_frame(train_data)
+    raw_train = _sanitize_ohlc_outliers(raw_train)
+    if not aug_config.get("enabled", False):
+        return process_technical_indicators(raw_train), None
+
     augmented_raw, metadata = augment_with_synthetic_bears(
         raw_train,
         oversample_ratio=aug_config.get("oversample_ratio", 0.3),
@@ -744,6 +806,7 @@ def _augment_training_slice(train_data: pd.DataFrame, window_folder: str | None 
         seed=int(config.get("seed", 42)),
         return_metadata=True,
     )
+    augmented_raw = _sanitize_ohlc_outliers(augmented_raw)
     recomputed_train = process_technical_indicators(augmented_raw)
 
     if metadata and window_folder:
@@ -778,7 +841,7 @@ def _prepare_tuning_inputs(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict | None]:
     """Prepare train/validation inputs for PPO tuning using the window pipeline."""
     prepared_train, synth_metadata = _augment_training_slice(train_data.copy(), window_folder)
-    prepared_val = validation_data.copy()
+    prepared_val = _recompute_clean_slice(validation_data.copy())
 
     if lstm_params is not None:
         tuning_lstm_generator = LSTMFeatureGenerator(
@@ -1269,6 +1332,7 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
     
     # Position tracking
     current_position = 0  # 0 = no position, 1 = long, -1 = short
+    current_contracts = 0
     entry_price = Decimal('0')  # Track entry price for P&L calculation
 
     # Trade tracking
@@ -1304,15 +1368,7 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
             position_action = int(action)
         action_history.append(position_action)
 
-        # Convert action to position (0 = long/buy, 1 = short/sell, 2 = hold, 3 = flat)
-        if position_action == 0:  # Long
-            new_position = 1
-        elif position_action == 1:  # Short
-            new_position = -1
-        elif position_action == 3:  # Flat - close position
-            new_position = 0
-        else:  # Hold - maintain current position
-            new_position = current_position
+        new_position = action_direction(position_action)
         
         # Check if we're at the last step or not
         # We need the next price to determine if prediction was correct
@@ -1324,11 +1380,11 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
             # Evaluate prediction accuracy based on action type
             prediction_correct = False
             
-            if action == 0:  # Long - prediction is correct if price goes up
+            if new_position == 1:
                 prediction_correct = price_change > 0
-            elif action == 1:  # Short - prediction is correct if price goes down
+            elif new_position == -1:
                 prediction_correct = price_change < 0
-            elif action == 3:  # Flat - prediction is correct if avoiding losses (price moves against previous position)
+            else:
                 # Flat is correct if we avoided a losing move
                 if current_position == 1:  # Was long, flat is correct if price went down
                     prediction_correct = price_change < 0
@@ -1337,11 +1393,6 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
                 else:  # Already flat, correct if price doesn't move much
                     threshold = current_price * money.to_decimal(0.001)
                     prediction_correct = abs(price_change) <= threshold
-            else:  # Hold (action == 2) - prediction is correct if price doesn't change much
-                # For hold, we'll define "correct" as the price not changing significantly
-                # Using a threshold of 0.1% of the current price
-                threshold = current_price * money.to_decimal(0.001)
-                prediction_correct = abs(price_change) <= threshold
             
             # Record prediction
             total_predictions += 1
@@ -1353,63 +1404,79 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
                 accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
                 logger.info(f"Step {current_step}: Predictions so far - {correct_predictions}/{total_predictions} correct ({accuracy:.2f}%)")
         
-        # Only record actual position changes (not every step)
-        position_changed = new_position != current_position
-        if position_changed:
-            trade_count += 1
+        old_position = current_position
 
-            # Calculate P&L for exiting trades
-            is_profitable = False
-            trade_pnl = Decimal('0')
-            if current_position != 0 and entry_price > 0:
-                if current_position == 1:  # Was long
-                    trade_pnl = current_price - entry_price
-                    is_profitable = trade_pnl > 0
-                elif current_position == -1:  # Was short
-                    trade_pnl = entry_price - current_price
-                    is_profitable = trade_pnl > 0
-
-            action_names = {0: "LONG", 1: "SHORT", 2: "HOLD", 3: "FLAT"}
-            trade_info = {
-                "step": current_step,
-                "action": action_names.get(int(action), "UNKNOWN"),
-                "price": float(current_price),
-                "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step]),
-                "old_position": current_position,
-                "new_position": new_position,
-                "entry_price": float(entry_price) if entry_price > 0 else None,
-                "trade_pnl_points": float(trade_pnl),
-                "profitable": is_profitable
-            }
-            trade_history.append(trade_info)
-
-            # Update entry price for new positions
-            if new_position != 0:
-                entry_price = current_price
-            else:
-                entry_price = Decimal('0')
-
-            current_position = new_position
-        
         # Take step in environment
         new_obs, reward, done, truncated, info = env.step(action)
         obs = new_obs
         done = done or truncated
+
+        # Track actual environment rebalances, not just direction changes.
+        position_changed = bool(info.get("position_changed", False))
+        env_old_position = int(info.get("old_position", current_position))
+        env_new_position = int(info.get("position", env.position))
+        old_contracts = int(info.get("old_contracts", current_contracts))
+        new_contracts = int(info.get("current_contracts", current_contracts))
+        if position_changed:
+            trade_count += 1
+            realized_trade = (
+                old_contracts != 0 and (
+                    new_contracts == 0
+                    or np.sign(old_contracts) != np.sign(new_contracts)
+                    or abs(new_contracts) < abs(old_contracts)
+                )
+            )
+
+            is_profitable = False
+            trade_pnl = Decimal('0')
+            if realized_trade and entry_price > 0:
+                if env_old_position == 1:
+                    trade_pnl = current_price - entry_price
+                    is_profitable = trade_pnl > 0
+                elif env_old_position == -1:
+                    trade_pnl = entry_price - current_price
+                    is_profitable = trade_pnl > 0
+
+            trade_info = {
+                "step": current_step,
+                "action": action_label(int(position_action)),
+                "price": float(current_price),
+                "timestamp": test_data.index[current_step].strftime('%Y-%m-%d %H:%M:%S') if hasattr(test_data.index[current_step], 'strftime') else str(test_data.index[current_step]),
+                "old_position": env_old_position,
+                "new_position": env_new_position,
+                "old_contracts": old_contracts,
+                "new_contracts": new_contracts,
+                "entry_price": float(entry_price) if entry_price > 0 else None,
+                "trade_pnl_points": float(trade_pnl),
+                "realized_trade": realized_trade,
+                "profitable": is_profitable
+            }
+            trade_history.append(trade_info)
+
+            if new_contracts != 0:
+                entry_price = money.to_decimal(info.get("avg_entry_price", current_price))
+            else:
+                entry_price = Decimal('0')
+
+            current_position = env_new_position
+            current_contracts = new_contracts
 
         # Update portfolio from environment
         current_portfolio = env.net_worth
         # Sample portfolio history (every 10 steps or on position change) to reduce memory
         if position_changed or len(portfolio_history) == 0 or current_step % 10 == 0:
             portfolio_history.append(float(current_portfolio))
+
+        current_position = env_new_position
+        current_contracts = new_contracts
     
     # Calculate final metrics
     prediction_accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
     total_return_pct = money.calculate_return_pct(current_portfolio, initial_balance)
     
-    # Calculate hit rate (percentage of profitable trades) from actual trade P&L
+    # Calculate hit rate from realized trade events only.
     profitable_trades = sum(1 for t in trade_history if t.get("profitable", False))
-    # Only count trades that exited a position (have entry_price)
-    completed_trades = sum(1 for t in trade_history if t.get("entry_price") is not None)
+    completed_trades = sum(1 for t in trade_history if t.get("realized_trade", False))
     hit_rate = (profitable_trades / completed_trades * 100) if completed_trades > 0 else 0
     
     # Create results dictionary
@@ -1424,6 +1491,7 @@ def evaluate_agent_prediction_accuracy(model, test_data, verbose=0, deterministi
         "trade_history": trade_history,
         "hit_rate": hit_rate,
         "profitable_trades": profitable_trades,
+        "completed_trades": completed_trades,
         "final_position": current_position,
         "portfolio_history": portfolio_history,
         "action_history": action_history
@@ -1526,6 +1594,8 @@ def process_single_window(
     # Augment the raw train slice first, then recompute indicators so synthetic
     # episodes have internally consistent features.
     train_data, synthetic_bears_metadata = _augment_training_slice(train_data, window_folder)
+    validation_data = _recompute_clean_slice(validation_data)
+    test_data = _recompute_clean_slice(test_data)
 
     # Generate LSTM features if enabled (train per window on that window's training data)
     lstm_config = config.get("indicators", {}).get("lstm_features", {})
@@ -1816,7 +1886,7 @@ def process_single_window(
     window_result["calmar_ratio"] = calmar
     window_result["sortino_ratio"] = sortino
     ret_pct = test_results['total_return_pct']
-    action_dist = format_action_distribution(test_results.get('action_history'))
+    action_dist = format_action_distribution(test_results.get('action_history') or test_results.get('action_counts'))
     logger.info(
         f"Window {window_idx}: Return={color_pct(ret_pct)}, "
         f"Sortino={bold(f'{sortino:.2f}')}, MaxDD={max_dd:.2f}%, Calmar={calmar:.2f}, "

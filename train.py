@@ -24,6 +24,7 @@ except ImportError:
     RECURRENT_PPO_AVAILABLE = False
 
 # Local application imports
+from action_space import action_label
 from config import config
 from environment import TradingEnv
 from get_data import get_data
@@ -82,12 +83,14 @@ def _with_training_diagnostics(
     enriched = dict(results)
     action_counts = {int(k): int(v) for k, v in enriched.get("action_counts", {}).items()}
     total_actions = max(1, sum(action_counts.values()))
-    long_action_pct = 100.0 * action_counts.get(0, 0) / total_actions
-    short_action_pct = 100.0 * action_counts.get(1, 0) / total_actions
-    flat_action_pct = 100.0 * action_counts.get(2, 0) / total_actions
+    long_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (0, 1, 2)) / total_actions
+    short_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (3, 4, 5)) / total_actions
+    flat_action_pct = 100.0 * action_counts.get(6, 0) / total_actions
     dominant_action_pct = max(long_action_pct, short_action_pct, flat_action_pct)
     active_actions = sum(1 for count in action_counts.values() if count > 0)
     max_flat_action_pct = float(config.get("training", {}).get("max_flat_action_pct", 80.0))
+    max_allowed_drawdown_pct = float(config.get("training", {}).get("max_allowed_drawdown_pct", 40.0))
+    max_drawdown_abs = abs(float(enriched.get("max_drawdown", 0.0)))
     metric_drop_from_best = None if best_metric_value is None else metric_value - best_metric_value
 
     collapse_flags = []
@@ -97,6 +100,8 @@ def _with_training_diagnostics(
         collapse_flags.append("flat_dominance")
     if active_actions <= 1:
         collapse_flags.append("single_action_policy")
+    if max_drawdown_abs > max_allowed_drawdown_pct:
+        collapse_flags.append("excessive_drawdown")
     if enriched.get("trade_count", 0) < min_trades:
         collapse_flags.append("too_few_trades")
     if metric_drop_from_best is not None and metric_drop_from_best <= -2.0:
@@ -107,14 +112,18 @@ def _with_training_diagnostics(
         and active_actions > 1
         and dominant_action_pct < 95.0
     )
+    has_acceptable_drawdown = max_drawdown_abs <= max_allowed_drawdown_pct
 
     enriched.update({
         "metric_used": metric_name,
         "loss_info": loss_info,
         "has_enough_trades": enriched.get("trade_count", 0) >= min_trades,
         "has_enough_action_mix": has_enough_action_mix,
+        "has_acceptable_drawdown": has_acceptable_drawdown,
         "min_trades_required": min_trades,
         "max_flat_action_pct": max_flat_action_pct,
+        "max_allowed_drawdown_pct": max_allowed_drawdown_pct,
+        "max_drawdown_abs": max_drawdown_abs,
         "action_counts": action_counts,
         "long_action_pct": long_action_pct,
         "short_action_pct": short_action_pct,
@@ -124,9 +133,12 @@ def _with_training_diagnostics(
         "metric_drop_from_best": metric_drop_from_best,
         "collapse_flags": collapse_flags,
         "warning_policy_collapse": any(
-            flag in collapse_flags for flag in ("dominant_action", "flat_dominance", "single_action_policy")
+            flag in collapse_flags for flag in ("dominant_action", "flat_dominance", "single_action_policy", "excessive_drawdown")
         ),
         "warning_metric_drop": "metric_drop" in collapse_flags,
+        "action_distribution": {
+            action_label(i): 100.0 * action_counts.get(i, 0) / total_actions for i in range(7)
+        },
     })
     return enriched
 
@@ -304,8 +316,13 @@ def train_agent(train_data, total_timesteps: int):
     check_env(single_env, skip_render_check=True)
 
     # Create vectorized environment for faster rollout collection
+    # Get sequence model config
+    seq_config = config.get("sequence_model", {})
+    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
     n_envs = config.get("training", {}).get("n_envs", 4)
     env_kwargs["random_start_pct"] = float(config.get("training", {}).get("random_start_pct", 0.2))
+    if use_recurrent:
+        env_kwargs["min_episode_steps"] = max(2, int(config["model"].get("n_steps", 2048)))
 
     def make_env(data, **kwargs):
         return lambda: TradingEnv(data.copy(), **kwargs)
@@ -317,12 +334,6 @@ def train_agent(train_data, total_timesteps: int):
         env = DummyVecEnv([make_env(train_data, **env_kwargs)])
         logger.info(f"Using DummyVecEnv (single process)")
     env.seed(base_seed)
-
-    # Get sequence model config
-    seq_config = config.get("sequence_model", {})
-    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
-    if use_recurrent:
-        env_kwargs["min_episode_steps"] = max(2, int(config["model"].get("n_steps", 2048)))
 
     # Get device configuration (use CPU for recurrent models due to MPS LSTM bugs)
     device_config = seq_config.get("device", "auto")
@@ -368,12 +379,16 @@ def train_agent(train_data, total_timesteps: int):
     if use_recurrent:
         logger.info("Using RecurrentPPO with LSTM policy for temporal sequence learning")
         shared_lstm = seq_config.get("shared_lstm", False)
+        rollout_steps = int(config["model"].get("n_steps", 2048))
+        recurrent_batch_size = rollout_steps * max(1, int(n_envs))
         model = RecurrentPPO(
             "MlpLstmPolicy",
             env,
             verbose=1,
             learning_rate=learning_rate,
             ent_coef=ent_coef,
+            n_steps=rollout_steps,
+            batch_size=recurrent_batch_size,
             seed=config.get('seed'),
             device=device,
             policy_kwargs={
@@ -445,20 +460,9 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     n_envs = config.get("training", {}).get("n_envs", 4)
     env_kwargs["random_start_pct"] = float(config.get("training", {}).get("random_start_pct", 0.2))
 
-    def make_env(data, **kwargs):
-        return lambda: TradingEnv(data.copy(), **kwargs)
-
-    if n_envs > 1:
-        train_env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
-        logger.info(f"{window_label}Using SubprocVecEnv with {n_envs} processes for faster rollouts")
-    else:
-        train_env = DummyVecEnv([make_env(train_data, **env_kwargs)])
-        logger.info(f"{window_label}Using DummyVecEnv (single process)")
-    train_env.seed(base_seed)
-    
     # Get verbosity level from config
     verbose_level = config["training"].get("verbose", 1)
-    
+
     # Use provided model parameters or get defaults from config
     if model_params is None:
         model_params = {
@@ -499,6 +503,17 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     if use_recurrent:
         env_kwargs["min_episode_steps"] = max(2, int(model_params.get("n_steps", config["model"].get("n_steps", 2048))))
 
+    def make_env(data, **kwargs):
+        return lambda: TradingEnv(data.copy(), **kwargs)
+
+    if n_envs > 1:
+        train_env = SubprocVecEnv([make_env(train_data, **env_kwargs) for _ in range(n_envs)])
+        logger.info(f"{window_label}Using SubprocVecEnv with {n_envs} processes for faster rollouts")
+    else:
+        train_env = DummyVecEnv([make_env(train_data, **env_kwargs)])
+        logger.info(f"{window_label}Using DummyVecEnv (single process)")
+    train_env.seed(base_seed)
+
     # Get entropy coefficient decay parameters from config or use defaults
     use_ent_decay = config["model"].get("ent_coef_decay", False)
     entropy_callback = None
@@ -527,6 +542,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         lstm_hidden_size = model_params.get("lstm_hidden_size", seq_config.get("lstm_hidden_size", 256))
         n_lstm_layers = model_params.get("n_lstm_layers", seq_config.get("n_lstm_layers", 1))
         shared_lstm = seq_config.get("shared_lstm", False)
+        rollout_steps = int(model_params.get("n_steps", 2048))
+        recurrent_batch_size = rollout_steps * max(1, int(n_envs))
 
         model = RecurrentPPO(
             "MlpLstmPolicy",
@@ -534,8 +551,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             verbose=verbose_level,
             ent_coef=ent_coef,
             learning_rate=learning_rate,
-            n_steps=model_params.get("n_steps", 2048),
-            batch_size=model_params.get("batch_size", 64),
+            n_steps=rollout_steps,
+            batch_size=recurrent_batch_size,
             gamma=model_params.get("gamma", 0.99),
             seed=config.get('seed'),
             gae_lambda=model_params.get("gae_lambda", 0.95),
@@ -607,7 +624,11 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         loss_info=initial_losses,
         min_trades=min_trades,
     )
-    initial_candidate_ok = results["has_enough_trades"] and results["has_enough_action_mix"]
+    initial_candidate_ok = (
+        results["has_enough_trades"]
+        and results["has_enough_action_mix"]
+        and results["has_acceptable_drawdown"]
+    )
     results["is_best"] = initial_candidate_ok
     best_results = dict(results)
     fallback_score = _fallback_candidate_score(results)
@@ -681,7 +702,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         # Require minimum trade count to prevent selecting near-static models.
         has_enough_trades = results["has_enough_trades"]
         has_enough_action_mix = results["has_enough_action_mix"]
-        if current_metric_value > best_metric_value and has_enough_trades and has_enough_action_mix:
+        has_acceptable_drawdown = results["has_acceptable_drawdown"]
+        if current_metric_value > best_metric_value and has_enough_trades and has_enough_action_mix and has_acceptable_drawdown:
             best_metric_value = current_metric_value
             results["is_best"] = True
             best_results = dict(results)
@@ -702,7 +724,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
                 f"ActionPct(L/S/F)=({results['long_action_pct']:.1f}/{results['short_action_pct']:.1f}/{results['flat_action_pct']:.1f})"
                 f"{collapse_warning}"
             )
-        elif current_metric_value > best_metric_value and (not has_enough_trades or not has_enough_action_mix):
+        elif current_metric_value > best_metric_value and (not has_enough_trades or not has_enough_action_mix or not has_acceptable_drawdown):
             metric_stagnant_counter += 1
             reject_reasons = []
             if not has_enough_trades:
@@ -710,6 +732,10 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             if not has_enough_action_mix:
                 reject_reasons.append(
                     f"degenerate action mix (flat={results['flat_action_pct']:.1f}%, active_actions={results['active_action_count']})"
+                )
+            if not has_acceptable_drawdown:
+                reject_reasons.append(
+                    f"max drawdown too high ({results['max_drawdown_abs']:.1f}%>{results['max_allowed_drawdown_pct']:.1f}%)"
                 )
             logger.info(
                 f"{window_label}Iter {iteration} - Val {metric_name}={color_value(current_metric_value)} "
@@ -818,11 +844,12 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     step_count = 0
     trade_count = 0
 
-    # Track trading positions
+    # Track trading state
     current_position = 0  # 0 = no position, 1 = long, -1 = short
+    current_contracts = 0
 
     # Track entry points for trades
-    entry_price = 0
+    entry_price = Decimal('0')
     entry_step = -1
     trade_history = []
     last_action = None  # Track the last action to record action changes
@@ -835,8 +862,8 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     else:
         close_col = 'close'
 
-    # Get initial price for reference
-    current_price_initial = round(float(test_data.loc[test_data.index[env.current_step], close_col]), 2)
+    # Get initial price for reference from the environment's sanitized price path.
+    current_price_initial = round(float(env._get_current_price()), 2)
 
     if verbose > 0:
         print(f"Starting evaluation with initial price: ${current_price_initial}")
@@ -848,9 +875,9 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         # Get current step information
         current_step = env.current_step
 
-        # Get current price
-        if current_step < len(test_data):
-            current_price = round(float(test_data.loc[test_data.index[current_step], close_col]), 2)
+        # Get current price from the environment so trade accounting uses sanitized prices.
+        if current_step <= env.total_steps:
+            current_price = round(float(env._get_current_price()), 2)
         else:
             current_price = current_price_initial  # Fallback if index out of bounds
         current_timestamp = test_data.index[current_step] if current_step < len(test_data) else test_data.index[-1]
@@ -892,47 +919,52 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         else:
             drawdown_history.append(0.0)
 
-        # Track trade history based on position changes from the environment
-        old_position = current_position
-        new_position = env.position
+        # Track trade history based on actual environment rebalances.
+        position_changed = bool(info.get("position_changed", False))
+        old_position = int(info.get("old_position", current_position))
+        new_position = int(info.get("position", env.position))
+        old_contracts = int(info.get("old_contracts", current_contracts))
+        new_contracts = int(info.get("current_contracts", current_contracts))
 
-        if new_position != old_position:
+        if position_changed:
             trade_count += 1
+            realized_trade = (
+                old_contracts != 0 and (
+                    new_contracts == 0
+                    or np.sign(old_contracts) != np.sign(new_contracts)
+                    or abs(new_contracts) < abs(old_contracts)
+                )
+            )
 
-            # Determine trade type based on position change
-            if new_position == 1:
-                trade_type = "Long"
-            elif new_position == -1:
-                trade_type = "Short"
-            elif new_position == 0:
-                trade_type = "Flat"
+            if old_contracts == 0 and new_contracts != 0:
+                trade_type = "Long Entry" if new_contracts > 0 else "Short Entry"
+            elif old_contracts != 0 and new_contracts == 0:
+                trade_type = "Exit"
+            elif old_contracts != 0 and new_contracts != 0 and np.sign(old_contracts) != np.sign(new_contracts):
+                trade_type = "Flip"
+            elif abs(new_contracts) > abs(old_contracts):
+                trade_type = "Scale In"
+            elif abs(new_contracts) < abs(old_contracts):
+                trade_type = "Scale Out"
             else:
-                trade_type = "Unknown"
+                trade_type = "Rebalance"
 
-            # Calculate if this trade was profitable (for exits)
+            # Only reductions/exits/flips realize P&L in a meaningful way for hit-rate tracking.
             is_profitable = False
-            if old_position != 0 and entry_price > 0:
-                # We had a position and are changing it - calculate P&L
+            if realized_trade and entry_price > 0:
                 if old_position == 1:  # Was long
                     is_profitable = current_price > entry_price
                 elif old_position == -1:  # Was short
                     is_profitable = current_price < entry_price
 
-            # For position_from/position_to:
-            # - Entry (Long/Short from Flat): position_from=0, position_to=entry_price
-            # - Exit (Flat from Long/Short): position_from=entry_price, position_to=0
-            # - Flip (Long to Short or vice versa): position_from=old_entry, position_to=new_entry
-            if old_position == 0:
-                # New entry from flat
+            if old_contracts == 0:
                 pos_from = 0.0
                 pos_to = current_price
-            elif new_position == 0:
-                # Exit to flat
-                pos_from = float(entry_price) if entry_price > 0 else current_price
+            elif new_contracts == 0:
+                pos_from = float(entry_price) if entry_price > 0 else float(current_price)
                 pos_to = 0.0
             else:
-                # Flip position (long to short or short to long)
-                pos_from = float(entry_price) if entry_price > 0 else current_price
+                pos_from = float(entry_price) if entry_price > 0 else float(current_price)
                 pos_to = current_price
 
             trade_history.append({
@@ -943,19 +975,25 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
                 "profitable": is_profitable,
                 "position_from": pos_from,
                 "position_to": pos_to,
+                "old_contracts": old_contracts,
+                "new_contracts": new_contracts,
+                "avg_entry_price": float(info.get("avg_entry_price", 0.0)),
+                "realized_trade": realized_trade,
                 "exit_reason": ""
             })
 
-            # Update entry price for new positions
-            if new_position != 0:
-                entry_price = current_price
+            if new_contracts != 0:
+                entry_price = money.to_decimal(info.get("avg_entry_price", current_price))
                 entry_step = current_step
             else:
-                # Flat - reset entry price
-                entry_price = 0
+                entry_price = Decimal('0')
                 entry_step = -1
 
             current_position = new_position
+            current_contracts = new_contracts
+
+        current_position = new_position
+        current_contracts = new_contracts
 
         # Update last action
         last_action = action
@@ -975,10 +1013,9 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     return_pct = money.calculate_return_pct(final_net_worth, initial_net_worth)
     
     # Calculate hit rate (percentage of profitable trades)
-    hit_rate = 0
-    if trade_count > 0:
-        profitable_count = sum(1 for t in trade_history if t.get("profitable", False))
-        hit_rate = (profitable_count / trade_count) * 100
+    completed_trades = sum(1 for t in trade_history if t.get("realized_trade", False))
+    profitable_count = sum(1 for t in trade_history if t.get("profitable", False))
+    hit_rate = (profitable_count / completed_trades) * 100 if completed_trades > 0 else 0
     
     # Calculate portfolio value
     final_portfolio_value = float(money.format_money(env.net_worth, 2))
@@ -989,8 +1026,8 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     # Calculate trade history
     trade_history_df = pd.DataFrame(trade_history)
     
-    # Calculate action distribution (0=Long, 1=Short, 2=Flat)
-    action_counts = {0: 0, 1: 0, 2: 0}
+    # Calculate action distribution across the 7 target-allocation actions.
+    action_counts = {i: 0 for i in range(7)}
     for action in action_history:
         action_val = int(action)
         if action_val in action_counts:
@@ -1031,6 +1068,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         "sell_dates": [],
         "sell_prices": [],
         "action_counts": action_counts,
+        "completed_trades": completed_trades,
         "max_drawdown": max_drawdown,
         "calmar_ratio": calmar_ratio,
         "sortino_ratio": sortino_ratio
@@ -1039,10 +1077,10 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     # Add additional information
     results["metric_used"] = "return"
     results["is_best"] = False
-    results["profitable_trades"] = sum(1 for t in trade_history if t.get("profitable", False))
+    results["profitable_trades"] = profitable_count
     results["profitable"] = total_return_pct > 0
     results["profitable_pct"] = total_return_pct
-    results["profitable_trade_pct"] = results["profitable_trades"] / trade_count * 100 if trade_count > 0 else 0
+    results["profitable_trade_pct"] = results["profitable_trades"] / completed_trades * 100 if completed_trades > 0 else 0
     results["profitable_trade_return"] = results["profitable_trade_pct"]
     results["profitable_trade_return_pct"] = results["profitable_trade_pct"]
     results["profitable_trade_return_str"] = f"{results['profitable_trade_pct']:.2f}%"
@@ -1282,6 +1320,40 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         window_label=window_label
     )
     
+    training_stats = []
+
+    # Prepare training stats for all iterations
+    for i, result in enumerate(all_results):
+        entry = {
+            "iteration": i,
+            "return_pct": result.get("total_return_pct", 0),
+            "portfolio_value": result.get("final_portfolio_value", 0),
+            "hit_rate": result.get("hit_rate", 0),
+            "prediction_accuracy": result.get("prediction_accuracy", 0),
+            "sortino_ratio": result.get("sortino_ratio", 0),
+            "calmar_ratio": result.get("calmar_ratio", 0),
+            "max_drawdown": result.get("max_drawdown", 0),
+            "trade_count": result.get("trade_count", 0),
+            "is_best": result.get("is_best", False),
+            "metric_used": result.get("metric_used", evaluation_metric),
+            "has_enough_trades": result.get("has_enough_trades", False),
+            "has_enough_action_mix": result.get("has_enough_action_mix", False),
+            "min_trades_required": result.get("min_trades_required", 0),
+            "max_flat_action_pct": result.get("max_flat_action_pct", 0),
+            "action_counts": result.get("action_counts", {}),
+            "long_action_pct": result.get("long_action_pct", 0),
+            "short_action_pct": result.get("short_action_pct", 0),
+            "flat_action_pct": result.get("flat_action_pct", 0),
+            "dominant_action_pct": result.get("dominant_action_pct", 0),
+            "active_action_count": result.get("active_action_count", 0),
+            "metric_drop_from_best": result.get("metric_drop_from_best"),
+            "collapse_flags": result.get("collapse_flags", []),
+            "warning_policy_collapse": result.get("warning_policy_collapse", False),
+            "warning_metric_drop": result.get("warning_metric_drop", False),
+            "loss_info": result.get("loss_info", {})
+        }
+        training_stats.append(entry)
+
     # Save validation results
     if window_folder:
         os.makedirs(window_folder, exist_ok=True)
@@ -1306,39 +1378,6 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         # Save model
         model.save(os.path.join(window_folder, "model"))
         
-        # Prepare training stats for all iterations
-        training_stats = []
-        for i, result in enumerate(all_results):
-            entry = {
-                "iteration": i,
-                "return_pct": result.get("total_return_pct", 0),
-                "portfolio_value": result.get("final_portfolio_value", 0),
-                "hit_rate": result.get("hit_rate", 0),
-                "prediction_accuracy": result.get("prediction_accuracy", 0),
-                "sortino_ratio": result.get("sortino_ratio", 0),
-                "calmar_ratio": result.get("calmar_ratio", 0),
-                "max_drawdown": result.get("max_drawdown", 0),
-                "trade_count": result.get("trade_count", 0),
-                "is_best": result.get("is_best", False),
-                "metric_used": result.get("metric_used", evaluation_metric),
-                "has_enough_trades": result.get("has_enough_trades", False),
-                "has_enough_action_mix": result.get("has_enough_action_mix", False),
-                "min_trades_required": result.get("min_trades_required", 0),
-                "max_flat_action_pct": result.get("max_flat_action_pct", 0),
-                "action_counts": result.get("action_counts", {}),
-                "long_action_pct": result.get("long_action_pct", 0),
-                "short_action_pct": result.get("short_action_pct", 0),
-                "flat_action_pct": result.get("flat_action_pct", 0),
-                "dominant_action_pct": result.get("dominant_action_pct", 0),
-                "active_action_count": result.get("active_action_count", 0),
-                "metric_drop_from_best": result.get("metric_drop_from_best"),
-                "collapse_flags": result.get("collapse_flags", []),
-                "warning_policy_collapse": result.get("warning_policy_collapse", False),
-                "warning_metric_drop": result.get("warning_metric_drop", False),
-                "loss_info": result.get("loss_info", {})
-            }
-            training_stats.append(entry)
-
         # Save training stats
         with open(os.path.join(window_folder, "training_stats.json"), "w") as f:
             json.dump(training_stats, f, indent=4)

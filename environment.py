@@ -14,6 +14,7 @@ from stable_baselines3.common.env_util import make_vec_env
 # Local application imports
 import constants
 import money
+from action_space import target_allocation_for_action
 from config import config
 
 class TradingEnv(gym.Env):
@@ -22,11 +23,12 @@ class TradingEnv(gym.Env):
 
     Observation Space: [close_norm, technical_indicators..., position, unrealized_pnl_norm, time_in_position_norm]
     Action Space:
-        0: Long (Buy/Stay Long)
-        1: Short (Sell/Stay Short)
-        2: Flat (Close position / Stay flat)
+        0-2: Long target allocations of 1%, 2%, 5%
+        3-5: Short target allocations of 1%, 2%, 5%
+        6: Flat
 
-    Agent can go long, short, or flat. Choosing the same action maintains the position (no transaction cost).
+    Agent chooses a target portfolio allocation. The environment rebalances to the
+    closest whole-contract MBT position that fits current net worth.
     """
 
     metadata = {"render.modes": ["human"]}
@@ -74,10 +76,10 @@ class TradingEnv(gym.Env):
             self.tp_multipliers = np.linspace(self.tp_range[0], self.tp_range[1], self.num_choices)
 
             # Action space: [position_action, sl_multiplier_idx, tp_multiplier_idx]
-            self.action_space = spaces.MultiDiscrete([3, self.num_choices, self.num_choices])
+            self.action_space = spaces.MultiDiscrete([7, self.num_choices, self.num_choices])
         else:
-            # Action space: 0 = long, 1 = short, 2 = flat
-            self.action_space = spaces.Discrete(3)
+            # Action space: 7 target-allocation actions
+            self.action_space = spaces.Discrete(7)
 
         # Fixed ATR-based stop loss / take profit from risk_management config
         risk_config = config.get("risk_management", {})
@@ -118,8 +120,9 @@ class TradingEnv(gym.Env):
                 if pd.api.types.is_numeric_dtype(self.data[col]):
                     self.technical_indicators.append(col)
             
-        # Calculate observation space size: close_norm + all technical indicators + position + unrealized_pnl + time_in_position + drawdown_pct
-        obs_size = 1 + len(self.technical_indicators) + 4  # +4 for position, unrealized_pnl, time_in_position, drawdown_pct
+        # Calculate observation space size: close_norm + all technical indicators +
+        # signed_exposure + unrealized_pnl + time_in_position + drawdown_pct
+        obs_size = 1 + len(self.technical_indicators) + 4
 
         # Create observation space with appropriate bounds
         # Most indicators are normalized between -1 and 1 or 0 and 1
@@ -134,7 +137,10 @@ class TradingEnv(gym.Env):
         # Internal state variables
         self.current_step = 0
         self.position = 0  # 0 = flat, 1 = long, -1 = short
-        self.entry_price = Decimal('0.0')  # Actual price when position was opened
+        self.current_contracts = 0
+        self.target_allocation_pct = Decimal('0.0')
+        self.signed_exposure_pct = Decimal('0.0')
+        self.entry_price = Decimal('0.0')  # Weighted average entry price
         self.initial_index = 0
         # Random start: on reset(), pick a random start within first random_start_pct of data
         # This gives vectorized envs trajectory diversity across episodes
@@ -157,13 +163,14 @@ class TradingEnv(gym.Env):
         self.returns_history = []  # Store returns for volatility calculation
         self.max_net_worth = self.initial_balance  # Track peak for drawdown calculation
 
-        # Position sizing
+        # Legacy config fallback retained for older code paths/tests.
         self.position_size = position_size
 
         # Pre-compute Decimal constants (avoid per-step conversions)
         self._point_value_decimal = money.to_decimal(constants.CONTRACT_POINT_VALUE)
         self._position_size_decimal = money.to_decimal(self.position_size)
         self._min_balance_pct_decimal = Decimal(str(constants.MIN_BALANCE_PERCENTAGE))
+        self._allocation_choices = [Decimal('0.01'), Decimal('0.02'), Decimal('0.05')]
 
         # Realistic execution cost model: fee + spread + time-of-day slippage.
         # MBT outright tick = 5.0 quoted BTC price points = $0.50/contract.
@@ -188,11 +195,28 @@ class TradingEnv(gym.Env):
         self._atr_col = next((c for c in ['ATR', 'atr'] if c in self.data.columns), None)
 
         # Pre-compute numpy arrays for fast per-step access (avoid DataFrame .loc[])
-        self._close_norm_array = self.data[self._close_norm_col].values.astype(np.float32)
-        self._close_array = self.data[self._close_col].values.astype(np.float64)
-        self._high_array = self.data[self._high_col].values.astype(np.float64) if self._high_col else None
-        self._low_array = self.data[self._low_col].values.astype(np.float64) if self._low_col else None
-        self._atr_array = self.data[self._atr_col].values.astype(np.float64) if self._atr_col else None
+        self._close_norm_array = self._sanitize_feature_array(
+            self.data[self._close_norm_col].values.astype(np.float32),
+            name=self._close_norm_col,
+        )
+        self._close_array = self._sanitize_price_array(
+            self.data[self._close_col].values.astype(np.float64),
+            name=self._close_col,
+        )
+        self._high_array = self._sanitize_price_array(
+            self.data[self._high_col].values.astype(np.float64),
+            fallback=self._close_array,
+            name=self._high_col,
+        ) if self._high_col else None
+        self._low_array = self._sanitize_price_array(
+            self.data[self._low_col].values.astype(np.float64),
+            fallback=self._close_array,
+            name=self._low_col,
+        ) if self._low_col else None
+        self._atr_array = self._sanitize_feature_array(
+            self.data[self._atr_col].values.astype(np.float64),
+            name=self._atr_col,
+        ) if self._atr_col else None
 
         # Resolve indicator column names once and build pre-computed indicator matrix
         resolved_indicator_cols = []
@@ -213,6 +237,7 @@ class TradingEnv(gym.Env):
             for i, found in enumerate(self._indicator_found):
                 if not found:
                     self._indicator_matrix[:, i] = 0.0
+            self._indicator_matrix = np.nan_to_num(self._indicator_matrix, nan=0.0, posinf=0.0, neginf=0.0)
         else:
             self._indicator_matrix = np.zeros((len(self.data), len(self.technical_indicators)), dtype=np.float32)
 
@@ -239,6 +264,46 @@ class TradingEnv(gym.Env):
         self._reward_calm_bonus = reward_config.get("calm_holding_bonus", 0.0005)
         self._reward_flat_penalty = reward_config.get("flat_time_penalty", 0.0015)
         self._reward_flat_grace = reward_config.get("flat_time_grace_steps", 6)
+
+    def _sanitize_feature_array(self, values: np.ndarray, *, name: str) -> np.ndarray:
+        """Replace NaN/Inf feature values with neutral zeroes."""
+        arr = np.asarray(values, dtype=np.float64).copy()
+        invalid_mask = ~np.isfinite(arr)
+        if invalid_mask.any():
+            logging.warning(
+                "TradingEnv: replacing %s non-finite values in feature column '%s' with 0.0",
+                int(invalid_mask.sum()),
+                name,
+            )
+            arr[invalid_mask] = 0.0
+        return arr
+
+    def _sanitize_price_array(self, values: np.ndarray, *, name: str, fallback: np.ndarray | None = None) -> np.ndarray:
+        """Replace invalid or implausible price values with nearby valid prices."""
+        arr = np.asarray(values, dtype=np.float64).copy()
+        invalid_mask = (~np.isfinite(arr)) | (arr <= 0.0)
+        finite_positive = arr[np.isfinite(arr) & (arr > 0.0)]
+        if finite_positive.size:
+            median_price = float(np.median(finite_positive))
+            if np.isfinite(median_price) and median_price > 0.0:
+                low_cutoff = median_price * 0.1
+                high_cutoff = median_price * 10.0
+                invalid_mask |= (arr < low_cutoff) | (arr > high_cutoff)
+        if invalid_mask.any():
+            logging.warning(
+                "TradingEnv: replacing %s invalid price values in column '%s'",
+                int(invalid_mask.sum()),
+                name,
+            )
+            series = pd.Series(arr)
+            if fallback is not None:
+                fallback_arr = np.asarray(fallback, dtype=np.float64)
+                series.loc[invalid_mask] = fallback_arr[invalid_mask]
+            else:
+                series.loc[invalid_mask] = np.nan
+            arr = np.array(series.ffill().bfill().fillna(0.0).to_numpy(dtype=np.float64), copy=True)
+            arr[arr < 0.0] = 0.0
+        return arr
 
 
     def seed(self, seed=None):
@@ -268,6 +333,9 @@ class TradingEnv(gym.Env):
         else:
             self.current_step = self.initial_index
         self.position = 0  # Start flat (no position)
+        self.current_contracts = 0
+        self.target_allocation_pct = Decimal('0.0')
+        self.signed_exposure_pct = Decimal('0.0')
         self.entry_price = Decimal('0.0')
         self.net_worth = self.initial_balance
         self.previous_net_worth = self.initial_balance  # Reset previous net worth for reward calculation
@@ -306,7 +374,7 @@ class TradingEnv(gym.Env):
 
         # State features
         idx = 1 + self._n_indicators
-        obs[idx] = float(self.position)
+        obs[idx] = float(self.signed_exposure_pct)
         obs[idx + 1] = self._calculate_unrealized_pnl_normalized()
         obs[idx + 2] = float(np.tanh(self.time_in_position / 50.0))
 
@@ -318,6 +386,9 @@ class TradingEnv(gym.Env):
         obs[idx + 3] = max(drawdown_pct, -1.0)
 
         # Ensure observation is within bounds
+        if not np.isfinite(obs).all():
+            logging.warning("TradingEnv: encountered non-finite observation values; replacing with zeros")
+            obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
         np.clip(obs, self.observation_space.low, self.observation_space.high, out=obs)
 
         return obs
@@ -374,7 +445,7 @@ class TradingEnv(gym.Env):
         Returns:
             Tuple of (exit_triggered, exit_reason, exit_price)
         """
-        if self.position == 0 or not self.dynamic_sl_tp_enabled:
+        if self.position == 0 or self.current_contracts == 0 or not self.dynamic_sl_tp_enabled:
             return False, "", Decimal('0.0')
 
         if self.sl_price == Decimal('0.0') and self.tp_price == Decimal('0.0'):
@@ -393,6 +464,91 @@ class TradingEnv(gym.Env):
 
         return False, "", Decimal('0.0')
 
+    def _calculate_signed_exposure(self, contracts: int, price: Decimal) -> Decimal:
+        """Return signed portfolio exposure for the supplied contract count."""
+        if contracts == 0 or price <= Decimal('0.0') or self.net_worth <= Decimal('0.0'):
+            return Decimal('0.0')
+
+        notional = price * self._point_value_decimal * Decimal(str(abs(contracts)))
+        exposure = notional / self.net_worth
+        return exposure if contracts > 0 else -exposure
+
+    def _calculate_target_contracts(self, target_allocation_pct: Decimal, price: Decimal) -> int:
+        """Convert a target allocation into a whole-contract MBT quantity."""
+        if price <= Decimal('0.0') or self.net_worth <= Decimal('0.0') or target_allocation_pct == Decimal('0.0'):
+            return 0
+
+        contract_notional = price * self._point_value_decimal
+        if contract_notional <= Decimal('0.0'):
+            return 0
+
+        target_notional = self.net_worth * abs(target_allocation_pct)
+        contracts = int(target_notional / contract_notional)
+        if contracts < 1:
+            return 0
+        return contracts if target_allocation_pct > 0 else -contracts
+
+    def _sync_position_state(self, price: Decimal) -> None:
+        """Synchronize derived position state after a rebalance/exit."""
+        if self.current_contracts > 0:
+            self.position = 1
+        elif self.current_contracts < 0:
+            self.position = -1
+        else:
+            self.position = 0
+            self.entry_price = Decimal('0.0')
+            self.target_allocation_pct = Decimal('0.0')
+
+        self.signed_exposure_pct = self._calculate_signed_exposure(self.current_contracts, price)
+
+    def _rebalance_position(self, target_contracts: int, current_price: Decimal) -> Tuple[bool, bool, int]:
+        """Rebalance to a target contract count.
+
+        Returns:
+            (position_changed, is_redundant_action, contracts_traded)
+        """
+        old_contracts = self.current_contracts
+        if target_contracts == old_contracts:
+            self.target_allocation_pct = self._calculate_signed_exposure(target_contracts, current_price)
+            self.signed_exposure_pct = self.target_allocation_pct
+            return False, True, 0
+
+        contracts_traded = 0
+        old_direction = 1 if old_contracts > 0 else (-1 if old_contracts < 0 else 0)
+        new_direction = 1 if target_contracts > 0 else (-1 if target_contracts < 0 else 0)
+
+        if old_direction == 0:
+            self.current_contracts = target_contracts
+            self.entry_price = current_price if target_contracts != 0 else Decimal('0.0')
+            self.time_in_position = 0 if target_contracts != 0 else 0
+            contracts_traded = abs(target_contracts)
+        elif new_direction == 0:
+            self.current_contracts = 0
+            self.entry_price = Decimal('0.0')
+            self.time_in_position = 0
+            contracts_traded = abs(old_contracts)
+        elif old_direction != new_direction:
+            contracts_traded = abs(old_contracts) + abs(target_contracts)
+            self.current_contracts = target_contracts
+            self.entry_price = current_price
+            self.time_in_position = 0
+        else:
+            old_abs = abs(old_contracts)
+            new_abs = abs(target_contracts)
+            delta = new_abs - old_abs
+            contracts_traded = abs(delta)
+            if delta > 0:
+                weighted_entry = (
+                    (self.entry_price * Decimal(str(old_abs))) +
+                    (current_price * Decimal(str(delta)))
+                ) / Decimal(str(new_abs))
+                self.entry_price = weighted_entry
+            self.current_contracts = target_contracts
+
+        self.target_allocation_pct = self._calculate_signed_exposure(target_contracts, current_price)
+        self._sync_position_state(current_price)
+        return True, False, contracts_traded
+
     def _calculate_unrealized_pnl_normalized(self) -> float:
         """
         Calculate the unrealized P&L normalized to [-1, 1].
@@ -400,7 +556,7 @@ class TradingEnv(gym.Env):
         Uses tanh scaling to map P&L to a bounded range.
         A P&L of ~$500 maps to ~0.76, $1000 maps to ~0.96.
         """
-        if self.position == 0 or self.entry_price == Decimal('0.0'):
+        if self.position == 0 or self.current_contracts == 0 or self.entry_price == Decimal('0.0'):
             return 0.0
 
         current_price = self._get_current_price()
@@ -411,7 +567,7 @@ class TradingEnv(gym.Env):
         else:  # Short
             price_change = self.entry_price - current_price
 
-        unrealized_pnl = float(price_change * self._point_value_decimal * self._position_size_decimal)
+        unrealized_pnl = float(price_change * self._point_value_decimal * Decimal(str(abs(self.current_contracts))))
 
         # Normalize using tanh with scaling factor of $500
         # This maps $500 -> ~0.76, $1000 -> ~0.96, -$500 -> ~-0.76
@@ -425,7 +581,7 @@ class TradingEnv(gym.Env):
 
         Args:
             action: Action to execute. Either int (Discrete) or array (MultiDiscrete).
-                   Discrete: 0=long, 1=short, 2=flat
+                   Discrete: 7 target-allocation actions
                    MultiDiscrete: [position_action, sl_idx, tp_idx]
 
         Returns:
@@ -449,13 +605,15 @@ class TradingEnv(gym.Env):
         # Get current price and high/low for SL/TP checking
         current_price = self._get_current_price()
 
-        # Track old position and entry price to detect changes for transaction cost and profit calculation
+        # Track old position state to detect changes for transaction cost and profit calculation
         old_position = self.position
         old_entry_price = self.entry_price
+        old_contracts = self.current_contracts
         position_changed = False
         is_redundant_action = False
         sl_tp_exit_reason = ""
         sl_tp_exit_price = Decimal('0.0')
+        contracts_traded = 0
 
         # Check for SL/TP exit BEFORE processing the action
         if self.position != 0 and self.dynamic_sl_tp_enabled:
@@ -472,17 +630,22 @@ class TradingEnv(gym.Env):
                 else:  # Short
                     price_change = self.entry_price - exit_price
 
-                dollar_change = price_change * self._point_value_decimal * self._position_size_decimal
+                dollar_change = price_change * self._point_value_decimal * Decimal(str(abs(self.current_contracts)))
                 self.net_worth += dollar_change
 
                 # Close position
                 old_position = self.position
                 old_entry_price = self.entry_price
+                old_contracts = self.current_contracts
+                self.current_contracts = 0
                 self.position = 0
+                self.target_allocation_pct = Decimal('0.0')
+                self.signed_exposure_pct = Decimal('0.0')
                 self.entry_price = Decimal('0.0')
                 self.time_in_position = 0
                 self.trade_count += 1
                 position_changed = True
+                contracts_traded = abs(old_contracts)
 
                 # Reset SL/TP state
                 self.current_sl_multiplier = None
@@ -495,99 +658,70 @@ class TradingEnv(gym.Env):
 
         # Only process action if we didn't get stopped out
         if not sl_tp_exit_reason:
-            # Action = desired position: 0 = Long, 1 = Short, 2 = Flat
-            # Choosing same position = no change (no transaction cost)
+            target_allocation = Decimal(str(target_allocation_for_action(position_action)))
+            target_contracts = self._calculate_target_contracts(target_allocation, current_price)
+            position_changed, is_redundant_action, contracts_traded = self._rebalance_position(
+                target_contracts=target_contracts,
+                current_price=current_price,
+            )
+            if position_changed:
+                self.trade_count += 1
 
-            if position_action == 0:  # Want to be Long
-                if self.position != 1:
-                    # Entering or reversing to long
-                    self.position = 1
-                    self.entry_price = current_price
-                    self.time_in_position = 0
-                    self.trade_count += 1
-                    position_changed = True
-
-                    # Set dynamic SL/TP on position entry
-                    if self.dynamic_sl_tp_enabled and sl_idx is not None and tp_idx is not None:
-                        self.current_sl_multiplier = float(self.sl_multipliers[sl_idx])
-                        self.current_tp_multiplier = float(self.tp_multipliers[tp_idx])
-                        atr = self._get_current_atr()
-                        self._set_sl_tp_prices(self.entry_price, atr)
-                        info["sl_multiplier"] = self.current_sl_multiplier
-                        info["tp_multiplier"] = self.current_tp_multiplier
-                        info["sl_price"] = float(self.sl_price)
-                        info["tp_price"] = float(self.tp_price)
-                else:
-                    is_redundant_action = True  # Already long, staying long
-
-            elif position_action == 1:  # Want to be Short
-                if self.position != -1:
-                    # Entering or reversing to short
-                    self.position = -1
-                    self.entry_price = current_price
-                    self.time_in_position = 0
-                    self.trade_count += 1
-                    position_changed = True
-
-                    # Set dynamic SL/TP on position entry
-                    if self.dynamic_sl_tp_enabled and sl_idx is not None and tp_idx is not None:
-                        self.current_sl_multiplier = float(self.sl_multipliers[sl_idx])
-                        self.current_tp_multiplier = float(self.tp_multipliers[tp_idx])
-                        atr = self._get_current_atr()
-                        self._set_sl_tp_prices(self.entry_price, atr)
-                        info["sl_multiplier"] = self.current_sl_multiplier
-                        info["tp_multiplier"] = self.current_tp_multiplier
-                        info["sl_price"] = float(self.sl_price)
-                        info["tp_price"] = float(self.tp_price)
-                else:
-                    is_redundant_action = True  # Already short, staying short
-
-            elif position_action == 2:  # Want to be Flat
-                if self.position != 0:
-                    # Closing current position
-                    self.position = 0
-                    self.entry_price = Decimal('0.0')
-                    self.time_in_position = 0
-                    self.trade_count += 1
-                    position_changed = True
-                    # Reset SL/TP state
+                # Set dynamic SL/TP on any non-flat rebalance
+                if self.dynamic_sl_tp_enabled and self.position != 0 and sl_idx is not None and tp_idx is not None:
+                    self.current_sl_multiplier = float(self.sl_multipliers[sl_idx])
+                    self.current_tp_multiplier = float(self.tp_multipliers[tp_idx])
+                    atr = self._get_current_atr()
+                    self._set_sl_tp_prices(self.entry_price, atr)
+                    info["sl_multiplier"] = self.current_sl_multiplier
+                    info["tp_multiplier"] = self.current_tp_multiplier
+                    info["sl_price"] = float(self.sl_price)
+                    info["tp_price"] = float(self.tp_price)
+                elif self.position == 0:
                     self.fixed_sl_price = Decimal('0.0')
                     self.fixed_tp_price = Decimal('0.0')
-                else:
-                    is_redundant_action = True  # Already flat, staying flat
 
         # Set fixed ATR-based SL/TP prices on position entry
         if position_changed and self.position != 0:
             atr = self._get_current_atr()
             if self.position == 1:  # Long
-                if self.fixed_sl_enabled and self.fixed_sl_atr_mult and atr > 0:
-                    self.fixed_sl_price = self.entry_price - (atr * self.fixed_sl_atr_mult)
-                if self.fixed_tp_enabled and self.fixed_tp_atr_mult and atr > 0:
-                    self.fixed_tp_price = self.entry_price + (atr * self.fixed_tp_atr_mult)
+                if self.fixed_sl_enabled:
+                    if self.fixed_sl_atr_mult and atr > 0:
+                        self.fixed_sl_price = self.entry_price - (atr * self.fixed_sl_atr_mult)
+                    elif self.fixed_sl_pct is not None:
+                        self.fixed_sl_price = self.entry_price * (Decimal('1.0') - self.fixed_sl_pct)
+                if self.fixed_tp_enabled:
+                    if self.fixed_tp_atr_mult and atr > 0:
+                        self.fixed_tp_price = self.entry_price + (atr * self.fixed_tp_atr_mult)
+                    elif self.fixed_tp_pct is not None:
+                        self.fixed_tp_price = self.entry_price * (Decimal('1.0') + self.fixed_tp_pct)
             elif self.position == -1:  # Short
-                if self.fixed_sl_enabled and self.fixed_sl_atr_mult and atr > 0:
-                    self.fixed_sl_price = self.entry_price + (atr * self.fixed_sl_atr_mult)
-                if self.fixed_tp_enabled and self.fixed_tp_atr_mult and atr > 0:
-                    self.fixed_tp_price = self.entry_price - (atr * self.fixed_tp_atr_mult)
+                if self.fixed_sl_enabled:
+                    if self.fixed_sl_atr_mult and atr > 0:
+                        self.fixed_sl_price = self.entry_price + (atr * self.fixed_sl_atr_mult)
+                    elif self.fixed_sl_pct is not None:
+                        self.fixed_sl_price = self.entry_price * (Decimal('1.0') + self.fixed_sl_pct)
+                if self.fixed_tp_enabled:
+                    if self.fixed_tp_atr_mult and atr > 0:
+                        self.fixed_tp_price = self.entry_price - (atr * self.fixed_tp_atr_mult)
+                    elif self.fixed_tp_pct is not None:
+                        self.fixed_tp_price = self.entry_price * (Decimal('1.0') - self.fixed_tp_pct)
 
         # Apply execution costs if position changed: commission + spread + slippage
         transaction_cost_applied = Decimal('0.0')
         if position_changed:
-            # Number of sides: reversal (long→short) = 2 fills, entry/exit = 1 fill
-            n_fills = 2 if old_position != 0 and self.position != 0 and old_position != self.position else 1
-
             # Commission (per fill)
             if self.transaction_cost > Decimal('0.0'):
-                transaction_cost_applied += self.transaction_cost * self._position_size_decimal * Decimal(str(n_fills))
+                transaction_cost_applied += self.transaction_cost * Decimal(str(contracts_traded))
 
             # Spread cost: half-spread per fill (crossing the bid-ask)
-            spread_cost = self._spread_points * self._point_value_decimal * self._position_size_decimal * Decimal(str(n_fills))
+            spread_cost = self._spread_points * self._point_value_decimal * Decimal(str(contracts_traded))
             transaction_cost_applied += spread_cost
 
             # Slippage: time-of-day dependent, per fill
             step_idx = min(self.current_step, len(self._slippage_points) - 1)
             slippage_pts = Decimal(str(self._slippage_points[step_idx]))
-            slippage_cost = slippage_pts * self._point_value_decimal * self._position_size_decimal * Decimal(str(n_fills))
+            slippage_cost = slippage_pts * self._point_value_decimal * Decimal(str(contracts_traded))
             transaction_cost_applied += slippage_cost
 
             self.net_worth -= transaction_cost_applied
@@ -603,61 +737,51 @@ class TradingEnv(gym.Env):
         # Advance to next step
         self.current_step += 1
 
-        # Calculate portfolio value change based on position and price change
-        # IMPORTANT: Use old_position for P&L calculation, not the new position!
-        # This handles the case where we exit a position (P&L should be calculated on the old position)
-        # Skip if we already calculated P&L from SL/TP exit
+        # Calculate portfolio value change from the post-action position over the next bar.
+        # Rebalances at the current price should affect exposure for the upcoming price move.
+        # If a fixed SL/TP is triggered on the next bar, only mark to the exit price once.
         if self.current_step < self.total_steps and not sl_tp_exit_reason:
-            next_price = self._get_current_price()
-
-            # Calculate P&L if we HAD an active position (use old_position)
-            if old_position != 0:
-                # Calculate price change based on the position we WERE in
-                if old_position == 1:  # Was long position
-                    price_change = next_price - current_price
-                else:  # Was short position (old_position == -1)
-                    price_change = current_price - next_price
-
-                # Calculate dollar change directly
-                dollar_change = price_change * self._point_value_decimal * self._position_size_decimal
-
-                # Update portfolio value
-                self.net_worth += dollar_change
-
-        # Check fixed ATR-based SL/TP after price update
-        if self.position != 0 and self.current_step < self.total_steps:
             next_price = self._get_current_price()
             fixed_exit = False
             exit_price = Decimal('0.0')
-            # Check stop loss
-            if self.fixed_sl_enabled and self.fixed_sl_price > 0:
-                if (self.position == 1 and next_price <= self.fixed_sl_price) or \
-                   (self.position == -1 and next_price >= self.fixed_sl_price):
-                    fixed_exit = True
-                    exit_price = self.fixed_sl_price
-                    info["fixed_sl_triggered"] = True
-            # Check take profit
-            if not fixed_exit and self.fixed_tp_enabled and self.fixed_tp_price > 0:
-                if (self.position == 1 and next_price >= self.fixed_tp_price) or \
-                   (self.position == -1 and next_price <= self.fixed_tp_price):
-                    fixed_exit = True
-                    exit_price = self.fixed_tp_price
-                    info["fixed_tp_triggered"] = True
+
+            if self.position != 0:
+                # Check fixed SL/TP against the next bar close proxy. Use the exit price
+                # directly for MTM so we do not double-count entry-to-exit P&L.
+                if self.fixed_sl_enabled and self.fixed_sl_price > 0:
+                    if (self.position == 1 and next_price <= self.fixed_sl_price) or \
+                       (self.position == -1 and next_price >= self.fixed_sl_price):
+                        fixed_exit = True
+                        exit_price = self.fixed_sl_price
+                        info["fixed_sl_triggered"] = True
+
+                if not fixed_exit and self.fixed_tp_enabled and self.fixed_tp_price > 0:
+                    if (self.position == 1 and next_price >= self.fixed_tp_price) or \
+                       (self.position == -1 and next_price <= self.fixed_tp_price):
+                        fixed_exit = True
+                        exit_price = self.fixed_tp_price
+                        info["fixed_tp_triggered"] = True
+
+            if self.position != 0 and self.current_contracts != 0:
+                mark_price = exit_price if fixed_exit else next_price
+                if self.position == 1:
+                    price_change = mark_price - current_price
+                else:
+                    price_change = current_price - mark_price
+
+                dollar_change = price_change * self._point_value_decimal * Decimal(str(abs(self.current_contracts)))
+                self.net_worth += dollar_change
 
             if fixed_exit:
-                # Close position at SL/TP price
-                if self.position == 1:
-                    price_change = exit_price - self.entry_price
-                else:
-                    price_change = self.entry_price - exit_price
-                dollar_change = price_change * self._point_value_decimal * self._position_size_decimal
-                self.net_worth += dollar_change
+                self.current_contracts = 0
                 self.position = 0
                 self.entry_price = Decimal('0.0')
                 self.time_in_position = 0
                 self.trade_count += 1
                 self.fixed_sl_price = Decimal('0.0')
                 self.fixed_tp_price = Decimal('0.0')
+                self.target_allocation_pct = Decimal('0.0')
+                self.signed_exposure_pct = Decimal('0.0')
 
         # Update max net worth for drawdown tracking
         if self.net_worth > self.max_net_worth:
@@ -665,6 +789,12 @@ class TradingEnv(gym.Env):
 
         # Ensure net_worth doesn't go below a minimum threshold (e.g., 1% of initial balance)
         min_balance = self.initial_balance * self._min_balance_pct_decimal
+        if not self.net_worth.is_finite():
+            logging.warning("TradingEnv: encountered non-finite net worth; clamping to minimum balance")
+            self.net_worth = min_balance
+            info["non_finite_net_worth"] = True
+        if not self.max_net_worth.is_finite():
+            self.max_net_worth = self.initial_balance
         if self.net_worth < min_balance:
             self.net_worth = min_balance
             info["hit_minimum_balance"] = True
@@ -674,6 +804,8 @@ class TradingEnv(gym.Env):
 
         if terminated:
             self.current_step = self.total_steps  # Clamp to last valid index
+
+        self._sync_position_state(self._get_current_price() if self.current_step <= self.total_steps else current_price)
 
         # Calculate RISK-ADJUSTED REWARD with scalping incentives
         exit_price_for_reward = sl_tp_exit_price if sl_tp_exit_price > Decimal('0.0') else current_price
@@ -695,6 +827,12 @@ class TradingEnv(gym.Env):
         info["reward"] = float(reward)
         info["net_worth"] = float(self.net_worth)
         info["position_size"] = self.position_size
+        info["current_contracts"] = self.current_contracts
+        info["old_contracts"] = old_contracts
+        info["contracts_traded"] = contracts_traded
+        info["signed_exposure"] = float(self.signed_exposure_pct)
+        info["avg_entry_price"] = float(self.entry_price) if self.entry_price > Decimal('0.0') else 0.0
+        info["target_allocation_pct"] = float(self.target_allocation_pct)
         info["time_in_position"] = self.time_in_position
         info["trade_count"] = self.trade_count
         info["transaction_cost"] = float(transaction_cost_applied)
@@ -767,6 +905,10 @@ class TradingEnv(gym.Env):
         # Inactivity penalty: gently discourage staying flat for long stretches.
         if self.position == 0 and self.time_flat > self._reward_flat_grace and self._reward_flat_penalty > 0:
             reward -= self._reward_flat_penalty * float(self.time_flat - self._reward_flat_grace)
+
+        if not np.isfinite(reward):
+            logging.warning("TradingEnv: encountered non-finite reward; replacing with 0.0")
+            reward = 0.0
 
         # Clamp reward to prevent gradient explosion from extreme values
         return max(min(reward, 10.0), -10.0)

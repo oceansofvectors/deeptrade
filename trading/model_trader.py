@@ -10,6 +10,7 @@ import pandas as pd
 import pytz
 from stable_baselines3 import PPO
 from ib_insync import MarketOrder, Order, LimitOrder, StopOrder, BracketOrder # Future, Contract may not be needed directly if ib_instance handles it
+from action_space import action_label, target_allocation_for_action
 import constants
 
 # RecurrentPPO for LSTM support
@@ -121,6 +122,7 @@ class ModelTrader:
         self.session_peak_equity = initial_balance
         self.session_equity = initial_balance
         self.drawdown_pct = 0.0
+        self.signed_exposure = 0.0
 
         if self.feature_layout is not None:
             logger.info(
@@ -184,6 +186,19 @@ class ModelTrader:
         else:
             self.position_size = config["environment"].get("position_size", 1)
             logger.info(f"Using fixed position size of {self.position_size} contracts per trade")
+
+    def _calculate_target_contracts(self, target_allocation_pct: float, price: float) -> int:
+        """Convert a target allocation into a whole-contract live quantity."""
+        if price <= 0 or target_allocation_pct == 0:
+            return 0
+        equity = max(float(self.session_equity), float(config.get("environment", {}).get("initial_balance", 100000.0)))
+        contract_notional = price * self.point_value
+        if contract_notional <= 0:
+            return 0
+        contracts = int((equity * abs(float(target_allocation_pct))) / contract_notional)
+        if contracts < 1:
+            return 0
+        return contracts if target_allocation_pct > 0 else -contracts
     
     def _load_enabled_indicators_from_file(self):
         """
@@ -948,7 +963,7 @@ class ModelTrader:
             current_close = float(hist_df["close"].iloc[-1])
             self._update_trade_state(current_close)
 
-            pos_signal = 1.0 if self.current_position > 0 else (-1.0 if self.current_position < 0 else 0.0)
+            pos_signal = float(self.signed_exposure)
             unrealized_norm = float(np.tanh(self.unrealized_pnl / 500.0))
             tip_norm = float(np.tanh(self.time_in_position / 50.0))
             dd = max(self.drawdown_pct, -1.0)
@@ -983,11 +998,10 @@ class ModelTrader:
         - Position flip (long <-> short): materialize previous, then open new leg.
         - Open position, same side: increment time_in_position, recompute unrealized.
         """
-        pos = self.current_position
+        pos = int(self.expected_position)
         prev = self.last_obs_position
 
-        if prev != 0 and pos != prev:
-            # Close or flip -> realize the old leg
+        if prev != 0 and (pos == 0 or np.sign(pos) != np.sign(prev)):
             if self.entry_price:
                 sign = 1.0 if prev > 0 else -1.0
                 closed_pnl = (current_close - self.entry_price) * sign * self.point_value * abs(prev)
@@ -997,9 +1011,13 @@ class ModelTrader:
             self.unrealized_pnl = 0.0
 
         if pos != 0 and self.entry_price == 0.0:
-            # Fresh entry (either flat->non-zero, or flipped)
             self.entry_price = current_close
             self.time_in_position = 0
+        elif pos != 0 and prev != 0 and np.sign(pos) == np.sign(prev) and abs(pos) > abs(prev) and self.entry_price:
+            add_qty = abs(pos) - abs(prev)
+            self.entry_price = (
+                (self.entry_price * abs(prev)) + (current_close * add_qty)
+            ) / abs(pos)
         elif pos != 0:
             self.time_in_position += 1
 
@@ -1010,6 +1028,11 @@ class ModelTrader:
             self.unrealized_pnl = 0.0
 
         self.session_equity = self.realized_cash + self.unrealized_pnl
+        if self.session_equity > 0 and current_close > 0 and pos != 0:
+            notional = current_close * self.point_value * abs(pos)
+            self.signed_exposure = (notional / self.session_equity) * (1.0 if pos > 0 else -1.0)
+        else:
+            self.signed_exposure = 0.0
         if self.session_equity > self.session_peak_equity:
             self.session_peak_equity = self.session_equity
         if self.session_peak_equity > 0:
@@ -1157,7 +1180,7 @@ class ModelTrader:
         Execute a trade based on the prediction from the model.
         
         Args:
-            prediction: The action predicted by the model (0=long/buy, 1=short/sell, 2=hold)
+            prediction: The action predicted by the model (target allocation action id)
             bar: The current price bar
             
         Returns:
@@ -1168,10 +1191,8 @@ class ModelTrader:
                 logger.error("No prediction available for trade execution")
                 return False
                 
-            # Convert prediction to action
-            # In environment.py: 0=long/buy, 1=short/sell, 2=hold
-            action = prediction  
-            logger.info(f"Trade decision based on prediction: {action}")
+            action = int(prediction)
+            logger.info(f"Trade decision based on prediction: {action} ({action_label(action)})")
             
             # Get current position from IB to verify internal state is correct
             self.verify_position()
@@ -1179,338 +1200,32 @@ class ModelTrader:
             # Get price information from the bar
             current_price = bar['close']
             logger.info(f"Current price: {current_price}")
-            
-            # Default position size from config or risk management
-            position_size = self.position_size
-            
-            # Generate a unique order ID to avoid collisions
-            execution_id = int(time.time() * 1000) + self.execution_counter
-            self.execution_counter += 1
-            
-            # Process the action (0=long/buy, 1=short/sell, 2=hold)
-            if action == 0:  # Buy/Long signal
-                if self.current_position <= 0:  # If not already long
-                    # First cancel ALL existing orders (including take profit/stop loss)
-                    self._cancel_all_existing_orders()
-                    
-                    # Wait a brief moment for order cancellations to be processed
-                    time.sleep(0.5)
-                    
-                    # Close any existing short position first
-                    if self.current_position < 0:
-                        logger.info("Closing existing short position before going long")
-                        # Create a market order to close the short position
-                        close_order = MarketOrder('BUY', abs(self.expected_position))
-                        close_order.transmit = True  # Set transmit flag to true
-                        trade = self.ib.placeOrder(self.contract, close_order)
-                        self.order_ids.append(trade.order.orderId)
-                        logger.info(f"Placed order to close short position: {trade.order}")
-                        
-                        # Wait for the position to be closed
-                        self._wait_for_position_change()
-                    
-                    # Now open a new long position
-                    logger.info(f"Opening long position of {position_size} contracts")
-                    
-                    # If risk management is enabled, use bracket orders
-                    if self.use_risk_management and (self.stop_loss_pct or self.take_profit_pct):
-                        # Calculate stop loss and take profit prices based on portfolio percentage
-                        # For futures, we need to convert portfolio percentage to price points
-                        
-                        point_value = self.point_value
-                        
-                        # Calculate stop loss and take profit prices
-                        stop_loss_price = None
-                        take_profit_price = None
-                        
-                        # Use the initial_balance from config.yaml instead of getting from IB
-                        portfolio_value = config["environment"]["initial_balance"]
-                        logger.info(f"Using configured portfolio value for risk: ${portfolio_value}")
-                        
-                        if self.stop_loss_pct:
-                            # Calculate dollar risk based on portfolio percentage
-                            risk_dollars = portfolio_value * (self.stop_loss_pct / 100)
-                            
-                            # Convert to points (how many points can we risk)
-                            risk_points = risk_dollars / (point_value * position_size)
-                            
-                            # Calculate stop loss price for long position (entry - risk points)
-                            stop_loss_price = round(current_price - risk_points, 2)
-                            logger.info(f"Stop loss: ${risk_dollars:.2f} ({self.stop_loss_pct}% of portfolio), {risk_points:.2f} points, price: {stop_loss_price}")
-                            
-                        if self.take_profit_pct:
-                            # Calculate dollar profit target based on portfolio percentage
-                            profit_dollars = portfolio_value * (self.take_profit_pct / 100)
-                            
-                            # Convert to points (how many points for target)
-                            profit_points = profit_dollars / (point_value * position_size)
-                            
-                            # Calculate take profit price for long position (entry + profit points)
-                            take_profit_price = round(current_price + profit_points, 2)
-                            logger.info(f"Take profit: ${profit_dollars:.2f} ({self.take_profit_pct}% of portfolio), {profit_points:.2f} points, price: {take_profit_price}")
-                        
-                        # Create parent market order
-                        parent = Order()
-                        parent.orderId = self.ib.client.getReqId()
-                        parent.action = 'BUY'
-                        parent.orderType = 'MKT'
-                        parent.totalQuantity = position_size
-                        parent.transmit = False  # Parent will not transmit until children are attached
-                        
-                        # Store parent order ID for reference
-                        parent_id = parent.orderId
-                        self.active_orders[parent_id] = {
-                            'type': 'parent',
-                            'direction': 'long',
-                            'children': []
-                        }
-                        
-                        # Create child orders list
-                        child_orders = []
-                        
-                        # Take profit order (limit order)
-                        if take_profit_price:
-                            take_profit = Order()
-                            take_profit.orderId = self.ib.client.getReqId()
-                            take_profit.action = 'SELL'
-                            take_profit.orderType = 'LMT'
-                            take_profit.totalQuantity = position_size
-                            take_profit.lmtPrice = take_profit_price
-                            take_profit.parentId = parent_id
-                            take_profit.transmit = False  # Don't transmit yet
-                            
-                            # Add to active orders
-                            tp_id = take_profit.orderId
-                            self.active_orders[tp_id] = {
-                                'type': 'take_profit',
-                                'parent_id': parent_id,
-                                'direction': 'long'
-                            }
-                            self.active_orders[parent_id]['children'].append(tp_id)
-                            
-                            child_orders.append(take_profit)
-                        
-                        # Stop loss order (stop order)
-                        if stop_loss_price:
-                            stop_loss = Order()
-                            stop_loss.orderId = self.ib.client.getReqId()
-                            stop_loss.action = 'SELL'
-                            stop_loss.orderType = 'STP'
-                            stop_loss.totalQuantity = position_size
-                            stop_loss.auxPrice = stop_loss_price
-                            stop_loss.parentId = parent_id
-                            # This is the last order, so it will transmit the entire bracket
-                            stop_loss.transmit = True
-                            
-                            # Add to active orders
-                            sl_id = stop_loss.orderId
-                            self.active_orders[sl_id] = {
-                                'type': 'stop_loss',
-                                'parent_id': parent_id,
-                                'direction': 'long'
-                            }
-                            self.active_orders[parent_id]['children'].append(sl_id)
-                            
-                            child_orders.append(stop_loss)
-                        else:
-                            # If no stop loss, the last (or only) take profit order must transmit
-                            if child_orders:
-                                child_orders[-1].transmit = True
-                            else:
-                                # If no child orders, parent must transmit
-                                parent.transmit = True
-                        
-                        # Place parent order first
-                        parent_trade = self.ib.placeOrder(self.contract, parent)
-                        self.order_ids.append(parent_id)
-                        logger.info(f"Placed parent order for long position: {parent_trade.order}")
-                        
-                        # Place child orders
-                        for child in child_orders:
-                            child_trade = self.ib.placeOrder(self.contract, child)
-                            self.order_ids.append(child.orderId)
-                            logger.info(f"Placed child order: {child_trade.order}")
-                    else:
-                        # Simple market order if no risk management
-                        order = MarketOrder('BUY', position_size)
-                        order.transmit = True  # Set transmit flag to true
-                        trade = self.ib.placeOrder(self.contract, order)
-                        self.order_ids.append(trade.order.orderId)
-                        logger.info(f"Placed market order to go long: {order}")
-                    
-                    # Update internal state
-                    self.current_position = 1
-                    self.expected_position = position_size
-                    return True
-                else:
-                    logger.info("Already in long position, no trade executed")
-                    return False
-                    
-            elif action == 1:  # Sell/Short signal
-                if self.current_position >= 0:  # If not already short
-                    # First cancel ALL existing orders (including take profit/stop loss)
-                    self._cancel_all_existing_orders()
-                    
-                    # Wait a brief moment for order cancellations to be processed
-                    time.sleep(0.5)
-                    
-                    # Close any existing long position first
-                    if self.current_position > 0:
-                        logger.info("Closing existing long position before going short")
-                        # Create a market order to close the long position
-                        close_order = MarketOrder('SELL', abs(self.expected_position))
-                        close_order.transmit = True  # Set transmit flag to true
-                        trade = self.ib.placeOrder(self.contract, close_order)
-                        self.order_ids.append(trade.order.orderId)
-                        logger.info(f"Placed order to close long position: {trade.order}")
-                        
-                        # Wait for the position to be closed
-                        self._wait_for_position_change()
-                    
-                    # Now open a new short position
-                    logger.info(f"Opening short position of {position_size} contracts")
-                    
-                    # If risk management is enabled, use bracket orders
-                    if self.use_risk_management and (self.stop_loss_pct or self.take_profit_pct):
-                        # Calculate stop loss and take profit prices based on portfolio percentage
-                        # For futures, we need to convert portfolio percentage to price points
-                        
-                        point_value = self.point_value
-                        
-                        # Calculate stop loss and take profit prices
-                        stop_loss_price = None
-                        take_profit_price = None
-                        
-                        # Use the initial_balance from config.yaml instead of getting from IB
-                        portfolio_value = config["environment"]["initial_balance"]
-                        logger.info(f"Using configured portfolio value for risk: ${portfolio_value}")
-                        
-                        if self.stop_loss_pct:
-                            # Calculate dollar risk based on portfolio percentage
-                            risk_dollars = portfolio_value * (self.stop_loss_pct / 100)
-                            
-                            # Convert to points (how many points can we risk)
-                            risk_points = risk_dollars / (point_value * position_size)
-                            
-                            # Calculate stop loss price for short position (entry + risk points)
-                            stop_loss_price = round(current_price + risk_points, 2)
-                            logger.info(f"Stop loss: ${risk_dollars:.2f} ({self.stop_loss_pct}% of portfolio), {risk_points:.2f} points, price: {stop_loss_price}")
-                            
-                        if self.take_profit_pct:
-                            # Calculate dollar profit target based on portfolio percentage
-                            profit_dollars = portfolio_value * (self.take_profit_pct / 100)
-                            
-                            # Convert to points (how many points for target)
-                            profit_points = profit_dollars / (point_value * position_size)
-                            
-                            # Calculate take profit price for short position (entry - profit points)
-                            take_profit_price = round(current_price - profit_points, 2)
-                            logger.info(f"Take profit: ${profit_dollars:.2f} ({self.take_profit_pct}% of portfolio), {profit_points:.2f} points, price: {take_profit_price}")
-                        
-                        # Create parent market order
-                        parent = Order()
-                        parent.orderId = self.ib.client.getReqId()
-                        parent.action = 'SELL'
-                        parent.orderType = 'MKT'
-                        parent.totalQuantity = position_size
-                        parent.transmit = False  # Parent will not transmit until children are attached
-                        
-                        # Store parent order ID for reference
-                        parent_id = parent.orderId
-                        self.active_orders[parent_id] = {
-                            'type': 'parent',
-                            'direction': 'short',
-                            'children': []
-                        }
-                        
-                        # Create child orders list
-                        child_orders = []
-                        
-                        # Take profit order (limit order)
-                        if take_profit_price:
-                            take_profit = Order()
-                            take_profit.orderId = self.ib.client.getReqId()
-                            take_profit.action = 'BUY'
-                            take_profit.orderType = 'LMT'
-                            take_profit.totalQuantity = position_size
-                            take_profit.lmtPrice = take_profit_price
-                            take_profit.parentId = parent_id
-                            take_profit.transmit = False  # Don't transmit yet
-                            
-                            # Add to active orders
-                            tp_id = take_profit.orderId
-                            self.active_orders[tp_id] = {
-                                'type': 'take_profit',
-                                'parent_id': parent_id,
-                                'direction': 'short'
-                            }
-                            self.active_orders[parent_id]['children'].append(tp_id)
-                            
-                            child_orders.append(take_profit)
-                        
-                        # Stop loss order (stop order)
-                        if stop_loss_price:
-                            stop_loss = Order()
-                            stop_loss.orderId = self.ib.client.getReqId()
-                            stop_loss.action = 'BUY'
-                            stop_loss.orderType = 'STP'
-                            stop_loss.totalQuantity = position_size
-                            stop_loss.auxPrice = stop_loss_price
-                            stop_loss.parentId = parent_id
-                            # This is the last order, so it will transmit the entire bracket
-                            stop_loss.transmit = True
-                            
-                            # Add to active orders
-                            sl_id = stop_loss.orderId
-                            self.active_orders[sl_id] = {
-                                'type': 'stop_loss',
-                                'parent_id': parent_id,
-                                'direction': 'short'
-                            }
-                            self.active_orders[parent_id]['children'].append(sl_id)
-                            
-                            child_orders.append(stop_loss)
-                        else:
-                            # If no stop loss, the last (or only) take profit order must transmit
-                            if child_orders:
-                                child_orders[-1].transmit = True
-                            else:
-                                # If no child orders, parent must transmit
-                                parent.transmit = True
-                        
-                        # Place parent order first
-                        parent_trade = self.ib.placeOrder(self.contract, parent)
-                        self.order_ids.append(parent_id)
-                        logger.info(f"Placed parent order for short position: {parent_trade.order}")
-                        
-                        # Place child orders
-                        for child in child_orders:
-                            child_trade = self.ib.placeOrder(self.contract, child)
-                            self.order_ids.append(child.orderId)
-                            logger.info(f"Placed child order: {child_trade.order}")
-                    else:
-                        # Simple market order if no risk management
-                        order = MarketOrder('SELL', position_size)
-                        order.transmit = True  # Set transmit flag to true
-                        trade = self.ib.placeOrder(self.contract, order)
-                        self.order_ids.append(trade.order.orderId)
-                        logger.info(f"Placed market order to go short: {order}")
-                    
-                    # Update internal state
-                    self.current_position = -1
-                    self.expected_position = -position_size
-                    return True
-                else:
-                    logger.info("Already in short position, no trade executed")
-                    return False
-                    
-            elif action == 2:  # Hold signal
-                logger.info(f"Hold signal received: {action}, no trade executed")
+            target_allocation = target_allocation_for_action(action)
+            target_position = self._calculate_target_contracts(target_allocation, current_price)
+            current_position = int(self.expected_position)
+            delta = target_position - current_position
+
+            if delta == 0:
+                logger.info("Target allocation already satisfied, no trade executed")
                 return False
-                
-            else:  # Invalid action
-                logger.info(f"Invalid action: {action}, no trade executed")
-                return False
+
+            self._cancel_all_existing_orders()
+            time.sleep(0.5)
+
+            order_action = 'BUY' if delta > 0 else 'SELL'
+            order_qty = abs(delta)
+            order = MarketOrder(order_action, order_qty)
+            order.transmit = True
+            trade = self.ib.placeOrder(self.contract, order)
+            self.order_ids.append(trade.order.orderId)
+            logger.info(
+                f"Placed rebalance order: action={order_action} qty={order_qty} "
+                f"current={current_position} target={target_position}"
+            )
+
+            self.expected_position = target_position
+            self.current_position = 1 if target_position > 0 else (-1 if target_position < 0 else 0)
+            return True
                 
         except Exception as e:
             logger.error(f"Error executing trade: {e}")
@@ -1850,7 +1565,7 @@ class ModelTrader:
                     action, _ = self.model.predict(prediction_input, deterministic=True)
 
                 act_int = int(action[0]) if hasattr(action, "__len__") else int(action)
-                logger.info(f"Model action: {act_int} (0=long, 1=short, 2=flat)")
+                logger.info(f"Model action: {act_int} ({action_label(act_int)})")
                 return act_int
 
             # Legacy DataFrame path

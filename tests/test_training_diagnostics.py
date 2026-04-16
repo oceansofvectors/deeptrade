@@ -13,12 +13,28 @@ import pandas as pd
 from train import (  # noqa: E402
     _calculate_sortino_ratio,
     _extract_metric_value,
+    _fallback_candidate_score,
     _infer_periods_per_year,
     _with_training_diagnostics,
 )
 
 
 class TestExtractMetricValue(unittest.TestCase):
+    def test_prediction_accuracy_metric(self):
+        value, name = _extract_metric_value({"prediction_accuracy": 62.5}, "prediction_accuracy")
+        self.assertEqual(value, 62.5)
+        self.assertEqual(name, "prediction_accuracy")
+
+    def test_hit_rate_metric(self):
+        value, name = _extract_metric_value({"hit_rate": 58.0}, "hit_rate")
+        self.assertEqual(value, 58.0)
+        self.assertEqual(name, "hit_rate")
+
+    def test_calmar_metric(self):
+        value, name = _extract_metric_value({"calmar_ratio": 1.25}, "calmar")
+        self.assertEqual(value, 1.25)
+        self.assertEqual(name, "calmar")
+
     def test_sortino_metric(self):
         value, name = _extract_metric_value({"sortino_ratio": 1.5}, "sortino")
         self.assertEqual(value, 1.5)
@@ -34,7 +50,7 @@ class TestTrainingDiagnostics(unittest.TestCase):
     def test_flags_dominant_action_and_metric_drop(self):
         results = {
             "trade_count": 4,
-            "action_counts": {0: 95, 1: 3, 2: 2},
+            "action_counts": {0: 95, 3: 3, 6: 2},
             "sortino_ratio": -3.0,
         }
         enriched = _with_training_diagnostics(
@@ -57,7 +73,7 @@ class TestTrainingDiagnostics(unittest.TestCase):
     def test_balanced_actions_do_not_flag_collapse(self):
         results = {
             "trade_count": 120,
-            "action_counts": {0: 35, 1: 30, 2: 35},
+            "action_counts": {0: 35, 3: 30, 6: 35},
             "total_return_pct": 2.0,
         }
         enriched = _with_training_diagnostics(
@@ -77,7 +93,7 @@ class TestTrainingDiagnostics(unittest.TestCase):
     def test_flat_dominance_rejects_action_mix(self):
         results = {
             "trade_count": 25,
-            "action_counts": {0: 5, 1: 10, 2: 85},
+            "action_counts": {0: 5, 3: 10, 6: 85},
             "total_return_pct": 0.5,
         }
         enriched = _with_training_diagnostics(
@@ -93,6 +109,25 @@ class TestTrainingDiagnostics(unittest.TestCase):
         self.assertFalse(enriched["has_enough_action_mix"])
         self.assertIn("flat_dominance", enriched["collapse_flags"])
         self.assertTrue(enriched["warning_policy_collapse"])
+
+    def test_excessive_drawdown_rejects_candidate(self):
+        results = {
+            "trade_count": 80,
+            "action_counts": {0: 20, 3: 30, 6: 50},
+            "max_drawdown": -45.0,
+            "total_return_pct": 5.0,
+        }
+        enriched = _with_training_diagnostics(
+            results,
+            metric_name="return",
+            metric_value=5.0,
+            loss_info={},
+            min_trades=20,
+            best_metric_value=6.0,
+        )
+
+        self.assertFalse(enriched["has_acceptable_drawdown"])
+        self.assertIn("excessive_drawdown", enriched["collapse_flags"])
 
     def test_infer_periods_per_year_for_one_minute_data(self):
         idx = pd.date_range("2026-01-01", periods=10, freq="1min", tz="UTC")
@@ -111,6 +146,28 @@ class TestTrainingDiagnostics(unittest.TestCase):
         portfolio = np.array([100000.0, 100500.0, 101000.0, 101600.0, 102300.0, 103000.0])
         sortino = _calculate_sortino_ratio(portfolio, idx)
         self.assertGreater(sortino, 0.0)
+
+    def test_fallback_candidate_score_prefers_healthier_policy(self):
+        collapsed = _fallback_candidate_score(
+            {
+                "sortino_ratio": 1.0,
+                "trade_count": 5,
+                "flat_action_pct": 95.0,
+                "active_action_count": 1,
+                "collapse_flags": ["single_action_policy", "too_few_trades", "dominant_action"],
+            }
+        )
+        healthier = _fallback_candidate_score(
+            {
+                "sortino_ratio": 0.5,
+                "trade_count": 30,
+                "flat_action_pct": 20.0,
+                "active_action_count": 4,
+                "collapse_flags": [],
+            }
+        )
+
+        self.assertGreater(healthier, collapsed)
 
 
 if __name__ == "__main__":

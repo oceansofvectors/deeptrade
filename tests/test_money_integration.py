@@ -259,5 +259,14 @@ class TestMoneyIntegration(unittest.TestCase):
         self.assertEqual(last_trade["profit"], float(expected_profit))
         self.assertEqual(last_trade["contracts"], contracts)
 
+    def test_format_money_handles_non_finite_and_huge_values(self):
+        self.assertEqual(money.format_money(Decimal("NaN"), 2), Decimal("0.00"))
+        self.assertEqual(money.format_money(Decimal("Infinity"), 2), Decimal("0.00"))
+        self.assertEqual(money.format_money(Decimal("1E+999999"), 2), Decimal("0.00"))
+        self.assertEqual(
+            money.format_money(Decimal("131374371149780809978658527.3"), 2),
+            Decimal("131374371149780809978658527.30"),
+        )
+
 if __name__ == "__main__":
     unittest.main() 
