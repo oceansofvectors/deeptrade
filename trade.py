@@ -2,16 +2,20 @@ import logging
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except ImportError:  # pragma: no cover - optional plotting dependency
+    go = None
+    make_subplots = None
 from typing import Dict, List, Tuple, Optional, Union
 from decimal import Decimal
 import pytz
 from collections import defaultdict
 
 from stable_baselines3 import PPO
+from action_space import action_direction, action_label, target_allocation_for_action
 from environment import TradingEnv
-from get_data import get_data
 from config import config
 import money
 import constants
@@ -77,6 +81,8 @@ class RiskManager:
         # Internal state
         self.position = 0  # Current position: 0 (neutral), 1 (long), -1 (short)
         self.entry_price = Decimal('0.0')  # Price at which position was entered
+        self.signed_exposure_pct = Decimal('0.0')
+        self.target_allocation_pct = Decimal('0.0')
         self.entry_portfolio_value = Decimal('0.0')  # Portfolio value at entry
         self.highest_price = Decimal('0.0')  # Highest price since entry (for trailing stop on long)
         self.lowest_price = Decimal('Infinity')  # Lowest price since entry (for trailing stop on short)
@@ -93,6 +99,13 @@ class RiskManager:
         self.daily_lowest_balance = self.initial_balance  # Lowest portfolio value during the day
         self.daily_trading_enabled = True  # Flag to track if trading is allowed for the day
         self.current_trading_day = None  # Current trading day being tracked
+
+    def _calculate_signed_exposure(self, contracts: int, price: Decimal) -> Decimal:
+        if contracts == 0 or price <= 0 or self.net_worth <= 0:
+            return Decimal('0.0')
+        notional = price * money.to_decimal(constants.CONTRACT_POINT_VALUE) * money.to_decimal(abs(contracts))
+        exposure = notional / self.net_worth
+        return exposure if contracts > 0 else -exposure
     
     def set_atr(self, atr_value: float) -> None:
         """
@@ -133,6 +146,23 @@ class RiskManager:
         notional_value = price * point_value * money.to_decimal(max_contracts)
         
         return max_contracts
+
+    def calculate_target_contracts(self, target_allocation_pct: float, price: float) -> int:
+        """Convert a target portfolio allocation into a whole-contract quantity."""
+        price_decimal = money.to_decimal(price)
+        allocation_decimal = money.to_decimal(target_allocation_pct)
+        if allocation_decimal == 0 or price_decimal <= 0 or self.net_worth <= 0:
+            return 0
+
+        contract_value = price_decimal * money.to_decimal(constants.CONTRACT_POINT_VALUE)
+        if contract_value <= 0:
+            return 0
+
+        target_notional = self.net_worth * abs(allocation_decimal)
+        contracts = int(target_notional / contract_value)
+        if contracts < 1:
+            return 0
+        return contracts if allocation_decimal > 0 else -contracts
         
     def enter_position(self, position: int, price: float, date: pd.Timestamp, contracts: int, atr_value: float = None,
                        sl_multiplier: float = None, tp_multiplier: float = None) -> None:
@@ -151,6 +181,8 @@ class RiskManager:
         self.position = position
         self.entry_price = money.to_decimal(price)
         self.current_contracts = contracts  # Store the number of contracts
+        self.signed_exposure_pct = self._calculate_signed_exposure(position * contracts, self.entry_price)
+        self.target_allocation_pct = self.signed_exposure_pct
 
         # Update ATR value if provided
         if atr_value is not None:
@@ -448,6 +480,91 @@ class RiskManager:
         self.take_profit_price = Decimal('0.0')
         self.trailing_stop_price = Decimal('0.0')
         self.current_contracts = 0  # Reset the number of contracts
+        self.signed_exposure_pct = Decimal('0.0')
+        self.target_allocation_pct = Decimal('0.0')
+
+    def rebalance_position(
+        self,
+        target_allocation_pct: float,
+        price: float,
+        date: pd.Timestamp,
+        atr_value: float = None,
+        sl_multiplier: float = None,
+        tp_multiplier: float = None,
+    ) -> bool:
+        """Rebalance current exposure to a target signed allocation."""
+        target_contracts = self.calculate_target_contracts(target_allocation_pct, price)
+        signed_current_contracts = self.position * self.current_contracts
+        if target_contracts == signed_current_contracts:
+            self.target_allocation_pct = self._calculate_signed_exposure(target_contracts, money.to_decimal(price))
+            self.signed_exposure_pct = self.target_allocation_pct
+            return False
+
+        price_decimal = money.to_decimal(price)
+        old_direction = self.position
+        new_direction = 1 if target_contracts > 0 else (-1 if target_contracts < 0 else 0)
+        old_contracts = self.current_contracts
+        target_abs = abs(target_contracts)
+
+        if old_direction == 0:
+            if target_abs > 0:
+                self.enter_position(new_direction, price, date, target_abs, atr_value, sl_multiplier, tp_multiplier)
+                return True
+            return False
+
+        if new_direction == 0:
+            self.exit_position(price, date, "model_flat")
+            return True
+
+        if old_direction != new_direction:
+            self.exit_position(price, date, "signal_change")
+            self.enter_position(new_direction, price, date, target_abs, atr_value, sl_multiplier, tp_multiplier)
+            return True
+
+        if target_abs > old_contracts:
+            add_contracts = target_abs - old_contracts
+            new_total = old_contracts + add_contracts
+            weighted_entry = (
+                (self.entry_price * money.to_decimal(old_contracts)) +
+                (price_decimal * money.to_decimal(add_contracts))
+            ) / money.to_decimal(new_total)
+            self.entry_price = weighted_entry
+            self.current_contracts = new_total
+            self.signed_exposure_pct = self._calculate_signed_exposure(self.position * self.current_contracts, price_decimal)
+            self.target_allocation_pct = self.signed_exposure_pct
+            self.trade_history.append({
+                "date": date,
+                "action": "buy" if self.position == 1 else "sell",
+                "price": float(price_decimal),
+                "contracts": add_contracts,
+                "portfolio_value": float(self.net_worth),
+                "rebalance": "scale_in",
+            })
+        else:
+            reduce_contracts = old_contracts - target_abs
+            point_value = money.to_decimal(constants.CONTRACT_POINT_VALUE)
+            pnl_per_contract = money.calculate_price_change(self.entry_price, price_decimal, self.position) * point_value
+            realized_pnl = pnl_per_contract * money.to_decimal(reduce_contracts)
+            tx_cost = money.calculate_transaction_cost(price_decimal, reduce_contracts, self.transaction_cost)
+            self.net_worth += money.calculate_net_profit(realized_pnl, tx_cost)
+            self.current_contracts = target_abs
+            self.signed_exposure_pct = self._calculate_signed_exposure(self.position * self.current_contracts, price_decimal)
+            self.target_allocation_pct = self.signed_exposure_pct
+            self.trade_history.append({
+                "date": date,
+                "action": "sell" if self.position == 1 else "buy",
+                "price": float(price_decimal),
+                "contracts": reduce_contracts,
+                "portfolio_value": float(self.net_worth),
+                "profit": float(money.calculate_net_profit(realized_pnl, tx_cost)),
+                "exit_reason": "rebalance",
+            })
+
+        if atr_value is not None:
+            self.set_atr(atr_value)
+        if self.current_contracts > 0:
+            self.entry_portfolio_value = self.net_worth
+        return True
 
     def check_daily_risk_limit(self, current_date: pd.Timestamp) -> Tuple[bool, str]:
         """
@@ -631,7 +748,15 @@ def trade_with_risk_management(
     dates = []
     price_history = []
     portfolio_history = []
-    action_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Action counts (0=long, 1=short, 2=hold, 3=flat)
+    action_counts = {i: 0 for i in range(7)}
+
+    def _record_exit_marker(exiting_position: int, exit_date: pd.Timestamp, exit_price: float) -> None:
+        if exiting_position == 1:
+            sell_dates.append(exit_date)
+            sell_prices.append(exit_price)
+        elif exiting_position == -1:
+            buy_dates.append(exit_date)
+            buy_prices.append(exit_price)
 
     # Process each candle
     for i in range(len(test_data)):
@@ -663,14 +788,9 @@ def trade_with_risk_management(
             # Close any open positions when daily risk limit is exceeded
             if risk_manager.position != 0:
                 logger.warning(f"Closing position due to exceeded daily risk limit at {current_date_et}")
+                exiting_position = risk_manager.position
                 risk_manager.exit_position(current_price, current_date, "daily_risk_limit")
-                # Record exit
-                if risk_manager.position == 1:  # Was long, now exiting
-                    sell_dates.append(current_date)
-                    sell_prices.append(current_price)
-                else:  # Was short, now exiting
-                    buy_dates.append(current_date)
-                    buy_prices.append(current_price)
+                _record_exit_marker(exiting_position, current_date, current_price)
                 exit_reasons["daily_risk_limit"] += 1
         
         # Check if this is the last candle of the day
@@ -724,6 +844,9 @@ def trade_with_risk_management(
             
             # Record portfolio value before exit for profit checking
             portfolio_before_exit = risk_manager.net_worth
+            exiting_position = risk_manager.position
+            entry_price_before_exit = risk_manager.entry_price
+            contracts_before_exit = risk_manager.current_contracts
             
             # Exit the position with the appropriate price
             risk_manager.exit_position(exit_price, current_date, exit_reason)
@@ -732,8 +855,12 @@ def trade_with_risk_management(
             trade_profit = risk_manager.net_worth - portfolio_before_exit
             
             # Check for unrealistic profits
-            price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-            expected_max_profit = price_diff * money.to_decimal(constants.CONTRACT_POINT_VALUE)
+            price_diff = abs(money.to_decimal(exit_price) - entry_price_before_exit)
+            expected_max_profit = (
+                price_diff
+                * money.to_decimal(constants.CONTRACT_POINT_VALUE)
+                * money.to_decimal(contracts_before_exit)
+            )
             
             if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
                 unrealistic_profit_count += 1
@@ -741,13 +868,7 @@ def trade_with_risk_management(
                               f"from price change of {price_diff:.2f} points. "
                               f"Expected max: ${expected_max_profit:.2f}")
             
-            # Record exit
-            if risk_manager.position == 1:  # Was long, now exiting
-                sell_dates.append(current_date)
-                sell_prices.append(exit_price)
-            else:  # Was short, now exiting
-                buy_dates.append(current_date)
-                buy_prices.append(exit_price)
+            _record_exit_marker(exiting_position, current_date, exit_price)
                 
             # Count exit reason
             exit_reasons[exit_reason] += 1
@@ -783,19 +904,14 @@ def trade_with_risk_management(
                     logger.info(f"Unrealized P&L before second-to-last candle exit: ${float(unrealized_pnl):.2f}")
                     
                     # Exit position with second-to-last candle reason
+                    exiting_position = risk_manager.position
                     risk_manager.exit_position(exit_price, current_date, "second_to_last_candle")
                     
                     # Calculate actual profit/loss from this trade
                     trade_profit = risk_manager.net_worth - portfolio_before_exit
                     logger.info(f"Second-to-last candle trade P&L: ${float(trade_profit):.2f} (using open price: ${float(exit_price):.2f})")
                     
-                    # Record exit
-                    if risk_manager.position == 1:  # Was long, now exiting
-                        sell_dates.append(current_date)
-                        sell_prices.append(exit_price)
-                    else:  # Was short, now exiting
-                        buy_dates.append(current_date)
-                        buy_prices.append(exit_price)
+                    _record_exit_marker(exiting_position, current_date, exit_price)
                     
                     # Count exit reason
                     exit_reasons["second_to_last_candle"] += 1
@@ -845,70 +961,40 @@ def trade_with_risk_management(
                         exit_price = current_price
                         portfolio_before_exit = risk_manager.net_worth
                         reason = "last_candle" if is_last_candle else "second_to_last_candle"
+                        exiting_position = risk_manager.position
                         risk_manager.exit_position(exit_price, current_date, reason)
                         trade_profit = risk_manager.net_worth - portfolio_before_exit
                         logger.info(f"{reason} trade P&L: ${float(trade_profit):.2f}")
                         exit_reasons[reason] += 1
                         logger.info(f"Position closed at {reason}. Exit reason recorded: {reason}")
                 else:
-                    # Normal trading logic for non-end-of-day candles
-                    if current_action == 0:  # Long signal
-                        if risk_manager.position != 1:  # Only enter if not already long
-                            # First exit any existing position
-                            if risk_manager.position != 0:
-                                risk_manager.exit_position(current_price, current_date, "signal_change")
+                    current_atr = None
+                    if "atr" in test_data.columns:
+                        current_atr = test_data.loc[test_data.index[i], "atr"]
+                    elif "ATR" in test_data.columns:
+                        current_atr = test_data.loc[test_data.index[i], "ATR"]
 
-                            # Get current ATR value if available
-                            current_atr = None
-                            if "atr" in test_data.columns:
-                                current_atr = test_data.loc[test_data.index[i], "atr"]
-                            elif "ATR" in test_data.columns:
-                                current_atr = test_data.loc[test_data.index[i], "ATR"]
-
-                            # Then enter long position with dynamic SL/TP multipliers
-                            contracts = risk_manager.calculate_position_size(current_price)
-                            if contracts > 0:
-                                risk_manager.enter_position(1, current_price, current_date, contracts, current_atr,
-                                                          sl_multiplier=current_sl_mult, tp_multiplier=current_tp_mult)
-                                buy_dates.append(current_date)
-                                buy_prices.append(current_price)
-                            else:
-                                logger.warning(f"Insufficient portfolio size to enter long position at {current_date_et}")
-                    elif current_action == 1:  # Short signal
-                        if risk_manager.position != -1:  # Only enter if not already short
-                            # First exit any existing position
-                            if risk_manager.position != 0:
-                                risk_manager.exit_position(current_price, current_date, "signal_change")
-
-                            # Get current ATR value if available
-                            current_atr = None
-                            if "atr" in test_data.columns:
-                                current_atr = test_data.loc[test_data.index[i], "atr"]
-                            elif "ATR" in test_data.columns:
-                                current_atr = test_data.loc[test_data.index[i], "ATR"]
-
-                            # Then enter short position with dynamic SL/TP multipliers
-                            contracts = risk_manager.calculate_position_size(current_price)
-                            if contracts > 0:
-                                risk_manager.enter_position(-1, current_price, current_date, contracts, current_atr,
-                                                          sl_multiplier=current_sl_mult, tp_multiplier=current_tp_mult)
-                                sell_dates.append(current_date)
-                                sell_prices.append(current_price)
-                            else:
-                                logger.warning(f"Insufficient portfolio size to enter short position at {current_date_et}")
-                    elif current_action == 3:  # Flat signal - close position
-                        if risk_manager.position != 0:
-                            risk_manager.exit_position(current_price, current_date, "model_flat")
-                            if risk_manager.position == 1:  # Was long
-                                sell_dates.append(current_date)
-                                sell_prices.append(current_price)
-                            else:  # Was short
-                                buy_dates.append(current_date)
-                                buy_prices.append(current_price)
+                    target_allocation = target_allocation_for_action(current_action)
+                    prev_position = risk_manager.position
+                    changed = risk_manager.rebalance_position(
+                        target_allocation_pct=target_allocation,
+                        price=current_price,
+                        date=current_date,
+                        atr_value=current_atr,
+                        sl_multiplier=current_sl_mult,
+                        tp_multiplier=current_tp_mult,
+                    )
+                    if changed:
+                        new_position = risk_manager.position
+                        if prev_position <= 0 < new_position:
+                            buy_dates.append(current_date)
+                            buy_prices.append(current_price)
+                        elif prev_position >= 0 > new_position:
+                            sell_dates.append(current_date)
+                            sell_prices.append(current_price)
+                        elif new_position == 0:
+                            _record_exit_marker(prev_position, current_date, current_price)
                             exit_reasons["model_flat"] += 1
-                    else:  # Model suggests hold (action 2)
-                        # No position change, just maintain current position
-                        pass
             # If we're on the last candle of the day or second-to-last candle, hold
             else:
                 if verbose > 1:
@@ -923,19 +1009,14 @@ def trade_with_risk_management(
                             portfolio_before_exit = risk_manager.net_worth
                             
                             # Exit position with last_candle reason
+                            exiting_position = risk_manager.position
                             risk_manager.exit_position(exit_price, current_date, "last_candle")
                             
                             # Calculate actual profit/loss from this trade
                             trade_profit = risk_manager.net_worth - portfolio_before_exit
                             logger.info(f"Last candle trade P&L: ${float(trade_profit):.2f}")
                             
-                            # Record exit
-                            if risk_manager.position == 1:  # Was long, now exiting
-                                sell_dates.append(current_date)
-                                sell_prices.append(exit_price)
-                            else:  # Was short, now exiting
-                                buy_dates.append(current_date)
-                                buy_prices.append(exit_price)
+                            _record_exit_marker(exiting_position, current_date, exit_price)
                             
                             # Count exit reason
                             exit_reasons["last_candle"] += 1
@@ -946,6 +1027,7 @@ def trade_with_risk_management(
                         if risk_manager.position != 0:
                             exit_price = current_price
                             portfolio_before_exit = risk_manager.net_worth
+                            exiting_position = risk_manager.position
                             risk_manager.exit_position(exit_price, current_date, "second_to_last_candle")
                             trade_profit = risk_manager.net_worth - portfolio_before_exit
                             logger.info(f"Second-to-last candle trade P&L: ${float(trade_profit):.2f}")
@@ -953,7 +1035,7 @@ def trade_with_risk_management(
                             logger.info(f"Position closed at second-to-last candle. Exit reason recorded: second_to_last_candle")
         
         # Take a step in the environment
-        obs, _, terminated, truncated, _ = env.step(2)  # Use hold action
+        obs, _, terminated, truncated, _ = env.step(6)  # Use flat action to advance env state
         done = terminated or truncated
         
         # Record data for plotting
@@ -970,6 +1052,9 @@ def trade_with_risk_management(
                 
                 # Record portfolio value before exit for profit checking
                 portfolio_before_exit = risk_manager.net_worth
+                exiting_position = risk_manager.position
+                entry_price_before_exit = risk_manager.entry_price
+                contracts_before_exit = risk_manager.current_contracts
                 
                 # Exit position
                 risk_manager.exit_position(exit_price, current_date, "end_of_period")
@@ -978,8 +1063,12 @@ def trade_with_risk_management(
                 trade_profit = risk_manager.net_worth - portfolio_before_exit
                 
                 # Check for unrealistic profits
-                price_diff = abs(money.to_decimal(exit_price) - risk_manager.entry_price)
-                expected_max_profit = price_diff * money.to_decimal(constants.CONTRACT_POINT_VALUE)
+                price_diff = abs(money.to_decimal(exit_price) - entry_price_before_exit)
+                expected_max_profit = (
+                    price_diff
+                    * money.to_decimal(constants.CONTRACT_POINT_VALUE)
+                    * money.to_decimal(contracts_before_exit)
+                )
                 
                 if trade_profit > unrealistic_profit_threshold and trade_profit > expected_max_profit * multiplier_threshold:
                     unrealistic_profit_count += 1
@@ -987,13 +1076,7 @@ def trade_with_risk_management(
                                   f"from price change of {price_diff:.2f} points. "
                                   f"Expected max: ${expected_max_profit:.2f}")
                 
-                # Record exit
-                if risk_manager.position == 1:  # Was long, now exiting
-                    sell_dates.append(current_date)
-                    sell_prices.append(exit_price)
-                else:  # Was short, now exiting
-                    buy_dates.append(current_date)
-                    buy_prices.append(exit_price)
+                _record_exit_marker(exiting_position, current_date, exit_price)
             break
         
         # Check if we need to close positions at the end of the trading day
@@ -1049,19 +1132,14 @@ def trade_with_risk_management(
                     logger.info(f"Unrealized P&L before end-of-day exit: ${float(unrealized_pnl):.2f}")
                     
                     # Exit position with end_of_day reason
+                    exiting_position = risk_manager.position
                     risk_manager.exit_position(exit_price, current_date, "end_of_day")
                     
                     # Calculate actual profit/loss from this trade
                     trade_profit = risk_manager.net_worth - portfolio_before_exit
                     logger.info(f"End-of-day trade P&L: ${float(trade_profit):.2f}")
                     
-                    # Record exit
-                    if risk_manager.position == 1:  # Was long, now exiting
-                        sell_dates.append(current_date)
-                        sell_prices.append(exit_price)
-                    else:  # Was short, now exiting
-                        buy_dates.append(current_date)
-                        buy_prices.append(exit_price)
+                    _record_exit_marker(exiting_position, current_date, exit_price)
                     
                     # Count exit reason
                     exit_reasons["end_of_day"] += 1
@@ -1326,7 +1404,15 @@ def save_trade_history(trade_history: List[Dict], filename: str = "risk_managed_
         
     # Calculate position changes
     for i in range(len(trade_history_df)):
-        if i > 0:
+        if i == 0:
+            curr_trade = trade_history_df.iloc[i]
+            if 'exit_reason' in curr_trade and pd.notna(curr_trade['exit_reason']):
+                trade_history_df.at[i, 'position_from'] = 0
+                trade_history_df.at[i, 'position_to'] = 0
+            else:
+                trade_history_df.at[i, 'position_from'] = 0
+                trade_history_df.at[i, 'position_to'] = 1 if curr_trade[action_field] == 'buy' else -1
+        else:
             prev_trade = trade_history_df.iloc[i-1]
             curr_trade = trade_history_df.iloc[i]
             
@@ -1363,6 +1449,8 @@ def main():
     torch.manual_seed(SEED)
     
     # Load data
+    from get_data import get_data
+
     _, test_data = get_data(
         symbol=config["data"]["symbol"],
         period=config["data"]["period"],

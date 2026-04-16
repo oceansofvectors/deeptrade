@@ -5,15 +5,15 @@ import re
 
 import numpy as np
 
+from action_space import action_label
+
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
 ANSI_GREEN = "\033[32m"
 ANSI_RED = "\033[31m"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# Standard discrete path in TradingEnv is 0=BUY/LONG, 1=SELL/SHORT, 2=FLAT.
-# Keep code 3 for legacy callers that still emit a separate HOLD-like value.
-ACTION_NAMES = {0: "BUY", 1: "SELL", 2: "FLAT", 3: "HOLD"}
+ACTION_NAMES = {idx: action_label(idx) for idx in range(7)}
 
 
 def color_value(value: float, fmt: str = ".2f", suffix: str = "") -> str:
@@ -32,7 +32,7 @@ def bold(text: str) -> str:
 
 
 def format_action_distribution(action_history) -> str:
-    """Format an action history iterable as 'BUY=N SELL=N HOLD=N FLAT=N'."""
+    """Format an action history iterable as 'LONG_1=N ... FLAT=N'."""
     if action_history is None:
         return "no actions"
     if isinstance(action_history, dict):

@@ -20,7 +20,7 @@ from walk_forward import (  # noqa: E402
 class TestWalkForwardTuningScore(unittest.TestCase):
     def test_normalize_action_counts_handles_string_keys(self):
         normalized = _normalize_action_counts({"0": 3, "1": 5, "2": 7})
-        self.assertEqual(normalized, {0: 3, 1: 5, 2: 7})
+        self.assertEqual(normalized, {0: 3, 1: 5, 2: 7, 3: 0, 4: 0, 5: 0, 6: 0})
 
     def test_always_short_policy_is_penalized(self):
         results = {
@@ -29,7 +29,7 @@ class TestWalkForwardTuningScore(unittest.TestCase):
             "calmar_ratio": 2.10,
             "max_drawdown": -7.61,
             "trade_count": 1,
-            "action_counts": {0: 0, 1: 1377, 2: 0},
+            "action_counts": {5: 1377},
         }
         score, diagnostics = _score_tuning_trial(results, validation_bars=1377)
 
@@ -42,12 +42,12 @@ class TestWalkForwardTuningScore(unittest.TestCase):
 
     def test_balanced_policy_keeps_positive_score(self):
         results = {
-            "total_return_pct": 14.77,
-            "sortino_ratio": 6.32,
-            "calmar_ratio": 3.88,
+            "total_return_pct": 45.0,
+            "sortino_ratio": 10.0,
+            "calmar_ratio": 5.0,
             "max_drawdown": -3.81,
             "trade_count": 32,
-            "action_counts": {0: 363, 1: 32, 2: 982},
+            "action_counts": {0: 363, 3: 320, 6: 694},
         }
         score, diagnostics = _score_tuning_trial(results, validation_bars=1377)
 
@@ -79,7 +79,7 @@ class TestWalkForwardTuningScore(unittest.TestCase):
 
     def test_hard_prune_detects_all_flat_zero_trade_policy(self):
         should_prune, reasons = _should_hard_prune_trial(
-            {"trade_count": 0, "action_counts": {0: 0, 1: 0, 2: 100}},
+            {"trade_count": 0, "action_counts": {6: 100}},
             {
                 "early_prune_zero_trade": True,
                 "early_prune_flat_action_pct": 99.0,
@@ -94,7 +94,7 @@ class TestWalkForwardTuningScore(unittest.TestCase):
 
     def test_hard_prune_keeps_active_policy(self):
         should_prune, reasons = _should_hard_prune_trial(
-            {"trade_count": 12, "action_counts": {0: 35, 1: 28, 2: 37}},
+            {"trade_count": 12, "action_counts": {0: 35, 3: 28, 6: 37}},
             {
                 "early_prune_zero_trade": True,
                 "early_prune_flat_action_pct": 99.0,
@@ -104,6 +104,21 @@ class TestWalkForwardTuningScore(unittest.TestCase):
 
         self.assertFalse(should_prune)
         self.assertEqual(reasons, [])
+
+    def test_excessive_drawdown_is_penalized(self):
+        results = {
+            "total_return_pct": 25.0,
+            "sortino_ratio": 3.0,
+            "calmar_ratio": 0.8,
+            "max_drawdown": -55.0,
+            "trade_count": 40,
+            "action_counts": {0: 300, 3: 250, 6: 100},
+        }
+        score, diagnostics = _score_tuning_trial(results, validation_bars=1000)
+
+        self.assertIn("excessive_drawdown", diagnostics["collapse_flags"])
+        self.assertGreater(diagnostics["total_penalty"], 0.0)
+        self.assertLess(score, diagnostics["base_score"])
 
     def test_narrow_hp_config_shrinks_ranges_around_best_params(self):
         base = {

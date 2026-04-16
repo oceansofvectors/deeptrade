@@ -21,6 +21,7 @@ from utils.log_format import (  # noqa: E402
     color_pct,
     color_value,
     format_action_distribution,
+    strip_ansi,
 )
 
 
@@ -57,39 +58,35 @@ class TestBold(unittest.TestCase):
 
 class TestActionDistribution(unittest.TestCase):
     def test_action_names_mapping(self):
-        self.assertEqual(ACTION_NAMES[0], "BUY")
-        self.assertEqual(ACTION_NAMES[1], "SELL")
-        self.assertEqual(ACTION_NAMES[2], "FLAT")
-        self.assertEqual(ACTION_NAMES[3], "HOLD")
+        self.assertEqual(ACTION_NAMES[0], "LONG_1")
+        self.assertEqual(ACTION_NAMES[5], "SHORT_5")
+        self.assertEqual(ACTION_NAMES[6], "FLAT")
 
     def test_empty_history(self):
         self.assertEqual(format_action_distribution([]), "no actions")
         self.assertEqual(format_action_distribution(None), "no actions")
 
     def test_counts(self):
-        history = [0, 0, 1, 2, 2, 2, 3]
+        history = [0, 0, 4, 6, 6, 6]
         s = format_action_distribution(history)
-        self.assertIn("BUY=2", s)
-        self.assertIn("SELL=1", s)
+        self.assertIn("LONG_1=2", s)
+        self.assertIn("SHORT_2=1", s)
         self.assertIn("FLAT=3", s)
-        self.assertIn("HOLD=1", s)
 
     def test_numpy_array_input(self):
         import numpy as np
-        history = np.array([0, 1, 1, 2])
+        history = np.array([0, 5, 5, 6])
         s = format_action_distribution(history)
-        self.assertIn("BUY=1", s)
-        self.assertIn("SELL=2", s)
+        self.assertIn("LONG_1=1", s)
+        self.assertIn("SHORT_5=2", s)
         self.assertIn("FLAT=1", s)
-        self.assertIn("HOLD=0", s)
 
     def test_dict_input(self):
-        counts = {0: 5, 1: 0, 2: 3}
+        counts = {0: 5, 5: 0, 6: 3}
         s = format_action_distribution(counts)
-        self.assertIn("BUY=5", s)
-        self.assertIn("SELL=0", s)
+        self.assertIn("LONG_1=5", s)
+        self.assertIn("SHORT_5=0", s)
         self.assertIn("FLAT=3", s)
-        self.assertIn("HOLD=0", s)
 
 
 class TestColorValue(unittest.TestCase):
@@ -103,6 +100,10 @@ class TestColorValue(unittest.TestCase):
         s = color_value(-0.5)
         self.assertIn(ANSI_RED, s)
         self.assertIn("-0.50", s)
+
+    def test_custom_suffix(self):
+        s = color_value(2.0, suffix="x")
+        self.assertIn("2.00x", s)
 
 
 class TestAnsiStrippingFormatter(unittest.TestCase):
@@ -128,6 +129,9 @@ class TestAnsiStrippingFormatter(unittest.TestCase):
         lg.propagate = False
         lg.info(f"Return={color_pct(-2.5)}")
         self.assertIn(ANSI_RED, buf.getvalue())
+
+    def test_strip_ansi_helper(self):
+        self.assertEqual(strip_ansi(f"{ANSI_GREEN}ok{ANSI_RESET}"), "ok")
 
 
 if __name__ == "__main__":
