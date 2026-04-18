@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from config import config  # noqa: E402
 from walk_forward import (  # noqa: E402
+    _apply_best_hyperparameters_to_config,
     _apply_trial_config_overrides,
     _align_feature_columns,
     _build_tuning_env,
@@ -23,6 +24,7 @@ from walk_forward import (  # noqa: E402
     _resolve_tuning_n_jobs,
     _restore_trial_config_overrides,
     _resolve_close_column,
+    _resolve_staged_trial_counts,
     _sanitize_ohlc_outliers,
     _sanitize_cuda_library_path,
     _sample_stage_params,
@@ -156,6 +158,11 @@ class TestWalkForwardHelpers(unittest.TestCase):
         self.assertEqual(_valid_batch_size_choices(960), [16, 32, 64])
         self.assertEqual(_valid_batch_size_choices(750), [16, 32, 64, 128, 256, 512])
 
+    def test_resolve_staged_trial_counts_caps_total_budget(self):
+        self.assertEqual(_resolve_staged_trial_counts(16, 24, 16), (10, 6))
+        self.assertEqual(_resolve_staged_trial_counts(4, 4, 0), (4, 0))
+        self.assertEqual(_resolve_staged_trial_counts(4, 0, 4), (0, 4))
+
     def test_narrow_hp_config_shrinks_linear_and_log_ranges_around_best(self):
         narrowed = _narrow_hp_config(
             {
@@ -176,14 +183,31 @@ class TestWalkForwardHelpers(unittest.TestCase):
         class _Trial:
             def __init__(self):
                 self.float_args = []
+                self.categorical_args = []
 
             def suggest_int(self, name, low, high, log=False):
-                self.int_args = (name, low, high, log)
-                return 512
+                self.int_args = getattr(self, "int_args", [])
+                self.int_args.append((name, low, high, log))
+                return 512 if name == "n_steps" else 30
 
             def suggest_float(self, name, low, high, log=False):
                 self.float_args.append((name, low, high, log))
-                return {"learning_rate": 1e-4, "ent_coef": 0.1, "reward_turnover_penalty": 0.01, "reward_calm_holding_bonus": 0.002}[name]
+                return {
+                    "learning_rate": 1e-4,
+                    "ent_coef": 0.1,
+                    "gamma": 0.995,
+                    "gae_lambda": 0.95,
+                    "reward_turnover_penalty": 0.01,
+                    "reward_loss_multiplier": 0.8,
+                    "reward_drawdown_penalty": 2.0,
+                    "reward_drawdown_penalty_threshold": 0.02,
+                    "reward_flat_time_penalty": 0.001,
+                    "synthetic_oversample_ratio": 0.12,
+                }[name]
+
+            def suggest_categorical(self, name, choices):
+                self.categorical_args.append((name, tuple(choices)))
+                return choices[-1]
 
         trial = _Trial()
         params = _sample_stage_params(
@@ -192,17 +216,31 @@ class TestWalkForwardHelpers(unittest.TestCase):
                 "learning_rate": {"min": 1e-5, "max": 1e-3, "log": True},
                 "n_steps": {"min": 128, "max": 1024, "log": True},
                 "ent_coef": {"min": 0.01, "max": 0.2},
+                "gamma": {"min": 0.985, "max": 0.999},
+                "gae_lambda": {"min": 0.90, "max": 0.99},
                 "reward_turnover_penalty": {"min": 0.0, "max": 0.02},
-                "reward_calm_holding_bonus": {"min": 0.0, "max": 0.01},
+                "reward_loss_multiplier": {"min": 0.25, "max": 1.25},
+                "reward_drawdown_penalty": {"min": 0.5, "max": 4.0},
+                "reward_drawdown_penalty_threshold": {"min": 0.01, "max": 0.05},
+                "reward_flat_time_penalty": {"min": 0.0, "max": 0.02},
+                "reward_flat_time_grace_steps": {"min": 15, "max": 60},
+                "synthetic_oversample_ratio": {"min": 0.0, "max": 0.2},
             },
         )
 
         self.assertEqual(params["n_steps"], 512)
-        self.assertEqual(trial.int_args, ("n_steps", 128, 1024, True))
+        self.assertIn(("n_steps", 128, 1024, True), trial.int_args)
+        self.assertIn(("reward_flat_time_grace_steps", 15, 60, False), trial.int_args)
         self.assertAlmostEqual(params["learning_rate"], 1e-4)
         self.assertAlmostEqual(params["ent_coef"], 0.1)
         self.assertAlmostEqual(params["reward_turnover_penalty"], 0.01)
-        self.assertAlmostEqual(params["reward_calm_holding_bonus"], 0.002)
+        self.assertAlmostEqual(params["gamma"], 0.995)
+        self.assertAlmostEqual(params["gae_lambda"], 0.95)
+        self.assertAlmostEqual(params["reward_loss_multiplier"], 0.8)
+        self.assertAlmostEqual(params["reward_drawdown_penalty"], 2.0)
+        self.assertAlmostEqual(params["reward_drawdown_penalty_threshold"], 0.02)
+        self.assertAlmostEqual(params["reward_flat_time_penalty"], 0.001)
+        self.assertAlmostEqual(params["synthetic_oversample_ratio"], 0.12)
 
     def test_summarize_trial_scores_applies_baseline_penalty(self):
         score, diagnostics = _summarize_trial_scores(
@@ -242,29 +280,83 @@ class TestWalkForwardHelpers(unittest.TestCase):
     def test_trial_config_overrides_apply_and_restore(self):
         config["reward"]["loss_multiplier"] = 0.7
         config["reward"]["turnover_penalty"] = 0.01
-        config["reward"]["calm_holding_bonus"] = 0.001
+        config["reward"]["drawdown_penalty"] = 2.5
+        config["reward"]["drawdown_penalty_threshold"] = 0.03
+        config["reward"]["flat_time_penalty"] = 0.0
+        config["reward"]["flat_time_grace_steps"] = 30
         config["augmentation"]["synthetic_bears"]["oversample_ratio"] = 0.3
 
         originals = _apply_trial_config_overrides(
             {
                 "reward_loss_multiplier": 0.9,
                 "reward_turnover_penalty": 0.02,
-                "reward_calm_holding_bonus": 0.003,
+                "reward_drawdown_penalty": 1.8,
+                "reward_drawdown_penalty_threshold": 0.02,
+                "reward_flat_time_penalty": 0.001,
+                "reward_flat_time_grace_steps": 45,
                 "synthetic_oversample_ratio": 0.5,
             }
         )
 
         self.assertEqual(config["reward"]["loss_multiplier"], 0.9)
         self.assertEqual(config["reward"]["turnover_penalty"], 0.02)
-        self.assertEqual(config["reward"]["calm_holding_bonus"], 0.003)
+        self.assertEqual(config["reward"]["drawdown_penalty"], 1.8)
+        self.assertEqual(config["reward"]["drawdown_penalty_threshold"], 0.02)
+        self.assertEqual(config["reward"]["flat_time_penalty"], 0.001)
+        self.assertEqual(config["reward"]["flat_time_grace_steps"], 45)
         self.assertEqual(config["augmentation"]["synthetic_bears"]["oversample_ratio"], 0.5)
 
         _restore_trial_config_overrides(originals)
 
         self.assertEqual(config["reward"]["loss_multiplier"], 0.7)
         self.assertEqual(config["reward"]["turnover_penalty"], 0.01)
-        self.assertEqual(config["reward"]["calm_holding_bonus"], 0.001)
+        self.assertEqual(config["reward"]["drawdown_penalty"], 2.5)
+        self.assertEqual(config["reward"]["drawdown_penalty_threshold"], 0.03)
+        self.assertEqual(config["reward"]["flat_time_penalty"], 0.0)
+        self.assertEqual(config["reward"]["flat_time_grace_steps"], 30)
         self.assertEqual(config["augmentation"]["synthetic_bears"]["oversample_ratio"], 0.3)
+
+    def test_apply_best_hyperparameters_updates_live_config(self):
+        _apply_best_hyperparameters_to_config(
+            {
+                "learning_rate": 0.00012,
+                "batch_size": 128,
+                "buffer_size": 200000,
+                "learning_starts": 5000,
+                "train_freq": 16,
+                "gradient_steps": 4,
+                "target_update_interval": 2000,
+                "exploration_fraction": 0.15,
+                "exploration_final_eps": 0.05,
+                "gamma": 0.997,
+                "gae_lambda": 0.94,
+                "reward_loss_multiplier": 0.6,
+                "reward_turnover_penalty": 0.007,
+                "reward_drawdown_penalty": 1.1,
+                "reward_drawdown_penalty_threshold": 0.02,
+                "reward_flat_time_penalty": 0.0,
+                "reward_flat_time_grace_steps": 20,
+                "synthetic_oversample_ratio": 0.1,
+            }
+        )
+
+        self.assertEqual(config["model"]["learning_rate"], 0.00012)
+        self.assertEqual(config["model"]["batch_size"], 128)
+        self.assertEqual(config["model"]["buffer_size"], 200000)
+        self.assertEqual(config["model"]["learning_starts"], 5000)
+        self.assertEqual(config["model"]["train_freq"], 16)
+        self.assertEqual(config["model"]["gradient_steps"], 4)
+        self.assertEqual(config["model"]["target_update_interval"], 2000)
+        self.assertEqual(config["model"]["exploration_fraction"], 0.15)
+        self.assertEqual(config["model"]["exploration_final_eps"], 0.05)
+        self.assertEqual(config["model"]["gamma"], 0.997)
+        self.assertEqual(config["model"]["gae_lambda"], 0.94)
+        self.assertEqual(config["reward"]["loss_multiplier"], 0.6)
+        self.assertEqual(config["reward"]["turnover_penalty"], 0.007)
+        self.assertEqual(config["reward"]["drawdown_penalty"], 1.1)
+        self.assertEqual(config["reward"]["drawdown_penalty_threshold"], 0.02)
+        self.assertEqual(config["reward"]["flat_time_grace_steps"], 20)
+        self.assertEqual(config["augmentation"]["synthetic_bears"]["oversample_ratio"], 0.1)
 
     def test_resolve_tuning_n_jobs_obeys_deterministic_mode(self):
         config["reproducibility"]["deterministic_mode"] = True
@@ -369,6 +461,68 @@ class TestWalkForwardHelpers(unittest.TestCase):
             _, prepared_val, _ = _prepare_tuning_inputs(train_df, val_df)
 
         self.assertGreater(float(prepared_val.iloc[1]["close"]), 1000.0)
+
+    def test_prepare_tuning_inputs_latent_only_drops_engineered_market_columns(self):
+        train_df = pd.DataFrame(
+            {"close": [1.0], "open": [1.0], "high": [1.0], "low": [1.0], "volume": [1.0], "position": [0]}
+        )
+        val_df = train_df.copy()
+        config["augmentation"]["synthetic_bears"]["enabled"] = False
+        config["representation"]["mode"] = "latent_only"
+
+        scaled_train = pd.DataFrame(
+            {
+                "close": [1.0],
+                "open": [1.0],
+                "high": [1.0],
+                "low": [1.0],
+                "volume": [1.0],
+                "close_norm": [0.5],
+                "feat": [0.2],
+                "position": [0],
+            }
+        )
+        scaled_val = scaled_train.copy()
+
+        class _FakeGenerator:
+            def __init__(self, **kwargs):
+                self.output_size = kwargs["output_size"]
+
+            def fit(self, train_df, validation_df, checkpoint_path=None):
+                self.feature_columns = list(train_df.columns)
+
+            def transform(self, df):
+                result = df.copy()
+                result["LATENT_F0"] = 0.1
+                result["LATENT_F1"] = 0.2
+                return result
+
+        lstm_params = {
+            "lookback": 10,
+            "hidden_size": 8,
+            "num_layers": 1,
+            "output_size": 2,
+            "pretrain_epochs": 1,
+            "pretrain_lr": 0.001,
+            "pretrain_batch_size": 8,
+            "pretrain_patience": 1,
+            "pretrain_min_delta": 0.0001,
+            "beta": 0.001,
+            "kl_warmup_epochs": 1,
+        }
+
+        with mock.patch("walk_forward.process_technical_indicators", side_effect=lambda df: df.copy()), \
+             mock.patch("walk_forward.get_standardized_column_names", return_value=[]), \
+             mock.patch("walk_forward.scale_window", return_value=(None, scaled_train.copy(), scaled_val.copy(), scaled_val.copy())), \
+             mock.patch("walk_forward.LSTMFeatureGenerator", _FakeGenerator):
+            prepared_train, prepared_val, _ = _prepare_tuning_inputs(train_df, val_df, lstm_params=lstm_params)
+
+        self.assertIn("LATENT_F0", prepared_train.columns)
+        self.assertIn("LATENT_F1", prepared_train.columns)
+        self.assertNotIn("close_norm", prepared_train.columns)
+        self.assertNotIn("feat", prepared_train.columns)
+        self.assertNotIn("close_norm", prepared_val.columns)
+        self.assertNotIn("feat", prepared_val.columns)
 
     def test_build_tuning_env_uses_dummy_or_subproc_based_on_count(self):
         data = pd.DataFrame({"close": [1.0], "close_norm": [0.0]})

@@ -6,6 +6,7 @@ This module contains shared data processing utilities to avoid circular dependen
 
 # Standard library imports
 import logging
+from collections.abc import Mapping
 from datetime import time
 
 # Third-party imports
@@ -17,6 +18,21 @@ logger = logging.getLogger(__name__)
 EASTERN = pytz.timezone("US/Eastern")
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
+
+
+def market_hours_only_enabled(settings: Mapping | None = None) -> bool:
+    """Return whether offline training/evaluation should use NYSE RTH only.
+
+    The repo treats this as a single source-of-truth boolean under
+    ``data.market_hours_only``. Missing keys default to enabled so all
+    training/evaluation paths agree on the safer market-hours-only behavior.
+    """
+    if settings is None:
+        return True
+    data_config = settings.get("data", {})
+    if not isinstance(data_config, Mapping):
+        return True
+    return bool(data_config.get("market_hours_only", True))
 
 
 def is_rth_bar(ts) -> bool:
@@ -86,6 +102,6 @@ def filter_market_hours(data: pd.DataFrame) -> pd.DataFrame:
 
     # Log filtering results
     filtered_pct = (len(filtered_data) / len(data)) * 100
-    logger.info(f"Filtered data to market hours only: {len(filtered_data)} / {len(data)} rows ({filtered_pct:.2f}%)")
+    logger.info(f"Filtered data to NYSE RTH only: {len(filtered_data)} / {len(data)} rows ({filtered_pct:.2f}%)")
 
     return filtered_data

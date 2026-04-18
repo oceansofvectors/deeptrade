@@ -10,7 +10,7 @@ import pandas as pd
 import pytz
 from stable_baselines3 import PPO
 from ib_insync import MarketOrder, Order, LimitOrder, StopOrder, BracketOrder # Future, Contract may not be needed directly if ib_instance handles it
-from action_space import action_label, target_allocation_for_action
+from action_space import action_label, target_contracts_for_action
 import constants
 
 # RecurrentPPO for LSTM support
@@ -19,6 +19,12 @@ try:
     RECURRENT_PPO_AVAILABLE = True
 except ImportError:
     RECURRENT_PPO_AVAILABLE = False
+
+try:
+    from sb3_contrib import QRDQN
+    QRDQN_AVAILABLE = True
+except ImportError:
+    QRDQN_AVAILABLE = False
 
 from config import config
 from get_data import process_technical_indicators # ensure_numeric is a dependency of this
@@ -32,6 +38,21 @@ except ImportError:
     LSTM_FEATURES_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _load_policy_model(model_path: str):
+    """Load the configured policy class with safe fallbacks."""
+    algorithm = str(config.get("model", {}).get("algorithm", "ppo")).lower()
+    if algorithm == "recurrent_ppo" and RECURRENT_PPO_AVAILABLE:
+        return RecurrentPPO.load(model_path), True
+    if algorithm == "qrdqn" and QRDQN_AVAILABLE:
+        return QRDQN.load(model_path), False
+    if RECURRENT_PPO_AVAILABLE:
+        try:
+            return RecurrentPPO.load(model_path), True
+        except Exception:
+            pass
+    return PPO.load(model_path), False
 
 class ModelTrader:
     def __init__(self, ib_instance, model_path, state_file_path="trader_state.pkl", use_risk_management=True):
@@ -187,19 +208,6 @@ class ModelTrader:
             self.position_size = config["environment"].get("position_size", 1)
             logger.info(f"Using fixed position size of {self.position_size} contracts per trade")
 
-    def _calculate_target_contracts(self, target_allocation_pct: float, price: float) -> int:
-        """Convert a target allocation into a whole-contract live quantity."""
-        if price <= 0 or target_allocation_pct == 0:
-            return 0
-        equity = max(float(self.session_equity), float(config.get("environment", {}).get("initial_balance", 100000.0)))
-        contract_notional = price * self.point_value
-        if contract_notional <= 0:
-            return 0
-        contracts = int((equity * abs(float(target_allocation_pct))) / contract_notional)
-        if contracts < 1:
-            return 0
-        return contracts if target_allocation_pct > 0 else -contracts
-    
     def _load_enabled_indicators_from_file(self):
         """
         Load enabled indicators from the enabled_indicators.json file if it exists,
@@ -361,33 +369,18 @@ class ModelTrader:
                     return True
                 model_path_for_load = model_zip.replace(".zip", "")
 
-                if RECURRENT_PPO_AVAILABLE:
-                    try:
-                        self.model = RecurrentPPO.load(model_path_for_load)
-                        self.is_recurrent_model = True
-                        logger.info(f"Loaded RecurrentPPO from bundle {bundle_dir}")
-                    except Exception:
-                        self.model = PPO.load(model_path_for_load)
-                        self.is_recurrent_model = False
-                        logger.info(f"Loaded PPO (non-recurrent) from bundle {bundle_dir}")
-                else:
-                    self.model = PPO.load(model_path_for_load)
-                    self.is_recurrent_model = False
+                self.model, self.is_recurrent_model = _load_policy_model(model_path_for_load)
+                logger.info(
+                    "Loaded %s from bundle %s",
+                    self.model.__class__.__name__,
+                    bundle_dir,
+                )
             else:
                 logger.warning(
                     f"No bundle directory detected at {self.model_path}. "
                     f"Loading model-only; live preprocessing will NOT work."
                 )
-                if RECURRENT_PPO_AVAILABLE:
-                    try:
-                        self.model = RecurrentPPO.load(self.model_path)
-                        self.is_recurrent_model = True
-                    except Exception:
-                        self.model = PPO.load(self.model_path)
-                        self.is_recurrent_model = False
-                else:
-                    self.model = PPO.load(self.model_path)
-                    self.is_recurrent_model = False
+                self.model, self.is_recurrent_model = _load_policy_model(self.model_path)
 
             if self.is_recurrent_model:
                 self.reset_lstm_state()
@@ -462,13 +455,13 @@ class ModelTrader:
 
     def _load_lstm_generator(self, bundle_dir: str):
         lstm_path = os.path.join(bundle_dir, "lstm_generator.pkl")
-        has_lstm = any(c.startswith("LSTM_F") for c in (self.indicator_columns or []))
+        has_lstm = any(c.startswith(("LSTM_F", "LATENT_F")) for c in (self.indicator_columns or []))
         if not has_lstm:
-            logger.info("feature_order contains no LSTM_F* columns; lstm_generator not needed")
+            logger.info("feature_order contains no latent VAE columns; lstm_generator not needed")
             return
         if not os.path.exists(lstm_path):
             logger.error(
-                f"feature_order.json expects LSTM_F* features but "
+                f"feature_order.json expects latent VAE features but "
                 f"lstm_generator.pkl is missing at {lstm_path}"
             )
             return
@@ -1180,7 +1173,7 @@ class ModelTrader:
         Execute a trade based on the prediction from the model.
         
         Args:
-            prediction: The action predicted by the model (target allocation action id)
+            prediction: The action predicted by the model (target-contract action id)
             bar: The current price bar
             
         Returns:
@@ -1200,13 +1193,24 @@ class ModelTrader:
             # Get price information from the bar
             current_price = bar['close']
             logger.info(f"Current price: {current_price}")
-            target_allocation = target_allocation_for_action(action)
-            target_position = self._calculate_target_contracts(target_allocation, current_price)
+            current_atr = None
+            for atr_key in ("ATR_RAW", "atr_raw", "ATR", "atr"):
+                if atr_key in bar and bar[atr_key] is not None:
+                    current_atr = bar[atr_key]
+                    break
+            target_position = int(
+                target_contracts_for_action(
+                    action,
+                    net_worth=getattr(self, "portfolio_value", None),
+                    atr=current_atr,
+                    price=current_price,
+                )
+            )
             current_position = int(self.expected_position)
             delta = target_position - current_position
 
             if delta == 0:
-                logger.info("Target allocation already satisfied, no trade executed")
+                logger.info("Target contract position already satisfied, no trade executed")
                 return False
 
             self._cancel_all_existing_orders()

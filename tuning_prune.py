@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import Dict
 
+from action_space import ACTION_COUNT, FLAT_ACTION
+
 
 def normalize_action_counts(action_counts: Dict | None) -> Dict[int, int]:
     """Normalize action-count mappings to integer-keyed dictionaries."""
-    normalized = {i: 0 for i in range(7)}
+    normalized = {i: 0 for i in range(ACTION_COUNT)}
     if not action_counts:
         return normalized
     for raw_key, raw_value in action_counts.items():
@@ -22,7 +24,7 @@ def tuning_prune_diagnostics(results: Dict) -> Dict[str, float | int | bool]:
     """Extract simple collapse diagnostics used for early trial pruning."""
     action_counts = normalize_action_counts(results.get("action_counts"))
     total_actions = max(1, sum(action_counts.values()))
-    flat_action_pct = 100.0 * action_counts.get(6, 0) / total_actions
+    flat_action_pct = 100.0 * action_counts.get(FLAT_ACTION, 0) / total_actions
     active_action_count = sum(1 for count in action_counts.values() if count > 0)
     trade_count = int(results.get("trade_count", results.get("num_trades", 0)))
     max_drawdown_pct = abs(float(results.get("max_drawdown", 0.0)))
@@ -34,11 +36,29 @@ def tuning_prune_diagnostics(results: Dict) -> Dict[str, float | int | bool]:
     }
 
 
-def should_hard_prune_trial(results: Dict, tuning_config: Dict) -> tuple[bool, list[str]]:
+def should_hard_prune_trial(
+    results: Dict,
+    tuning_config: Dict,
+    *,
+    prune_step: int | None = None,
+) -> tuple[bool, list[str]]:
     """Return whether a trial should be pruned immediately for degenerate behavior."""
     diag = tuning_prune_diagnostics(results)
     reasons = []
-    if tuning_config.get("early_prune_zero_trade", True) and diag["trade_count"] == 0:
+    zero_trade_min_step = int(tuning_config.get("early_prune_zero_trade_min_step", 3))
+    allow_zero_trade_prune = (
+        prune_step is None or prune_step >= max(1, zero_trade_min_step)
+    )
+    zero_trade_requires_collapsed_actions = (
+        diag["active_action_count"] <= 1
+        or diag["flat_action_pct"] >= float(tuning_config.get("early_prune_flat_action_pct", 99.0))
+    )
+    if (
+        tuning_config.get("early_prune_zero_trade", True)
+        and diag["trade_count"] == 0
+        and allow_zero_trade_prune
+        and zero_trade_requires_collapsed_actions
+    ):
         reasons.append("zero_trade")
     if diag["flat_action_pct"] >= float(tuning_config.get("early_prune_flat_action_pct", 99.0)):
         reasons.append("all_flat")

@@ -74,23 +74,42 @@ def calculate_opening_range_features(
             continue
 
         session_open_idx = result_df.index[opening_mask][0]
-        opening_high = float(result_df.loc[opening_mask, high_col].max())
-        opening_low = float(result_df.loc[opening_mask, low_col].min())
         opening_open = float(result_df.loc[session_open_idx, open_col])
+        active_session_mask = session_mask & in_session
+        opening_high_series = result_df.loc[opening_mask, high_col].astype(float).cummax()
+        opening_low_series = result_df.loc[opening_mask, low_col].astype(float).cummin()
+        opening_mid_series = (opening_high_series + opening_low_series) / 2.0
+        opening_width_series = (opening_high_series - opening_low_series).clip(lower=1e-9)
+        opening_width_pct_series = opening_width_series / opening_mid_series.abs().clip(lower=1e-9)
+
+        # During the opening window, only expose the range accumulated so far.
+        opening_close_series = result_df.loc[opening_mask, close_col].astype(float)
+        result_df.loc[opening_mask, or_high_col] = opening_high_series.to_numpy()
+        result_df.loc[opening_mask, or_low_col] = opening_low_series.to_numpy()
+        result_df.loc[opening_mask, or_width_col] = opening_width_pct_series.to_numpy()
+        result_df.loc[opening_mask, dist_high_col] = (
+            (opening_close_series - opening_high_series) / opening_high_series.abs().clip(lower=1e-9)
+        ).to_numpy()
+        result_df.loc[opening_mask, dist_low_col] = (
+            (opening_close_series - opening_low_series) / opening_low_series.abs().clip(lower=1e-9)
+        ).to_numpy()
+
+        opening_high = float(opening_high_series.iloc[-1])
+        opening_low = float(opening_low_series.iloc[-1])
         opening_mid = (opening_high + opening_low) / 2.0
         width = max(opening_high - opening_low, 1e-9)
         width_pct = width / max(abs(opening_mid), 1e-9)
 
-        active_session_mask = session_mask & in_session
-        result_df.loc[active_session_mask, or_high_col] = opening_high
-        result_df.loc[active_session_mask, or_low_col] = opening_low
-        result_df.loc[active_session_mask, or_width_col] = width_pct
+        after_open_mask = session_mask & after_opening
+        result_df.loc[after_open_mask, or_high_col] = opening_high
+        result_df.loc[after_open_mask, or_low_col] = opening_low
+        result_df.loc[after_open_mask, or_width_col] = width_pct
 
-        close_series = result_df.loc[active_session_mask, close_col].astype(float)
-        result_df.loc[active_session_mask, dist_high_col] = (close_series - opening_high) / max(abs(opening_high), 1e-9)
-        result_df.loc[active_session_mask, dist_low_col] = (close_series - opening_low) / max(abs(opening_low), 1e-9)
+        close_series = result_df.loc[after_open_mask, close_col].astype(float)
+        result_df.loc[after_open_mask, dist_high_col] = (close_series - opening_high) / max(abs(opening_high), 1e-9)
+        result_df.loc[after_open_mask, dist_low_col] = (close_series - opening_low) / max(abs(opening_low), 1e-9)
 
-        breakout_mask = session_mask & after_opening
+        breakout_mask = after_open_mask
         breakout_dir = np.where(
             result_df.loc[breakout_mask, close_col].astype(float) > opening_high,
             1.0,

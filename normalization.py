@@ -508,7 +508,9 @@ def get_standardized_column_names(df: pd.DataFrame,
     # Get all numeric columns except those in skip_columns
     cols_to_scale = []
     for col in df.columns:
+        if str(col).endswith("_RAW"):
+            continue
         if col not in skip_columns and pd.api.types.is_numeric_dtype(df[col]):
             cols_to_scale.append(col)
-    
+
     return cols_to_scale 

@@ -1,0 +1,272 @@
+{
+  "generated_at": "2026-04-18T15:41:08Z",
+  "objective": "Improve out-of-sample robustness of the repo's QR-DQN trading path without adding external data, while hardening walk-forward reporting so validation conclusions come from faithful report artifacts rather than raw console output.",
+  "verification": {
+    "status": "passed",
+    "note": "Test counts below are per successful command execution and the suites overlap.",
+    "test_runs": [
+      {
+        "command": "venv/bin/python -m unittest tests.test_environment_reward_and_stops tests.test_train_iterative_selection tests.test_walk_forward_integration tests.test_walk_forward_tuning tests.test_train_evaluate_agent tests.test_action_space_helpers",
+        "tests_passed": 55
+      },
+      {
+        "command": "venv/bin/python -m unittest tests.test_walk_forward_report",
+        "tests_passed": 2
+      },
+      {
+        "command": "venv/bin/python -m unittest tests.test_walk_forward_report tests.test_train_helpers_extra tests.test_walk_forward_integration tests.test_walk_forward_plotting_and_config",
+        "tests_passed": 34
+      }
+    ],
+    "validation_runner_command": "venv/bin/python scripts/codex_walk_forward_validation.py"
+  },
+  "retained_changes": [
+    {
+      "file": "environment.py",
+      "change": "The flat-time inactivity penalty now keys off the current realized bar via opportunity_step_idx instead of the next bar."
+    },
+    {
+      "file": "train.py",
+      "change": "Validation-result serialization now preserves completed trades, rebalances, Sortino, Calmar, max drawdown, collapse diagnostics, and fallback checkpoint-selection flags for the reporting layer."
+    },
+    {
+      "file": "walk_forward.py",
+      "change": "Window report payloads and session summaries now distinguish completed trades from rebalances and persist both into reporting artifacts."
+    },
+    {
+      "file": "reporting/walk_forward_report.py",
+      "change": "HTML reports now surface validation risk metrics, fallback checkpoint selection, completed-trade versus rebalance counts, and replay markers derived from the actual trade-history schema."
+    },
+    {
+      "file": "scripts/codex_walk_forward_validation.py",
+      "change": "The reproducible smoke plus multi-scenario validation runner now exports completed-trade and rebalance metrics in its consolidated summary artifacts."
+    }
+  ],
+  "tested_but_not_promoted": [
+    {
+      "config_path": "augmentation.synthetic_bears.oversample_ratio",
+      "baseline": 0.18,
+      "candidate": 0.08,
+      "decision": "rejected",
+      "reason": "The candidate underperformed in the default full-cycle run, in 2023 recovery, and in the 2024 stress scenario. It improved some risk-shape diagnostics in 2022, but not enough to improve profitability robustly."
+    }
+  ],
+  "smoke_validation": {
+    "label": "smoke_default_modified",
+    "session_folder": "models/session_20260418_093705_762409",
+    "html_report_path": "models/session_20260418_093705_762409/reports/walk_forward_report.html",
+    "budget": {
+      "window_size": 120,
+      "step_size": 24,
+      "train_ratio": 0.6,
+      "validation_ratio": 0.2,
+      "embargo_days": 1,
+      "initial_timesteps": 2000,
+      "additional_timesteps": 1000,
+      "max_iterations": 1,
+      "n_stagnant_loops": 1,
+      "improvement_threshold": 0.01,
+      "run_hyperparameter_tuning": false,
+      "tuning_trials": 0,
+      "max_windows": 1
+    },
+    "metrics": {
+      "avg_return_pct": -4.15,
+      "avg_portfolio": 95851.5,
+      "avg_sortino": -2.187186133663275,
+      "avg_calmar": -0.3453358800551471,
+      "worst_max_drawdown_pct": -12.017285893771831,
+      "avg_completed_trades": 239.0,
+      "avg_rebalances": 273.0,
+      "avg_hit_rate_pct": 60.25104602510461
+    }
+  },
+  "walk_forward_validation": {
+    "budget": {
+      "window_size": 120,
+      "step_size": 24,
+      "train_ratio": 0.6,
+      "validation_ratio": 0.2,
+      "embargo_days": 1,
+      "initial_timesteps": 5000,
+      "additional_timesteps": 2000,
+      "max_iterations": 2,
+      "n_stagnant_loops": 2,
+      "improvement_threshold": 0.01,
+      "run_hyperparameter_tuning": false,
+      "tuning_trials": 0,
+      "max_windows": 2
+    },
+    "per_scenario_metrics": [
+      {
+        "scenario": "default_full_cycle",
+        "stress_scenario": false,
+        "baseline": {
+          "oversample_ratio": 0.18,
+          "session_folder": "models/session_20260418_093719_556246",
+          "html_report_path": "models/session_20260418_093719_556246/reports/walk_forward_report.html",
+          "avg_return_pct": -6.525,
+          "avg_portfolio": 93474.25,
+          "avg_sortino": -2.907031792716432,
+          "avg_calmar": -0.5079334534619648,
+          "worst_max_drawdown_pct": -13.587796921296528,
+          "avg_completed_trades": 228.5,
+          "avg_rebalances": 237.0,
+          "avg_hit_rate_pct": 65.15755727578387,
+          "profitable_windows": 0
+        },
+        "candidate": {
+          "oversample_ratio": 0.08,
+          "session_folder": "models/session_20260418_093752_742661",
+          "html_report_path": "models/session_20260418_093752_742661/reports/walk_forward_report.html",
+          "avg_return_pct": -15.445,
+          "avg_portfolio": 84552.25,
+          "avg_sortino": -6.89279708620843,
+          "avg_calmar": -0.7356249447934322,
+          "worst_max_drawdown_pct": -25.014021859469267,
+          "avg_completed_trades": 139.5,
+          "avg_rebalances": 196.0,
+          "avg_hit_rate_pct": 27.419354838709676,
+          "profitable_windows": 0
+        },
+        "delta": {
+          "avg_return_pct": -8.92,
+          "avg_sortino": -3.9857652934919976,
+          "avg_completed_trades": -89.0,
+          "avg_rebalances": -41.0
+        }
+      },
+      {
+        "scenario": "btc_recovery_2023",
+        "stress_scenario": false,
+        "baseline": {
+          "oversample_ratio": 0.18,
+          "session_folder": "models/session_20260418_093826_590622",
+          "html_report_path": "models/session_20260418_093826_590622/reports/walk_forward_report.html",
+          "avg_return_pct": -3.825,
+          "avg_portfolio": 96173.5,
+          "avg_sortino": -6.703129700919163,
+          "avg_calmar": -0.5665767425463336,
+          "worst_max_drawdown_pct": -7.305299923473893,
+          "avg_completed_trades": 311.0,
+          "avg_rebalances": 377.0,
+          "avg_hit_rate_pct": 57.14983195567263,
+          "profitable_windows": 0
+        },
+        "candidate": {
+          "oversample_ratio": 0.08,
+          "session_folder": "models/session_20260418_093854_683682",
+          "html_report_path": "models/session_20260418_093854_683682/reports/walk_forward_report.html",
+          "avg_return_pct": -5.565,
+          "avg_portfolio": 94436.5,
+          "avg_sortino": -9.002291734499346,
+          "avg_calmar": -0.7648690300033565,
+          "worst_max_drawdown_pct": -7.665821486005189,
+          "avg_completed_trades": 314.5,
+          "avg_rebalances": 370.0,
+          "avg_hit_rate_pct": 60.585026215797406,
+          "profitable_windows": 0
+        },
+        "delta": {
+          "avg_return_pct": -1.7400000000000002,
+          "avg_sortino": -2.299162033580183,
+          "avg_completed_trades": 3.5,
+          "avg_rebalances": -7.0
+        }
+      },
+      {
+        "scenario": "btc_post_run_chop_2024",
+        "stress_scenario": true,
+        "baseline": {
+          "oversample_ratio": 0.18,
+          "session_folder": "models/session_20260418_093923_100716",
+          "html_report_path": "models/session_20260418_093923_100716/reports/walk_forward_report.html",
+          "avg_return_pct": 14.38,
+          "avg_portfolio": 114378.5,
+          "avg_sortino": 5.133403095366345,
+          "avg_calmar": 1.266792532198984,
+          "worst_max_drawdown_pct": -11.351503608122972,
+          "avg_completed_trades": 79.0,
+          "avg_rebalances": 188.0,
+          "avg_hit_rate_pct": 59.49367088607595,
+          "profitable_windows": 1
+        },
+        "candidate": {
+          "oversample_ratio": 0.08,
+          "session_folder": "models/session_20260418_093942_180302",
+          "html_report_path": "models/session_20260418_093942_180302/reports/walk_forward_report.html",
+          "avg_return_pct": 3.27,
+          "avg_portfolio": 103269.0,
+          "avg_sortino": 1.1360661121862374,
+          "avg_calmar": 0.16892112876935617,
+          "worst_max_drawdown_pct": -19.358146750634358,
+          "avg_completed_trades": 401.0,
+          "avg_rebalances": 480.0,
+          "avg_hit_rate_pct": 57.107231920199496,
+          "profitable_windows": 1
+        },
+        "delta": {
+          "avg_return_pct": -11.110000000000001,
+          "avg_sortino": -3.9973369831801078,
+          "avg_completed_trades": 322.0,
+          "avg_rebalances": 292.0
+        }
+      },
+      {
+        "scenario": "btc_bear_market_2022",
+        "stress_scenario": false,
+        "baseline": {
+          "oversample_ratio": 0.18,
+          "session_folder": "models/session_20260418_094001_839657",
+          "html_report_path": "models/session_20260418_094001_839657/reports/walk_forward_report.html",
+          "avg_return_pct": -6.96,
+          "avg_portfolio": 93040.25,
+          "avg_sortino": -6.472451181703912,
+          "avg_calmar": -0.5263760463924655,
+          "worst_max_drawdown_pct": -13.96063597139311,
+          "avg_completed_trades": 167.5,
+          "avg_rebalances": 169.5,
+          "avg_hit_rate_pct": 54.81757451181912,
+          "profitable_windows": 0
+        },
+        "candidate": {
+          "oversample_ratio": 0.08,
+          "session_folder": "models/session_20260418_094035_364521",
+          "html_report_path": "models/session_20260418_094035_364521/reports/walk_forward_report.html",
+          "avg_return_pct": -7.8100000000000005,
+          "avg_portfolio": 92190.0,
+          "avg_sortino": -5.779107712378623,
+          "avg_calmar": -0.7075923396927195,
+          "worst_max_drawdown_pct": -11.155587254916231,
+          "avg_completed_trades": 155.0,
+          "avg_rebalances": 162.0,
+          "avg_hit_rate_pct": 59.021273052745514,
+          "profitable_windows": 0
+        },
+        "delta": {
+          "avg_return_pct": -0.8500000000000005,
+          "avg_sortino": 0.6933434693252885,
+          "avg_completed_trades": -12.5,
+          "avg_rebalances": -7.5
+        }
+      }
+    ]
+  },
+  "final_assessment": {
+    "profitability_improved_robustly": false,
+    "reward_fix_retained": true,
+    "reporting_fix_retained": true,
+    "promoted_candidate_config": false,
+    "repo_default_after_validation": {
+      "augmentation.synthetic_bears.oversample_ratio": 0.18
+    },
+    "summary": "The reward-timing fix and the reporting-path fix are valid structural improvements, but the tested 0.08 synthetic-bear candidate still does not survive fresh multi-scenario walk-forward validation."
+  },
+  "artifacts": {
+    "report_markdown": "docs/codex_overnight_improvement_report.md",
+    "raw_validation_json": "artifacts/codex_validation_raw.json",
+    "validation_summary_csv": "artifacts/walk_forward_validation_summary.csv",
+    "validation_summary_markdown": "artifacts/walk_forward_validation_summary.md",
+    "change_log": "artifacts/codex_change_log.md"
+  }
+}

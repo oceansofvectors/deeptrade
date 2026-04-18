@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+import copy
 from unittest import mock
 import json
 
@@ -17,6 +18,8 @@ from train import (  # noqa: E402
     EntropyDecayCallback,
     LossTrackingCallback,
     _checkpoint_prefix,
+    _serialize_validation_results_for_report,
+    get_configured_algorithm,
     plot_results,
     plot_training_progress,
     save_trade_history,
@@ -49,11 +52,28 @@ class _FakeFig:
 
 
 class TestTrainHelpersExtra(unittest.TestCase):
+    def setUp(self):
+        from config import config  # noqa: WPS433
+
+        self._config_backup = copy.deepcopy(config)
+
+    def tearDown(self):
+        from config import config  # noqa: WPS433
+
+        config.clear()
+        config.update(self._config_backup)
+
     def test_checkpoint_prefix_uses_window_folder_when_provided(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = _checkpoint_prefix(tmpdir)
             self.assertTrue(prefix.startswith(tmpdir))
             self.assertTrue(prefix.endswith("best_model"))
+
+    def test_get_configured_algorithm_reads_explicit_benchmark_mode(self):
+        from config import config  # noqa: WPS433
+
+        config.setdefault("model", {})["algorithm"] = "qrdqn"
+        self.assertEqual(get_configured_algorithm(), "qrdqn")
 
     def test_checkpoint_prefix_creates_temp_prefix_when_folder_missing(self):
         prefix = _checkpoint_prefix(None)
@@ -138,11 +158,50 @@ class TestTrainHelpersExtra(unittest.TestCase):
             )
             self.assertTrue(os.path.exists(path))
 
+    def test_serialize_validation_results_for_report_keeps_reporting_fields(self):
+        payload = _serialize_validation_results_for_report(
+            {
+                "final_portfolio_value": 101000.0,
+                "total_return_pct": 1.0,
+                "trade_count": 25,
+                "rebalance_count": 25,
+                "completed_trades": 10,
+                "economic_trade_count": 10,
+                "sortino_ratio": 1.5,
+                "calmar_ratio": 0.6,
+                "max_drawdown": -4.0,
+                "selected_via_fallback": True,
+                "collapse_flags": ["too_few_trades"],
+            },
+            evaluation_metric="sortino",
+        )
+
+        self.assertEqual(payload["evaluation_metric_used"], "sortino")
+        self.assertEqual(payload["economic_trade_count"], 10)
+        self.assertEqual(payload["completed_trades"], 10)
+        self.assertEqual(payload["sortino_ratio"], 1.5)
+        self.assertEqual(payload["calmar_ratio"], 0.6)
+        self.assertEqual(payload["max_drawdown"], -4.0)
+        self.assertTrue(payload["selected_via_fallback"])
+        self.assertEqual(payload["collapse_flags"], ["too_few_trades"])
+
     def test_train_walk_forward_model_uses_defaults_and_writes_artifacts(self):
         train_df = pd.DataFrame({"close": [1.0]})
         val_df = pd.DataFrame({"close": [1.0]})
         fake_model = mock.MagicMock()
-        validation_results = {"final_portfolio_value": 101000.0, "total_return_pct": 1.0, "loss_history": [1.0, 0.5]}
+        validation_results = {
+            "final_portfolio_value": 101000.0,
+            "total_return_pct": 1.0,
+            "trade_count": 5,
+            "completed_trades": 2,
+            "economic_trade_count": 2,
+            "sortino_ratio": 1.4,
+            "calmar_ratio": 0.5,
+            "max_drawdown": -2.5,
+            "selected_via_fallback": True,
+            "collapse_flags": ["too_few_trades"],
+            "loss_history": [1.0, 0.5],
+        }
         all_results = [
             {
                 "total_return_pct": 1.0,
@@ -172,6 +231,11 @@ class TestTrainHelpersExtra(unittest.TestCase):
             fake_model.save.assert_called_once_with(os.path.join(tmpdir, "model"))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "validation_results.json")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "training_stats.json")))
+            with open(os.path.join(tmpdir, "validation_results.json"), "r") as f:
+                saved_validation = json.load(f)
+            self.assertEqual(saved_validation["economic_trade_count"], 2)
+            self.assertEqual(saved_validation["sortino_ratio"], 1.4)
+            self.assertTrue(saved_validation["selected_via_fallback"])
 
     def test_train_walk_forward_model_can_use_tuning_results(self):
         train_df = pd.DataFrame({"close": [1.0]})

@@ -63,6 +63,36 @@ class TestSyntheticBearAugmentation(unittest.TestCase):
         synthetic_only = augmented.loc[augmented.index > raw.index[-1]]
         self.assertEqual(len(synthetic_only), metadata["synthetic_bars"])
 
+    def test_tiny_oversample_ratio_does_not_force_full_segment(self):
+        raw = extract_ohlcv_frame(self.df)
+        augmented, metadata = augment_with_synthetic_bears(
+            raw,
+            oversample_ratio=0.10,
+            segment_length_pct=0.20,
+            seed=5,
+            return_metadata=True,
+        )
+
+        self.assertEqual(metadata["target_synthetic_bars"], int(round(len(raw) * 0.10)))
+        self.assertEqual(metadata["synthetic_bars"], metadata["target_synthetic_bars"])
+        self.assertLess(metadata["synthetic_bars"], int(len(raw) * 0.20))
+        self.assertEqual(len(augmented) - len(raw), metadata["synthetic_bars"])
+
+    def test_sub_minimum_target_ratio_skips_augmentation(self):
+        raw = extract_ohlcv_frame(self.df)
+        augmented, metadata = augment_with_synthetic_bears(
+            raw,
+            oversample_ratio=0.01,
+            segment_length_pct=0.20,
+            seed=3,
+            return_metadata=True,
+        )
+
+        pd.testing.assert_frame_equal(augmented, raw)
+        self.assertFalse(metadata["enabled"])
+        self.assertEqual(metadata["synthetic_bars"], 0)
+        self.assertEqual(metadata["num_segments"], 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

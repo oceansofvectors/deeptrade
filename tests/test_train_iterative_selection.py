@@ -63,6 +63,7 @@ class TestTrainIterativeSelection(unittest.TestCase):
         config["training"]["n_envs"] = 1
         config["training"]["verbose"] = 0
         config["training"]["random_start_pct"] = 0.0
+        config["model"]["algorithm"] = "ppo"
         config["model"]["ent_coef_decay"] = False
         config["model"]["use_lr_decay"] = False
         config["sequence_model"]["enabled"] = False
@@ -161,6 +162,47 @@ class TestTrainIterativeSelection(unittest.TestCase):
         self.assertIn("fallback_score", best_results)
         self.assertEqual(len(all_results), 2)
         self.assertTrue(best_model.loaded_path.endswith("best_model_fallback"))
+
+    def test_iterative_training_ignores_tiny_metric_gains_below_threshold(self):
+        train_df = pd.DataFrame({"close": [1.0]})
+        val_df = pd.DataFrame({"close": [1.0] * 1000})
+        eval_results = [
+            {
+                "total_return_pct": 1.0,
+                "final_portfolio_value": 101000.0,
+                "trade_count": 30,
+                "action_counts": {0: 15, 3: 10, 6: 5},
+                "max_drawdown": -5.0,
+            },
+            {
+                "total_return_pct": 1.005,
+                "final_portfolio_value": 101005.0,
+                "trade_count": 32,
+                "action_counts": {0: 12, 3: 12, 6: 8},
+                "max_drawdown": -5.0,
+            },
+        ]
+
+        with self._patch_train_stack() as patched, \
+             mock.patch("train.evaluate_agent", side_effect=eval_results):
+            patched["check_env"].return_value = None
+            patched["get_device"].return_value = "cpu"
+            best_model, best_results, all_results = train_agent_iteratively(
+                train_df,
+                val_df,
+                initial_timesteps=1,
+                max_iterations=1,
+                additional_timesteps=1,
+                n_stagnant_loops=1,
+                evaluation_metric="return",
+                improvement_threshold=0.01,
+                window_folder=None,
+            )
+
+        self.assertFalse(best_results["selected_via_fallback"])
+        self.assertEqual(best_results["total_return_pct"], 1.0)
+        self.assertEqual(len(all_results), 2)
+        self.assertTrue(best_model.loaded_path.endswith("best_model"))
 
 
 if __name__ == "__main__":

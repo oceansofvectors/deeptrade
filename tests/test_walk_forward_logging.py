@@ -58,8 +58,8 @@ class TestBold(unittest.TestCase):
 
 class TestActionDistribution(unittest.TestCase):
     def test_action_names_mapping(self):
-        self.assertEqual(ACTION_NAMES[0], "LONG_1")
-        self.assertEqual(ACTION_NAMES[5], "SHORT_5")
+        self.assertEqual(ACTION_NAMES[0], "LONG_0.5R")
+        self.assertEqual(ACTION_NAMES[5], "SHORT_1.5R")
         self.assertEqual(ACTION_NAMES[6], "FLAT")
 
     def test_empty_history(self):
@@ -69,23 +69,23 @@ class TestActionDistribution(unittest.TestCase):
     def test_counts(self):
         history = [0, 0, 4, 6, 6, 6]
         s = format_action_distribution(history)
-        self.assertIn("LONG_1=2", s)
-        self.assertIn("SHORT_2=1", s)
+        self.assertIn("LONG_0.5R=2", s)
+        self.assertIn("SHORT_1R=1", s)
         self.assertIn("FLAT=3", s)
 
     def test_numpy_array_input(self):
         import numpy as np
         history = np.array([0, 5, 5, 6])
         s = format_action_distribution(history)
-        self.assertIn("LONG_1=1", s)
-        self.assertIn("SHORT_5=2", s)
+        self.assertIn("LONG_0.5R=1", s)
+        self.assertIn("SHORT_1.5R=2", s)
         self.assertIn("FLAT=1", s)
 
     def test_dict_input(self):
         counts = {0: 5, 5: 0, 6: 3}
         s = format_action_distribution(counts)
-        self.assertIn("LONG_1=5", s)
-        self.assertIn("SHORT_5=0", s)
+        self.assertIn("LONG_0.5R=5", s)
+        self.assertIn("SHORT_1.5R=0", s)
         self.assertIn("FLAT=3", s)
 
 

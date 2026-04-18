@@ -1,12 +1,14 @@
 #!/usr/bin/env python
-"""Tests for train.evaluate_agent behavior under target-allocation actions."""
+"""Tests for train.evaluate_agent behavior under target-contract actions."""
 
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 import pandas as pd
 import math
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -22,6 +24,26 @@ class _SequenceModel:
         action = self._actions[min(self._idx, len(self._actions) - 1)]
         self._idx += 1
         return action, None
+
+
+class _RecurrentSequenceModel:
+    def __init__(self, actions):
+        self._actions = list(actions)
+        self._idx = 0
+        self.policy = SimpleNamespace(lstm=object())
+        self.calls = []
+
+    def predict(self, obs, state=None, episode_start=None, deterministic=True):
+        action = self._actions[min(self._idx, len(self._actions) - 1)]
+        self.calls.append(
+            {
+                "state": state,
+                "episode_start": episode_start.copy() if episode_start is not None else None,
+                "deterministic": deterministic,
+            }
+        )
+        self._idx += 1
+        return action, {"hidden": self._idx}
 
 
 class TestEvaluateAgent(unittest.TestCase):
@@ -55,8 +77,9 @@ class TestEvaluateAgent(unittest.TestCase):
             [trade["trade_type"] for trade in results["trade_history"]],
             ["Long Entry", "Scale In", "Exit"],
         )
-        self.assertEqual(results["trade_history"][1]["old_contracts"], 100)
-        self.assertEqual(results["trade_history"][1]["new_contracts"], 454)
+        self.assertEqual(results["action_history"], [0, 2, 6, 6])
+        self.assertEqual(results["trade_history"][1]["old_contracts"], 1)
+        self.assertEqual(results["trade_history"][1]["new_contracts"], 3)
         self.assertFalse(results["trade_history"][1]["realized_trade"])
 
     def test_evaluate_agent_tracks_scale_out_and_flip_as_realized_trades(self):
@@ -85,6 +108,38 @@ class TestEvaluateAgent(unittest.TestCase):
         self.assertTrue(math.isfinite(results["total_return_pct"]))
         self.assertGreaterEqual(results["final_portfolio_value"], 1000.0)
         self.assertGreaterEqual(results["completed_trades"], 1)
+
+    def test_evaluate_agent_synthesizes_close_norm_from_close_variants(self):
+        data = self._make_data().rename(
+            columns={
+                "close": "Close",
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "volume": "Volume",
+            }
+        ).drop(columns=["close_norm"])
+
+        results = evaluate_agent(_SequenceModel([0, 6, 6, 6]), data, verbose=0, deterministic=True)
+
+        self.assertIn("close_norm", data.columns)
+        self.assertTrue(data["close_norm"].between(0.0, 1.0).all())
+        self.assertEqual(data["close_norm"].iloc[0], 0.5)
+        self.assertEqual(data["close_norm"].iloc[1], 1.0)
+        self.assertGreaterEqual(results["completed_trades"], 1)
+
+    def test_evaluate_agent_handles_recurrent_models_and_rendering(self):
+        model = _RecurrentSequenceModel([0, 6, 6, 6])
+
+        with mock.patch("environment.TradingEnv.render") as render_mock:
+            results = evaluate_agent(model, self._make_data(), verbose=0, deterministic=True, render=True)
+
+        self.assertEqual(model.calls[0]["state"], None)
+        self.assertTrue(bool(model.calls[0]["episode_start"][0]))
+        self.assertEqual(model.calls[1]["state"], {"hidden": 1})
+        self.assertTrue(all(call["deterministic"] for call in model.calls))
+        self.assertGreaterEqual(render_mock.call_count, 1)
+        self.assertGreaterEqual(results["trade_count"], 1)
 
 
 if __name__ == "__main__":

@@ -18,12 +18,12 @@ from config import config
 from get_data import process_technical_indicators, ensure_numeric
 import money  # Import for formatting functions
 from normalization import scale_window, get_standardized_column_names  # Add normalization module
+from utils.data_utils import filter_market_hours, market_hours_only_enabled
 
 # Import hyperparameter tuning and evaluation functions
 try:
     from walk_forward import hyperparameter_tuning
     print(f"Successfully imported hyperparameter_tuning: {hyperparameter_tuning}")
-    from walk_forward import filter_market_hours
     from train import train_agent_iteratively, evaluate_agent
 except ImportError as e:
     print(f"Warning: Could not import all modules. Error: {e}")
@@ -122,12 +122,14 @@ def load_live_data(csv_filepath="data/live.csv") -> pd.DataFrame:
                 processed_df['close_norm'] = 0.5
         
         # Apply market hours filter if configured
-        if config["data"].get("market_hours_only", False):
-            logger.info("Filtering data to include only market hours")
+        if market_hours_only_enabled(config):
+            logger.info("Filtering data to NYSE RTH only")
             try:
                 processed_df = filter_market_hours(processed_df)
             except Exception as e:
                 logger.warning(f"Could not filter for market hours: {e}. Using all data.")
+        else:
+            logger.info("Using full-session data without NYSE RTH filtering")
         
         logger.info(f"Data loaded and processed. Final shape: {processed_df.shape}")
         logger.info(f"Final columns: {processed_df.columns.tolist()}")

@@ -58,9 +58,13 @@ class TestSessionFeatures(unittest.TestCase):
 
         day1_or_high = 106.0
         day1_or_low = 99.0
-        self.assertAlmostEqual(df.iloc[0]["OPENING_RANGE_HIGH"], day1_or_high)
+        # The opening window should only expose the range built so far, not the
+        # full future 30-minute range.
+        self.assertAlmostEqual(df.iloc[0]["OPENING_RANGE_HIGH"], 101.0)
         self.assertAlmostEqual(df.iloc[0]["OPENING_RANGE_LOW"], day1_or_low)
         self.assertAlmostEqual(df.iloc[0]["OR_BREAKOUT_ACTIVE"], 0.0)
+        self.assertAlmostEqual(df.iloc[6]["OPENING_RANGE_HIGH"], day1_or_high)
+        self.assertAlmostEqual(df.iloc[6]["OPENING_RANGE_LOW"], day1_or_low)
         self.assertAlmostEqual(df.iloc[7]["OR_BREAKOUT_DIR"], 1.0)
         self.assertAlmostEqual(df.iloc[7]["OR_BREAKOUT_ACTIVE"], 1.0)
 

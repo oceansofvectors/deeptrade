@@ -57,6 +57,7 @@ class TestTrainAgentModes(unittest.TestCase):
         config["seed"] = 42
         config["training"]["n_envs"] = 1
         config["training"]["random_start_pct"] = 0.2
+        config["model"]["algorithm"] = "ppo"
         config["model"]["learning_rate"] = 0.0003
         config["model"]["ent_coef"] = 0.01
         config["model"]["use_lr_decay"] = False
@@ -77,6 +78,7 @@ class TestTrainAgentModes(unittest.TestCase):
             SubprocVecEnv=_FakeVecEnv,
             PPO=_FakeModel,
             RecurrentPPO=_FakeModel,
+            QRDQN=_FakeModel,
             check_env=mock.DEFAULT,
             get_device=mock.DEFAULT,
         )
@@ -101,6 +103,7 @@ class TestTrainAgentModes(unittest.TestCase):
         self.assertEqual(model.learn_calls[0][0], 10)
 
     def test_train_agent_recurrent_uses_entropy_callback(self):
+        config["model"]["algorithm"] = "recurrent_ppo"
         config["sequence_model"]["enabled"] = True
         config["sequence_model"]["lstm_hidden_size"] = 64
         config["sequence_model"]["n_lstm_layers"] = 2
@@ -125,6 +128,7 @@ class TestTrainAgentModes(unittest.TestCase):
         self.assertEqual(_FakeEnv.last_kwargs["min_episode_steps"], 128)
 
     def test_train_agent_warns_and_falls_back_when_recurrent_unavailable(self):
+        config["model"]["algorithm"] = "recurrent_ppo"
         config["sequence_model"]["enabled"] = True
         train_df = pd.DataFrame({"close": [1.0]})
 
@@ -137,6 +141,39 @@ class TestTrainAgentModes(unittest.TestCase):
 
         self.assertIsInstance(model, _FakeModel)
         warn_mock.assert_called_once()
+
+    def test_train_agent_qrdqn_uses_exploration_and_replay_settings(self):
+        config["model"]["algorithm"] = "qrdqn"
+        config["model"]["use_lr_decay"] = True  # should be ignored for QR-DQN
+        config["model"]["batch_size"] = 128
+        config["model"]["gamma"] = 0.995
+        config["model"]["buffer_size"] = 200000
+        config["model"]["learning_starts"] = 5000
+        config["model"]["train_freq"] = 16
+        config["model"]["gradient_steps"] = 4
+        config["model"]["target_update_interval"] = 2000
+        config["model"]["exploration_fraction"] = 0.15
+        config["model"]["exploration_initial_eps"] = 1.0
+        config["model"]["exploration_final_eps"] = 0.05
+
+        train_df = pd.DataFrame({"close": [1.0]})
+
+        with self._patch_stack() as patched:
+            patched["check_env"].return_value = None
+            patched["get_device"].return_value = "cpu"
+            model = train_agent(train_df, total_timesteps=10)
+
+        self.assertEqual(model.kwargs["learning_rate"], 0.0003)
+        self.assertEqual(model.kwargs["batch_size"], 128)
+        self.assertEqual(model.kwargs["gamma"], 0.995)
+        self.assertEqual(model.kwargs["buffer_size"], 200000)
+        self.assertEqual(model.kwargs["learning_starts"], 5000)
+        self.assertEqual(model.kwargs["train_freq"], 16)
+        self.assertEqual(model.kwargs["gradient_steps"], 4)
+        self.assertEqual(model.kwargs["target_update_interval"], 2000)
+        self.assertEqual(model.kwargs["exploration_fraction"], 0.15)
+        self.assertEqual(model.kwargs["exploration_initial_eps"], 1.0)
+        self.assertEqual(model.kwargs["exploration_final_eps"], 0.05)
 
 
 if __name__ == "__main__":

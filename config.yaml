@@ -4,11 +4,12 @@ reproducibility:
 training:
   total_timesteps: 100000
   fee_rate: 0.0
-  max_iterations: 20
+  max_allowed_drawdown_pct: 60.0
+  max_iterations: 6
   improvement_threshold: 0.01
-  additional_timesteps: 10000
+  additional_timesteps: 20000
   n_stagnant_loops: 4
-  n_envs: 4  # Parallel envs for faster rollouts (safe with sequential windows)
+  n_envs: 1  # QR-DQN uses a single env
   random_start_pct: 1.0
   eval_frequency: 1
   verbose: 0
@@ -31,7 +32,7 @@ data:
   validation_ratio: 0.2
   test_ratio: 0.2
   embargo_days: 1
-  market_hours_only: false
+  market_hours_only: true
 normalization:
   scaler_type: robust
 indicators:
@@ -122,20 +123,21 @@ indicators:
     enabled: true
     window: 60
   lstm_features:
-    enabled: true
+    enabled: false
     lookback: 10
     hidden_size: 32
     num_layers: 2
     output_size: 4
-    beta: 0.0008266502663726915
+    beta: 0.0005806994544639808
     kl_warmup_epochs: 10
     pretrain_epochs: 100
-    pretrain_lr: 0.0075741650324583016
+    pretrain_lr: 0.0010671451666058852
     pretrain_batch_size: 64
     pretrain_patience: 10
     pretrain_min_delta: 0.001
     tuning:
       enabled: false
+      scope: session
       n_trials: 20
       parameters:
         hidden_size:
@@ -178,12 +180,36 @@ augmentation:
     - 0.12
     - 0.18
     - 0.24
-    max_windows: 3
+    max_windows: 4
     timesteps: 10000
 environment:
   initial_balance: 100000.0
   position_size: 10
   transaction_cost: 0.75
+representation:
+  mode: engineered_only
+action_space:
+  mode: atr_risk
+  target_contracts:
+  - 1
+  - 2
+  - 3
+  - -1
+  - -2
+  - -3
+  - 0
+  risk_buckets:
+  - 0.5
+  - 1.0
+  - 1.5
+  - -0.5
+  - -1.0
+  - -1.5
+  - 0.0
+  risk_budget_pct: 0.01
+  stop_atr_multiple: 2.0
+  max_contracts: 12
+  min_non_flat_contracts: 1
 execution_costs:
   half_spread_points: 2.5
   base_slippage_points: 0.0
@@ -192,22 +218,32 @@ reward:
   loss_multiplier: 0.7494921246671704  # Latest walk-forward tuning
   drawdown_penalty_threshold: 0.025
   drawdown_penalty: 2.2
-  turnover_penalty: 0.0100
-  calm_holding_bonus: 0.001380767344043113  # Latest walk-forward tuning
-  flat_time_penalty: 0.0040
-  flat_time_grace_steps: 3
+  turnover_penalty: 0.004
+  flat_time_penalty: 0.0003
+  flat_time_grace_steps: 20
+  flat_penalty_opportunity_vol_percentile: 65.0
+  realized_trade_quality_bonus: 0.25
 model:
-  ent_coef: 0.16239021973061413  # Latest walk-forward tuning
-  ent_coef_decay: true
+  algorithm: qrdqn
+  ent_coef: 0.18931484770714052  # Unused by QR-DQN
+  ent_coef_decay: false
   final_ent_coef: 0.045
-  learning_rate: 0.00029570465033637995  # Latest walk-forward tuning
-  n_steps: 753  # Latest walk-forward tuning
-  batch_size: 83  # Tuned
-  gamma: 0.9949826964778363  # Latest walk-forward tuning
+  learning_rate: 0.00015
+  n_steps: 378  # Unused by QR-DQN
+  batch_size: 64
+  gamma: 0.995
+  buffer_size: 200000
+  learning_starts: 5000
+  train_freq: 16
+  gradient_steps: 4
+  target_update_interval: 2000
+  exploration_fraction: 0.15
+  exploration_initial_eps: 1.0
+  exploration_final_eps: 0.05
   gae_lambda: 0.85
-  use_lr_decay: true
+  use_lr_decay: false
 sequence_model:
-  enabled: true
+  enabled: false
   lstm_hidden_size: 256  # Latest walk-forward tuning
   n_lstm_layers: 1  # Latest walk-forward tuning
   shared_lstm: false
@@ -258,44 +294,127 @@ walk_forward:
     max_workers: 0
 hyperparameter_tuning:
   enabled: true
-  n_trials: 40
+  n_trials: 16
   stage1_trials: 24
   stage2_trials: 16
-  stage1_timesteps: 10000
+  stage1_timesteps: 25000
   stage2_timesteps: 20000
   stage2_window_shrink: 0.35
   tuning_timesteps: 20000
   pruning_eval_steps: 5000
+  retune_every_windows: 2
   holdout_windows: 2  # Additional validation windows scored after the primary tuning window
+  finalist_top_k: 3
+  finalist_num_seeds: 3
+  finalist_timesteps: 150000
   baseline_margin: 0.25
   early_prune_zero_trade: true
+  early_prune_zero_trade_min_step: 3
   early_prune_flat_action_pct: 99.0
   early_prune_single_action: true
-  n_envs: 1  # Keep each Optuna trial single-process to avoid n_jobs * n_envs overload
+  early_prune_max_drawdown_pct: 60.0
+  n_envs: 1
   parallel_processing:
     enabled: false
     n_jobs: 1  # Deterministic mode forces sequential Optuna suggestions
     max_auto_jobs: 2  # Applied only when n_jobs is set to 0
     reserve_cores: 2  # Leave headroom for the OS/UI when auto-detecting
   parameters:
-    # Core PPO parameters
     learning_rate:
-      min: 5.0e-06
-      max: 0.0008
+      min: 1.0e-05
+      max: 5.0e-04
       log: true
     n_steps:
-      min: 256
-      max: 768
-      log: true
+      choices:
+      - 128
+      - 256
+      - 512
+      - 1024
     ent_coef:
-      min: 0.10
-      max: 0.25
+      min: 0.001
+      max: 0.08
+      log: false
+    gamma:
+      min: 0.985
+      max: 0.999
+      log: false
+    gae_lambda:
+      min: 0.90
+      max: 0.99
       log: false
     reward_turnover_penalty:
-      min: 0.006
-      max: 0.018
+      min: 0.002
+      max: 0.02
       log: false
-    reward_calm_holding_bonus:
-      min: 0.0008
-      max: 0.0022
+    reward_loss_multiplier:
+      min: 0.25
+      max: 1.25
+      log: false
+    reward_drawdown_penalty:
+      min: 0.5
+      max: 4.0
+      log: false
+    reward_drawdown_penalty_threshold:
+      min: 0.01
+      max: 0.05
+      log: false
+    reward_flat_time_penalty:
+      min: 0.0
+      max: 0.002
+      log: false
+    reward_flat_time_grace_steps:
+      min: 15
+      max: 60
+  qrdqn_tuning_timesteps: 100000
+  qrdqn_parameters:
+    learning_rate:
+      min: 1.0e-05
+      max: 5.0e-04
+      log: true
+    batch_size:
+      choices:
+      - 32
+      - 64
+      - 128
+      - 256
+    gamma:
+      min: 0.985
+      max: 0.999
+      log: false
+    buffer_size:
+      choices:
+      - 50000
+      - 100000
+      - 200000
+      - 500000
+    learning_starts:
+      choices:
+      - 2000
+      - 5000
+      - 10000
+    train_freq:
+      choices:
+      - 4
+      - 8
+      - 16
+      - 32
+    gradient_steps:
+      choices:
+      - 1
+      - 2
+      - 4
+      - 8
+    target_update_interval:
+      choices:
+      - 1000
+      - 2000
+      - 5000
+      - 10000
+    exploration_fraction:
+      min: 0.05
+      max: 0.20
+      log: false
+    exploration_final_eps:
+      min: 0.02
+      max: 0.10
       log: false

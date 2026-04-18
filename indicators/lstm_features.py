@@ -1,16 +1,4 @@
-"""
-LSTM Feature Extractor for noise filtering and pattern extraction.
-
-Based on the cascaded LSTM approach from:
-"A Novel Deep Reinforcement Learning Based Automated Stock Trading System
-Using Cascaded LSTM Networks" (arXiv:2212.02721)
-
-This module creates an LSTM encoder that:
-1. Takes raw OHLCV data as input
-2. PRE-TRAINS using an autoencoder to learn meaningful representations
-3. Filters noise from the low signal-to-noise ratio financial data
-4. Outputs learned features that complement hand-crafted indicators
-"""
+"""LSTM/VAE feature extractor for market-feature compression."""
 
 import os
 import numpy as np
@@ -22,11 +10,29 @@ from tqdm import tqdm
 from typing import Tuple, Optional
 import logging
 import pickle
+from config import config
 
 logger = logging.getLogger(__name__)
 
 
-MODEL_FORMAT_VERSION = "lstm_vae_v2"
+MODEL_FORMAT_VERSION = "lstm_vae_v3"
+
+
+def _clear_cuda_cache() -> None:
+    """Best-effort CUDA cache cleanup after large trial allocations."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _seed_lstm_trial(seed: int) -> None:
+    """Reset RNG state before each LSTM tuning trial."""
+    from utils.seeding import enable_full_determinism, set_global_seed
+
+    deterministic_mode = bool(config.get("reproducibility", {}).get("deterministic_mode", True))
+    if deterministic_mode:
+        enable_full_determinism(seed)
+    else:
+        set_global_seed(seed)
 
 
 class LSTMVAE(nn.Module):
@@ -160,6 +166,8 @@ class LSTMFeatureGenerator:
         hidden_size: int = 32,
         num_layers: int = 1,
         output_size: int = 8,
+        feature_columns: Optional[list[str]] = None,
+        feature_prefix: str = "LATENT_F",
         device: str = "auto",
         pretrain_epochs: int = 50,
         pretrain_lr: float = 0.001,
@@ -192,6 +200,8 @@ class LSTMFeatureGenerator:
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.output_size = output_size
+        self.feature_columns = list(feature_columns) if feature_columns is not None else None
+        self.feature_prefix = str(feature_prefix)
         self.pretrain_epochs = pretrain_epochs
         self.pretrain_lr = pretrain_lr
         self.pretrain_batch_size = pretrain_batch_size
@@ -206,21 +216,82 @@ class LSTMFeatureGenerator:
         resolved = get_device(device, for_recurrent=True)
         self.device = torch.device(resolved)
 
-        # Input features: returns, high-low range, close-open, volume change, volatility
-        self.input_size = 5
-
-        # Initialize VAE
-        self.autoencoder = LSTMVAE(
-            input_size=self.input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            latent_size=output_size
-        ).to(self.device)
+        self.input_size = len(self.feature_columns) if self.feature_columns is not None else 0
+        self.autoencoder = None
+        if self.input_size > 0:
+            self._rebuild_autoencoder()
 
         # Statistics for normalization
         self.input_mean = None
         self.input_std = None
         self.is_pretrained = False
+
+    def _rebuild_autoencoder(self) -> None:
+        """Instantiate the autoencoder for the current input width."""
+        if self.input_size <= 0:
+            raise ValueError("LSTMFeatureGenerator input_size must be positive before building the autoencoder")
+        self.autoencoder = LSTMVAE(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            latent_size=self.output_size,
+        ).to(self.device)
+
+    def _resolve_feature_columns(self, df: pd.DataFrame) -> list[str]:
+        """Resolve and persist the ordered encoder feature columns."""
+        if self.feature_columns is None:
+            inferred = []
+            for col in df.columns:
+                if str(col).endswith("_RAW"):
+                    continue
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    inferred.append(col)
+            if not inferred:
+                raise ValueError("No numeric feature columns available for LSTM/VAE input")
+            self.feature_columns = inferred
+        return list(self.feature_columns)
+
+    def _validation_batch_size(self) -> int:
+        """Use smaller batches for eval to avoid single-pass CUDA spikes."""
+        return max(1, min(self.pretrain_batch_size, 256))
+
+    def _evaluate_sequences_loss(self, sequences: np.ndarray, kl_weight: float) -> float:
+        """Evaluate VAE loss over sequences in small batches."""
+        if sequences is None or len(sequences) == 0:
+            raise ValueError("Validation sequences are empty")
+
+        dataset = TensorDataset(torch.FloatTensor(sequences))
+        loader = DataLoader(dataset, batch_size=self._validation_batch_size(), shuffle=False)
+        total_loss = 0.0
+        total_items = 0
+
+        self.autoencoder.eval()
+        with torch.no_grad():
+            for (batch_x_cpu,) in loader:
+                batch_x = batch_x_cpu.to(self.device)
+                reconstructed, mu, logvar = self.autoencoder(batch_x)
+                loss = self._vae_loss(reconstructed, batch_x, mu, logvar, kl_weight)[0]
+                batch_size = batch_x.shape[0]
+                total_loss += loss.item() * batch_size
+                total_items += batch_size
+
+        return total_loss / max(1, total_items)
+
+    def _encode_sequences_batched(self, sequences: np.ndarray) -> np.ndarray:
+        """Encode sequences in batches to control GPU memory usage."""
+        dataset = TensorDataset(torch.FloatTensor(sequences))
+        loader = DataLoader(dataset, batch_size=self._validation_batch_size(), shuffle=False)
+        outputs = []
+
+        self.autoencoder.eval()
+        with torch.no_grad():
+            for (batch_x_cpu,) in loader:
+                batch_x = batch_x_cpu.to(self.device)
+                outputs.append(self.autoencoder.encode(batch_x).cpu().numpy())
+
+        if not outputs:
+            return np.empty((0, self.output_size), dtype=np.float32)
+        return np.concatenate(outputs, axis=0)
 
     def _current_kl_weight(self, epoch_idx: int) -> float:
         """Return the epoch-specific KL weight."""
@@ -244,51 +315,14 @@ class LSTMFeatureGenerator:
         return total_loss, recon_loss, kl_loss
 
     def _prepare_input(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Prepare input features from OHLCV data.
-
-        Converts raw OHLCV to normalized features that are more suitable
-        for LSTM processing.
-        """
-        # Get column names (handle different capitalizations)
-        close_col = 'close' if 'close' in df.columns else 'Close'
-        open_col = 'open' if 'open' in df.columns else 'Open'
-        high_col = 'high' if 'high' in df.columns else 'High'
-        low_col = 'low' if 'low' in df.columns else 'Low'
-        vol_col = 'volume' if 'volume' in df.columns else 'Volume'
-
-        close = pd.to_numeric(df[close_col], errors='coerce').astype(float)
-        open_ = pd.to_numeric(df[open_col], errors='coerce').astype(float)
-        high = pd.to_numeric(df[high_col], errors='coerce').astype(float)
-        low = pd.to_numeric(df[low_col], errors='coerce').astype(float)
-        volume = pd.to_numeric(df[vol_col], errors='coerce').astype(float)
-
-        safe_close = close.replace(0.0, np.nan)
-
-        # Calculate normalized features with finite-value cleanup.
-        returns = close.pct_change()
-        hl_range = (high - low) / safe_close
-        co_diff = (close - open_) / safe_close
-        vol_change = volume.pct_change()
-
-        # Rolling volatility (std of returns over short window)
-        volatility = pd.Series(returns).rolling(5, min_periods=1).std()
-
-        def _clean(series: pd.Series) -> np.ndarray:
-            cleaned = series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            return cleaned.to_numpy(dtype=np.float32, copy=False)
-
-        # Stack features
-        features = np.column_stack([
-            _clean(returns),
-            _clean(hl_range),
-            _clean(co_diff),
-            _clean(vol_change),
-            _clean(volatility),
-        ])
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return features
+        """Prepare the ordered market-feature matrix for VAE training/inference."""
+        feature_columns = self._resolve_feature_columns(df)
+        features_df = df.reindex(columns=feature_columns, fill_value=0.0).copy()
+        for col in feature_columns:
+            features_df[col] = pd.to_numeric(features_df[col], errors='coerce')
+        features_df = features_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        features = features_df.to_numpy(dtype=np.float32, copy=False)
+        return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _create_sequences(self, features: np.ndarray) -> np.ndarray:
         """
@@ -331,6 +365,8 @@ class LSTMFeatureGenerator:
         validation so callers that only provide one frame still use a standard train/val flow.
         """
         train_features = self._prepare_input(train_df)
+        self.input_size = int(train_features.shape[1])
+        self._rebuild_autoencoder()
         self.input_mean = np.nan_to_num(np.mean(train_features, axis=0), nan=0.0, posinf=0.0, neginf=0.0)
         self.input_std = np.nan_to_num(np.std(train_features, axis=0), nan=1.0, posinf=1.0, neginf=1.0)
         self.input_std = np.where(self.input_std < 1e-8, 1.0, self.input_std)
@@ -374,10 +410,6 @@ class LSTMFeatureGenerator:
         train_tensor = torch.FloatTensor(train_sequences).to(self.device)
         train_dataset = TensorDataset(train_tensor)
         train_loader = DataLoader(train_dataset, batch_size=self.pretrain_batch_size, shuffle=True)
-
-        val_tensor = None
-        if validation_sequences is not None and len(validation_sequences) > 0:
-            val_tensor = torch.FloatTensor(validation_sequences).to(self.device)
 
         # Optimizer and loss
         optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=self.pretrain_lr)
@@ -424,17 +456,8 @@ class LSTMFeatureGenerator:
             avg_train_loss = total_train_loss / num_batches
 
             val_loss = None
-            if val_tensor is not None:
-                self.autoencoder.eval()
-                with torch.no_grad():
-                    reconstructed_val, mu_val, logvar_val = self.autoencoder(val_tensor)
-                    val_loss = self._vae_loss(
-                        reconstructed_val,
-                        val_tensor,
-                        mu_val,
-                        logvar_val,
-                        self.beta,
-                    )[0].item()
+            if validation_sequences is not None and len(validation_sequences) > 0:
+                val_loss = self._evaluate_sequences_loss(validation_sequences, self.beta)
                 self.autoencoder.train()
 
             monitor_loss = val_loss if val_loss is not None else avg_train_loss
@@ -542,7 +565,7 @@ class LSTMFeatureGenerator:
             df: DataFrame with OHLCV data
 
         Returns:
-            DataFrame with additional LSTM_F0, LSTM_F1, ... columns
+            DataFrame with additional LATENT_F0, LATENT_F1, ... columns
         """
         if self.input_mean is None:
             raise ValueError("Must call fit() before transform()")
@@ -551,22 +574,14 @@ class LSTMFeatureGenerator:
             logger.warning("Autoencoder was not pre-trained! Features may be meaningless.")
 
         # Prepare and normalize input
-        features = self._prepare_input(df)
-        features = (features - self.input_mean) / self.input_std
-
-        # Clip extreme values
-        features = np.clip(features, -5, 5)
+        features = self._normalize_features(self._prepare_input(df))
 
         # Create sequences
         sequences = self._create_sequences(features)
 
         # Convert to tensor
-        x = torch.FloatTensor(sequences).to(self.device)
-
-        # Generate features using trained encoder
-        self.autoencoder.eval()
-        with torch.no_grad():
-            lstm_features = self.autoencoder.encode(x).cpu().numpy()
+        # Generate features using trained encoder in batches to avoid large eval spikes.
+        lstm_features = self._encode_sequences_batched(sequences)
 
         # Create output DataFrame
         result = df.copy()
@@ -577,11 +592,11 @@ class LSTMFeatureGenerator:
 
         # Add columns
         for i in range(self.output_size):
-            result[f'LSTM_F{i}'] = all_features[:, i]
+            result[f'{self.feature_prefix}{i}'] = all_features[:, i]
 
         # Fill NaN values with 0.0 (neutral value since LSTM features are tanh-bounded to [-1,1])
         for i in range(self.output_size):
-            result[f'LSTM_F{i}'] = result[f'LSTM_F{i}'].fillna(0.0)
+            result[f'{self.feature_prefix}{i}'] = result[f'{self.feature_prefix}{i}'].fillna(0.0)
 
         logger.debug(f"Generated {self.output_size} LSTM features for {len(df)} samples")
 
@@ -610,6 +625,8 @@ class LSTMFeatureGenerator:
             'pretrain_min_delta': self.pretrain_min_delta,
             'beta': self.beta,
             'kl_warmup_epochs': self.kl_warmup_epochs,
+            'feature_columns': self.feature_columns,
+            'feature_prefix': self.feature_prefix,
         }
         with open(path, 'wb') as f:
             pickle.dump(state, f)
@@ -636,14 +653,11 @@ class LSTMFeatureGenerator:
         self.pretrain_min_delta = state.get('pretrain_min_delta', 0.0001)
         self.beta = state.get('beta', 0.001)
         self.kl_warmup_epochs = state.get('kl_warmup_epochs', 10)
+        self.feature_columns = state.get('feature_columns')
+        self.feature_prefix = state.get('feature_prefix', 'LATENT_F')
 
         # Recreate VAE with correct dimensions
-        self.autoencoder = LSTMVAE(
-            input_size=self.input_size,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            latent_size=self.output_size
-        ).to(self.device)
+        self._rebuild_autoencoder()
 
         self.autoencoder.load_state_dict(state['autoencoder_state'])
         logger.info(f"LSTM feature extractor loaded from {path}")
@@ -655,6 +669,7 @@ def calculate_lstm_features(
     hidden_size: int = 32,
     num_layers: int = 1,
     output_size: int = 8,
+    feature_columns: Optional[list[str]] = None,
     generator: Optional[LSTMFeatureGenerator] = None
 ) -> Tuple[pd.DataFrame, LSTMFeatureGenerator]:
     """
@@ -678,7 +693,8 @@ def calculate_lstm_features(
             lookback=lookback,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            output_size=output_size
+            output_size=output_size,
+            feature_columns=feature_columns,
         )
         result = generator.fit_transform(df)
     else:
@@ -692,6 +708,7 @@ def tune_lstm_hyperparameters(
     validation_data: Optional[pd.DataFrame],
     tuning_config: dict,
     base_config: dict,
+    feature_columns: Optional[list[str]] = None,
     window_folder: str = None
 ) -> dict:
     """
@@ -718,8 +735,11 @@ def tune_lstm_hyperparameters(
     device = torch.device(get_device("auto", for_recurrent=True))
 
     logger.info(f"Starting LSTM hyperparameter tuning with {n_trials} trials on {device}")
+    base_seed = int(config.get("seed", 42))
 
     def objective(trial: optuna.Trial) -> float:
+        _seed_lstm_trial(base_seed)
+
         # Sample hyperparameters
         hidden_size_config = params_config.get("hidden_size", {})
         if "choices" in hidden_size_config:
@@ -773,6 +793,7 @@ def tune_lstm_hyperparameters(
             hidden_size=hidden_size,
             num_layers=num_layers,
             output_size=output_size,
+            feature_columns=feature_columns,
             device=str(device),
             pretrain_epochs=base_config.get("pretrain_epochs", 50),
             pretrain_lr=pretrain_lr,
@@ -793,11 +814,18 @@ def tune_lstm_hyperparameters(
             validation_df=validation_data
         )
 
-        best_val_loss = generator._pretrain_autoencoder(
-            train_sequences=train_sequences,
-            validation_sequences=validation_sequences,
-            checkpoint_path=None
-        )
+        try:
+            best_val_loss = generator._pretrain_autoencoder(
+                train_sequences=train_sequences,
+                validation_sequences=validation_sequences,
+                checkpoint_path=None
+            )
+        except torch.OutOfMemoryError as exc:
+            logger.warning("LSTM tuning trial %s hit CUDA OOM and will be pruned: %s", trial.number, exc)
+            _clear_cuda_cache()
+            raise optuna.TrialPruned("cuda_oom") from exc
+        finally:
+            _clear_cuda_cache()
 
         trial.report(best_val_loss, generator.pretrain_epochs)
         if trial.should_prune():
@@ -810,11 +838,14 @@ def tune_lstm_hyperparameters(
     pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5)
     study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
 
-    # Suppress Optuna logging
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    # Run optimization
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    previous_optuna_verbosity = optuna.logging.get_verbosity()
+    try:
+        # Suppress noisy per-trial LSTM Optuna logs without leaking this setting
+        # into the later PPO walk-forward tuning stages.
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    finally:
+        optuna.logging.set_verbosity(previous_optuna_verbosity)
 
     # Get best parameters
     best_params = study.best_params

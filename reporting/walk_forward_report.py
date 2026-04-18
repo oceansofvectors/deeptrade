@@ -7,6 +7,7 @@ import json
 import os
 from typing import Any, Dict, List
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -66,13 +67,16 @@ def _window_summary_rows(payloads: List[Dict[str, Any]]) -> List[List[Any]]:
     rows: List[List[Any]] = []
     for payload in payloads:
         metrics = payload["metrics"]
+        completed_trades = metrics.get("economic_trade_count", metrics.get("completed_trades", metrics.get("trade_count", 0)))
+        rebalances = metrics.get("rebalance_count", metrics.get("trade_count", 0))
         rows.append([
             payload["window"],
             _fmt_pct(metrics.get("return_pct")),
             _fmt_num(metrics.get("sortino_ratio")),
             _fmt_num(metrics.get("calmar_ratio")),
             _fmt_pct(metrics.get("max_drawdown")),
-            metrics.get("trade_count", 0),
+            completed_trades,
+            rebalances,
             _fmt_pct(metrics.get("hit_rate")),
             payload.get("best_iteration", "n/a"),
         ])
@@ -83,17 +87,26 @@ def _build_summary_metrics(payloads: List[Dict[str, Any]], summary_results: Dict
     profitable_windows = sum(1 for payload in payloads if payload["metrics"].get("return_pct", 0.0) > 0)
     all_returns = [payload["metrics"].get("return_pct", 0.0) for payload in payloads]
     all_drawdowns = [payload["metrics"].get("max_drawdown", 0.0) for payload in payloads]
-    all_trades = [payload["metrics"].get("trade_count", 0) for payload in payloads]
+    all_completed_trades = [
+        payload["metrics"].get(
+            "economic_trade_count",
+            payload["metrics"].get("completed_trades", payload["metrics"].get("trade_count", 0)),
+        )
+        for payload in payloads
+    ]
+    all_rebalances = [payload["metrics"].get("rebalance_count", payload["metrics"].get("trade_count", 0)) for payload in payloads]
     return [
         ["Windows", summary_results.get("num_windows", len(payloads))],
         ["Profitable windows", f"{profitable_windows}/{len(payloads)}"],
         ["Average return", _fmt_pct(summary_results.get("avg_return"))],
         ["Average Sortino", _fmt_num(summary_results.get("avg_sortino"))],
         ["Average final portfolio", _fmt_money(summary_results.get("avg_portfolio"))],
-        ["Average trades", _fmt_num(summary_results.get("avg_trades"))],
+        ["Average completed trades", _fmt_num(summary_results.get("avg_completed_trades", summary_results.get("avg_trades")))],
+        ["Average rebalances", _fmt_num(summary_results.get("avg_rebalances", summary_results.get("avg_trades")))],
         ["Worst window return", _fmt_pct(min(all_returns) if all_returns else None)],
         ["Worst max drawdown", _fmt_pct(min(all_drawdowns) if all_drawdowns else None)],
-        ["Max trades in a window", max(all_trades) if all_trades else 0],
+        ["Max completed trades in a window", max(all_completed_trades) if all_completed_trades else 0],
+        ["Max rebalances in a window", max(all_rebalances) if all_rebalances else 0],
     ]
 
 
@@ -115,6 +128,7 @@ def _build_engineer_notes(payloads: List[Dict[str, Any]]) -> List[str]:
     collapse_windows = []
     degradation_windows = []
     overtrading_windows = []
+    fallback_windows = []
 
     for payload in payloads:
         window = payload["window"]
@@ -125,7 +139,9 @@ def _build_engineer_notes(payloads: List[Dict[str, Any]]) -> List[str]:
         test_sortino = payload["metrics"].get("sortino_ratio")
         if validation_sortino is not None and test_sortino is not None and validation_sortino - test_sortino > 2.0:
             degradation_windows.append(window)
-        if payload["metrics"].get("trade_count", 0) > 500 and payload["metrics"].get("return_pct", 0.0) <= 0:
+        if payload.get("validation_results", {}).get("selected_via_fallback", False):
+            fallback_windows.append(window)
+        if payload["metrics"].get("rebalance_count", payload["metrics"].get("trade_count", 0)) > 500 and payload["metrics"].get("return_pct", 0.0) <= 0:
             overtrading_windows.append(window)
 
     returns = [payload["metrics"].get("return_pct", 0.0) for payload in payloads]
@@ -135,6 +151,8 @@ def _build_engineer_notes(payloads: List[Dict[str, Any]]) -> List[str]:
         notes.append(f"Policy-collapse warnings appear in windows {collapse_windows}; inspect action concentration and reward bias.")
     if degradation_windows:
         notes.append(f"Validation-to-test degradation is material in windows {degradation_windows}; check overfitting and tuning leakage.")
+    if fallback_windows:
+        notes.append(f"Fallback checkpoint selection was required in windows {fallback_windows}; the validation gates likely rejected all candidate checkpoints.")
     if overtrading_windows:
         notes.append(f"High trade-count with weak returns appears in windows {overtrading_windows}; turnover penalty or action stability likely needs work.")
     if not notes:
@@ -147,7 +165,7 @@ def _cross_window_figure(payloads: List[Dict[str, Any]]) -> go.Figure:
     returns = [payload["metrics"].get("return_pct", 0.0) for payload in payloads]
     sortinos = [payload["metrics"].get("sortino_ratio", 0.0) for payload in payloads]
     drawdowns = [payload["metrics"].get("max_drawdown", 0.0) for payload in payloads]
-    trades = [payload["metrics"].get("trade_count", 0) for payload in payloads]
+    trades = [payload["metrics"].get("economic_trade_count", payload["metrics"].get("trade_count", 0)) for payload in payloads]
 
     fig = make_subplots(
         rows=2,
@@ -167,18 +185,20 @@ def _training_figure(payload: Dict[str, Any]) -> go.Figure:
     x = [item.get("iteration", idx) for idx, item in enumerate(iterations)]
     returns = [item.get("return_pct", 0.0) for item in iterations]
     sortinos = [item.get("sortino_ratio", 0.0) for item in iterations]
-    trades = [item.get("trade_count", 0) for item in iterations]
+    completed_trades = [item.get("economic_trade_count", item.get("trade_count", 0)) for item in iterations]
+    rebalances = [item.get("rebalance_count", item.get("trade_count", 0)) for item in iterations]
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=x, y=returns, name="Return %", line=dict(color="#1f77b4", width=3)), secondary_y=False)
     fig.add_trace(go.Scatter(x=x, y=sortinos, name="Sortino", line=dict(color="#2ca02c", width=2)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=x, y=trades, name="Trades", line=dict(color="#d62728", dash="dot")), secondary_y=True)
+    fig.add_trace(go.Scatter(x=x, y=completed_trades, name="Completed Trades", line=dict(color="#d62728", dash="dot")), secondary_y=True)
+    fig.add_trace(go.Scatter(x=x, y=rebalances, name="Rebalances", line=dict(color="#9467bd", dash="dash")), secondary_y=True)
     best_iteration = payload.get("best_iteration")
     if best_iteration is not None:
         fig.add_vline(x=best_iteration, line_dash="dash", line_color="#ff7f0e")
     fig.update_layout(height=360, title=f"Window {payload['window']} Training Diagnostics")
     fig.update_yaxes(title_text="Validation Metric / Return", secondary_y=False)
-    fig.update_yaxes(title_text="Trades", secondary_y=True)
+    fig.update_yaxes(title_text="Trade Events", secondary_y=True)
     return fig
 
 
@@ -208,28 +228,56 @@ def _replay_figure(payload: Dict[str, Any]) -> go.Figure:
     if not trades.empty and "date" in trades.columns:
         trades["date"] = pd.to_datetime(trades["date"], utc=True, errors="coerce")
         trades = trades.dropna(subset=["date"])
-        if "trade_type" in trades.columns:
-            trade_type_series = trades["trade_type"].astype(str).str.lower()
-            buys = trades[trade_type_series == "long"]
-            sells = trades[trade_type_series == "short"]
-            flats = trades[trade_type_series == "flat"]
-            for df, name, color, symbol in (
-                (buys, "Long", "#2ca02c", "triangle-up"),
-                (sells, "Short", "#d62728", "triangle-down"),
-                (flats, "Flat", "#ff7f0e", "circle"),
-            ):
-                if not df.empty:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df["date"],
-                            y=df["price"],
-                            name=name,
-                            mode="markers",
-                            marker=dict(color=color, symbol=symbol, size=9),
-                        ),
-                        row=1,
-                        col=1,
-                    )
+        if "old_contracts" in trades.columns and "new_contracts" in trades.columns:
+            old_contracts = pd.to_numeric(trades["old_contracts"], errors="coerce").fillna(0.0)
+            new_contracts = pd.to_numeric(trades["new_contracts"], errors="coerce").fillna(0.0)
+            old_direction = np.sign(old_contracts)
+            new_direction = np.sign(new_contracts)
+            old_abs = old_contracts.abs()
+            new_abs = new_contracts.abs()
+            realized_mask = trades.get("realized_trade", pd.Series(False, index=trades.index)).astype(bool)
+
+            marker_frames = [
+                (
+                    trades[(new_direction > 0) & ((old_direction <= 0) | (new_abs > old_abs))],
+                    "Long Entry / Add",
+                    "#2ca02c",
+                    "triangle-up",
+                ),
+                (
+                    trades[(new_direction < 0) & ((old_direction >= 0) | (new_abs > old_abs))],
+                    "Short Entry / Add",
+                    "#d62728",
+                    "triangle-down",
+                ),
+                (
+                    trades[realized_mask],
+                    "Exit / Reduce",
+                    "#ff7f0e",
+                    "x",
+                ),
+            ]
+        else:
+            trade_type_series = trades.get("trade_type", pd.Series("", index=trades.index)).astype(str).str.lower()
+            marker_frames = [
+                (trades[trade_type_series.str.contains("long", na=False)], "Long Entry / Add", "#2ca02c", "triangle-up"),
+                (trades[trade_type_series.str.contains("short", na=False)], "Short Entry / Add", "#d62728", "triangle-down"),
+                (trades[trade_type_series.str.contains("exit|scale out|flat", na=False)], "Exit / Reduce", "#ff7f0e", "x"),
+            ]
+
+        for df, name, color, symbol in marker_frames:
+            if not df.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=df["date"],
+                        y=df["price"],
+                        name=name,
+                        mode="markers",
+                        marker=dict(color=color, symbol=symbol, size=9),
+                    ),
+                    row=1,
+                    col=1,
+                )
 
     fig.update_layout(height=850, title=f"Window {payload['window']} Trade Replay")
     return fig
@@ -258,7 +306,7 @@ def generate_walk_forward_report(session_folder: str) -> str:
         _build_summary_metrics(payloads, summary_results),
     )
     window_table = _table(
-        ["Window", "Return", "Sortino", "Calmar", "Max DD", "Trades", "Hit Rate", "Best Iter"],
+        ["Window", "Return", "Sortino", "Calmar", "Max DD", "Completed Trades", "Rebalances", "Hit Rate", "Best Iter"],
         _window_summary_rows(payloads),
     )
     action_mix = _aggregate_action_mix(payloads)
@@ -283,12 +331,19 @@ def generate_walk_forward_report(session_folder: str) -> str:
                 ["Sortino", _fmt_num(metrics.get("sortino_ratio"))],
                 ["Calmar", _fmt_num(metrics.get("calmar_ratio"))],
                 ["Max drawdown", _fmt_pct(metrics.get("max_drawdown"))],
-                ["Trades", metrics.get("trade_count", 0)],
+                ["Completed trades", metrics.get("economic_trade_count", metrics.get("trade_count", 0))],
+                ["Rebalances", metrics.get("rebalance_count", metrics.get("trade_count", 0))],
                 ["Hit rate", _fmt_pct(metrics.get("hit_rate"))],
                 ["Validation portfolio", _fmt_money(validation_results.get("final_portfolio_value"))],
                 ["Validation return", _fmt_pct(validation_results.get("total_return_pct"))],
+                ["Validation Sortino", _fmt_num(validation_results.get("sortino_ratio"))],
+                ["Validation Calmar", _fmt_num(validation_results.get("calmar_ratio"))],
+                ["Validation max drawdown", _fmt_pct(validation_results.get("max_drawdown"))],
             ],
         )
+        fallback_note = ""
+        if validation_results.get("selected_via_fallback", False):
+            fallback_note = "<div class=\"note\">Validation checkpoint selection fell back to the least-bad candidate because all checkpoints failed the configured trade/action/drawdown gates.</div>"
         training_fig = _training_figure(payload)
         replay_fig = _replay_figure(payload)
         flag_rows = []
@@ -302,6 +357,7 @@ def generate_walk_forward_report(session_folder: str) -> str:
             <section class="window">
               <h2>Window {payload['window']}</h2>
               {metrics_table}
+              {fallback_note}
               <div class="note">Train/Val/Test: {html.escape(str(payload['window_periods'].get('train_start')))} to {html.escape(str(payload['window_periods'].get('test_end')))}</div>
               {replay_fig.to_html(full_html=False, include_plotlyjs=False)}
               {training_fig.to_html(full_html=False, include_plotlyjs=False)}

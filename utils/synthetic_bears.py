@@ -9,6 +9,7 @@ data before indicators / LSTM features are recomputed upstream.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -50,11 +51,12 @@ def _infer_bar_delta(index: pd.Index) -> pd.Timedelta | None:
     return diffs.mode().iloc[0]
 
 
-def _episode_index(source_index: pd.Index, end_anchor, segment_length: int, bar_delta, episode_idx: int) -> pd.Index:
+def _episode_index(source_index: pd.Index, end_anchor, segment_length: int, bar_delta, offset_bars: int) -> pd.Index:
     if isinstance(source_index, pd.DatetimeIndex) and bar_delta is not None:
-        start = pd.Timestamp(end_anchor) + bar_delta * (episode_idx * (segment_length + 1))
+        start = pd.Timestamp(end_anchor) + bar_delta * (offset_bars + 1)
         return pd.date_range(start=start, periods=segment_length, freq=bar_delta)
-    return pd.RangeIndex(start=int(len(source_index)) + episode_idx * segment_length, stop=int(len(source_index)) + (episode_idx + 1) * segment_length)
+    start = int(len(source_index)) + offset_bars
+    return pd.RangeIndex(start=start, stop=start + segment_length)
 
 
 def _ensure_ohlc_consistency(segment: pd.DataFrame) -> pd.DataFrame:
@@ -188,8 +190,29 @@ def augment_with_synthetic_bears(
         return (raw_df, None) if return_metadata else raw_df
 
     segment_length = max(10, int(n * segment_length_pct))
-    num_synthetic_bars = int(n * oversample_ratio)
-    num_segments = max(1, num_synthetic_bars // segment_length)
+    num_synthetic_bars = max(0, int(round(n * oversample_ratio)))
+    if num_synthetic_bars < 10:
+        metadata = {
+            "enabled": False,
+            "seed": int(seed),
+            "original_bars": int(n),
+            "synthetic_bars": 0,
+            "target_synthetic_bars": int(num_synthetic_bars),
+            "augmented_bars": int(n),
+            "oversample_ratio": float(oversample_ratio),
+            "segment_length_pct": float(segment_length_pct),
+            "num_segments": 0,
+            "regime_counts": {regime: 0 for regime in REGIME_TYPES},
+            "segments": [],
+            "real_close_stats": _return_stats(raw_df["close"]),
+        }
+        logger.info(
+            "Skipping synthetic bear augmentation: target bars=%d is below minimum segment length",
+            num_synthetic_bars,
+        )
+        return (raw_df, metadata) if return_metadata else raw_df
+
+    num_segments = max(1, math.ceil(num_synthetic_bars / segment_length))
     rng = np.random.default_rng(seed=seed)
     bar_delta = _infer_bar_delta(raw_df.index)
 
@@ -200,17 +223,35 @@ def augment_with_synthetic_bears(
 
     augmented_segments: List[pd.DataFrame] = []
     segment_reports: List[Dict[str, object]] = []
-    max_start = n - segment_length
-    if max_start <= 0:
+    if n - min(segment_length, num_synthetic_bars) <= 0:
         return (raw_df, None) if return_metadata else raw_df
 
+    synthetic_offset = 0
+    synthetic_bars_created = 0
     for episode_idx in range(num_segments):
+        remaining_bars = num_synthetic_bars - synthetic_bars_created
+        current_length = min(segment_length, remaining_bars)
+        if current_length < 10:
+            break
+
+        max_start = n - current_length
+        if max_start <= 0:
+            break
+
         start = int(rng.integers(0, max_start + 1))
-        source = raw_df.iloc[start:start + segment_length].copy()
+        source = raw_df.iloc[start:start + current_length].copy()
         regime_type = str(rng.choice(REGIME_TYPES, p=REGIME_WEIGHTS))
         synthetic = _regime_transform(source, regime_type, rng)
-        synthetic.index = _episode_index(raw_df.index, raw_df.index[-1], len(source), bar_delta, episode_idx + 1)
+        synthetic.index = _episode_index(
+            raw_df.index,
+            raw_df.index[-1],
+            len(source),
+            bar_delta,
+            synthetic_offset,
+        )
         augmented_segments.append(synthetic)
+        synthetic_offset += len(source)
+        synthetic_bars_created += len(source)
 
         segment_reports.append({
             "episode_id": episode_idx + 1,
@@ -235,6 +276,7 @@ def augment_with_synthetic_bears(
         "seed": int(seed),
         "original_bars": int(n),
         "synthetic_bars": int(sum(len(seg) for seg in augmented_segments)),
+        "target_synthetic_bars": int(num_synthetic_bars),
         "augmented_bars": int(len(result)),
         "oversample_ratio": float(oversample_ratio),
         "segment_length_pct": float(segment_length_pct),

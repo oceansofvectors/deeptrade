@@ -34,11 +34,11 @@ class TestLogFormatHelpers(unittest.TestCase):
         self.assertEqual(format_action_distribution([]), "no actions")
         self.assertEqual(
             format_action_distribution({0: 2, 5: 1, 6: 3}),
-            "LONG_1=2 LONG_2=0 LONG_5=0 SHORT_1=0 SHORT_2=0 SHORT_5=1 FLAT=3",
+            "LONG_0.5R=2 LONG_1R=0 LONG_1.5R=0 SHORT_0.5R=0 SHORT_1R=0 SHORT_1.5R=1 FLAT=3",
         )
         self.assertEqual(
             format_action_distribution([0, 0, 5, 6]),
-            "LONG_1=2 LONG_2=0 LONG_5=0 SHORT_1=0 SHORT_2=0 SHORT_5=1 FLAT=1",
+            "LONG_0.5R=2 LONG_1R=0 LONG_1.5R=0 SHORT_0.5R=0 SHORT_1R=0 SHORT_1.5R=1 FLAT=1",
         )
 
     def test_strip_ansi_and_formatter_remove_color_codes(self):

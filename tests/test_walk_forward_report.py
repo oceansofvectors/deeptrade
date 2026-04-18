@@ -38,6 +38,8 @@ class TestWalkForwardReport(unittest.TestCase):
             "avg_sortino": 1.8,
             "avg_portfolio": 103200.0,
             "avg_trades": 214.0,
+            "avg_completed_trades": 87.0,
+            "avg_rebalances": 214.0,
             "num_windows": 1,
         })
         self._write_json("reports/best_hyperparameters.json", {
@@ -50,6 +52,9 @@ class TestWalkForwardReport(unittest.TestCase):
                 "return_pct": 3.2,
                 "final_portfolio_value": 103200.0,
                 "trade_count": 214,
+                "rebalance_count": 214,
+                "completed_trades": 87,
+                "economic_trade_count": 87,
                 "hit_rate": 51.4,
                 "max_drawdown": -6.8,
                 "calmar_ratio": 0.47,
@@ -68,17 +73,21 @@ class TestWalkForwardReport(unittest.TestCase):
                 "drawdown_values": [0.0, -1.2],
             },
             "trade_history": [
-                {"date": "2021-03-01 14:35:00+00:00", "trade_type": "Long", "price": 13010.0}
+                {"date": "2021-03-01 14:35:00+00:00", "trade_type": "Long Entry", "price": 13010.0, "old_contracts": 0, "new_contracts": 2, "realized_trade": False},
+                {"date": "2021-03-01 14:40:00+00:00", "trade_type": "Exit", "price": 13012.0, "old_contracts": 2, "new_contracts": 0, "realized_trade": True},
             ],
             "action_counts": {"0": 10, "1": 8, "2": 2},
             "training_iterations": [
-                {"iteration": 0, "return_pct": 3.2, "sortino_ratio": 1.8, "trade_count": 214, "is_best": True, "collapse_flags": []},
-                {"iteration": 1, "return_pct": -2.0, "sortino_ratio": -0.5, "trade_count": 300, "warning_metric_drop": True, "collapse_flags": ["metric_drop"]},
+                {"iteration": 0, "return_pct": 3.2, "sortino_ratio": 1.8, "trade_count": 214, "rebalance_count": 214, "economic_trade_count": 87, "is_best": True, "collapse_flags": []},
+                {"iteration": 1, "return_pct": -2.0, "sortino_ratio": -0.5, "trade_count": 300, "rebalance_count": 300, "economic_trade_count": 120, "warning_metric_drop": True, "collapse_flags": ["metric_drop"]},
             ],
             "validation_results": {
                 "final_portfolio_value": 104500.0,
                 "total_return_pct": 4.5,
                 "sortino_ratio": 3.1,
+                "calmar_ratio": 0.9,
+                "max_drawdown": -3.2,
+                "selected_via_fallback": True,
             },
             "best_iteration": 0,
         })
@@ -93,6 +102,11 @@ class TestWalkForwardReport(unittest.TestCase):
         self.assertIn("Cross-Window Diagnostics", html_doc)
         self.assertIn("reward_calm_holding_bonus", html_doc)
         self.assertIn("Plotly.newPlot", html_doc)
+        self.assertIn("Average completed trades", html_doc)
+        self.assertIn("Validation Sortino", html_doc)
+        self.assertIn("Long Entry \\u002f Add", html_doc)
+        self.assertIn("Exit \\u002f Reduce", html_doc)
+        self.assertIn("Fallback checkpoint selection", html_doc)
 
     def test_missing_window_payloads_raises(self):
         self._write_json("reports/session_parameters.json", {"timestamp": "20260414_120000"})

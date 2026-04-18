@@ -14,7 +14,7 @@ import pytz
 from collections import defaultdict
 
 from stable_baselines3 import PPO
-from action_space import action_direction, action_label, target_allocation_for_action
+from action_space import ACTION_COUNT, action_label, target_contracts_for_action
 from environment import TradingEnv
 from config import config
 import money
@@ -82,7 +82,7 @@ class RiskManager:
         self.position = 0  # Current position: 0 (neutral), 1 (long), -1 (short)
         self.entry_price = Decimal('0.0')  # Price at which position was entered
         self.signed_exposure_pct = Decimal('0.0')
-        self.target_allocation_pct = Decimal('0.0')
+        self.target_contracts = 0
         self.entry_portfolio_value = Decimal('0.0')  # Portfolio value at entry
         self.highest_price = Decimal('0.0')  # Highest price since entry (for trailing stop on long)
         self.lowest_price = Decimal('Infinity')  # Lowest price since entry (for trailing stop on short)
@@ -147,23 +147,6 @@ class RiskManager:
         
         return max_contracts
 
-    def calculate_target_contracts(self, target_allocation_pct: float, price: float) -> int:
-        """Convert a target portfolio allocation into a whole-contract quantity."""
-        price_decimal = money.to_decimal(price)
-        allocation_decimal = money.to_decimal(target_allocation_pct)
-        if allocation_decimal == 0 or price_decimal <= 0 or self.net_worth <= 0:
-            return 0
-
-        contract_value = price_decimal * money.to_decimal(constants.CONTRACT_POINT_VALUE)
-        if contract_value <= 0:
-            return 0
-
-        target_notional = self.net_worth * abs(allocation_decimal)
-        contracts = int(target_notional / contract_value)
-        if contracts < 1:
-            return 0
-        return contracts if allocation_decimal > 0 else -contracts
-        
     def enter_position(self, position: int, price: float, date: pd.Timestamp, contracts: int, atr_value: float = None,
                        sl_multiplier: float = None, tp_multiplier: float = None) -> None:
         """
@@ -181,8 +164,8 @@ class RiskManager:
         self.position = position
         self.entry_price = money.to_decimal(price)
         self.current_contracts = contracts  # Store the number of contracts
+        self.target_contracts = position * contracts
         self.signed_exposure_pct = self._calculate_signed_exposure(position * contracts, self.entry_price)
-        self.target_allocation_pct = self.signed_exposure_pct
 
         # Update ATR value if provided
         if atr_value is not None:
@@ -481,23 +464,23 @@ class RiskManager:
         self.trailing_stop_price = Decimal('0.0')
         self.current_contracts = 0  # Reset the number of contracts
         self.signed_exposure_pct = Decimal('0.0')
-        self.target_allocation_pct = Decimal('0.0')
+        self.target_contracts = 0
 
     def rebalance_position(
         self,
-        target_allocation_pct: float,
+        target_contracts: int,
         price: float,
         date: pd.Timestamp,
         atr_value: float = None,
         sl_multiplier: float = None,
         tp_multiplier: float = None,
     ) -> bool:
-        """Rebalance current exposure to a target signed allocation."""
-        target_contracts = self.calculate_target_contracts(target_allocation_pct, price)
+        """Rebalance current exposure to a target signed contract count."""
+        target_contracts = int(target_contracts)
         signed_current_contracts = self.position * self.current_contracts
+        self.target_contracts = target_contracts
         if target_contracts == signed_current_contracts:
-            self.target_allocation_pct = self._calculate_signed_exposure(target_contracts, money.to_decimal(price))
-            self.signed_exposure_pct = self.target_allocation_pct
+            self.signed_exposure_pct = self._calculate_signed_exposure(target_contracts, money.to_decimal(price))
             return False
 
         price_decimal = money.to_decimal(price)
@@ -531,7 +514,6 @@ class RiskManager:
             self.entry_price = weighted_entry
             self.current_contracts = new_total
             self.signed_exposure_pct = self._calculate_signed_exposure(self.position * self.current_contracts, price_decimal)
-            self.target_allocation_pct = self.signed_exposure_pct
             self.trade_history.append({
                 "date": date,
                 "action": "buy" if self.position == 1 else "sell",
@@ -549,7 +531,6 @@ class RiskManager:
             self.net_worth += money.calculate_net_profit(realized_pnl, tx_cost)
             self.current_contracts = target_abs
             self.signed_exposure_pct = self._calculate_signed_exposure(self.position * self.current_contracts, price_decimal)
-            self.target_allocation_pct = self.signed_exposure_pct
             self.trade_history.append({
                 "date": date,
                 "action": "sell" if self.position == 1 else "buy",
@@ -748,7 +729,7 @@ def trade_with_risk_management(
     dates = []
     price_history = []
     portfolio_history = []
-    action_counts = {i: 0 for i in range(7)}
+    action_counts = {i: 0 for i in range(ACTION_COUNT)}
 
     def _record_exit_marker(exiting_position: int, exit_date: pd.Timestamp, exit_price: float) -> None:
         if exiting_position == 1:
@@ -969,15 +950,20 @@ def trade_with_risk_management(
                         logger.info(f"Position closed at {reason}. Exit reason recorded: {reason}")
                 else:
                     current_atr = None
-                    if "atr" in test_data.columns:
-                        current_atr = test_data.loc[test_data.index[i], "atr"]
-                    elif "ATR" in test_data.columns:
-                        current_atr = test_data.loc[test_data.index[i], "ATR"]
+                    for atr_col in ("ATR_RAW", "atr_raw", "ATR", "atr"):
+                        if atr_col in test_data.columns:
+                            current_atr = test_data.loc[test_data.index[i], atr_col]
+                            break
 
-                    target_allocation = target_allocation_for_action(current_action)
+                    target_contracts = target_contracts_for_action(
+                        current_action,
+                        net_worth=risk_manager.net_worth,
+                        atr=current_atr,
+                        price=current_price,
+                    )
                     prev_position = risk_manager.position
                     changed = risk_manager.rebalance_position(
-                        target_allocation_pct=target_allocation,
+                        target_contracts=target_contracts,
                         price=current_price,
                         date=current_date,
                         atr_value=current_atr,

@@ -52,6 +52,7 @@ from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
 import pickle
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+import train as train_module
 
 # RecurrentPPO for LSTM support
 try:
@@ -60,10 +61,10 @@ try:
 except ImportError:
     RECURRENT_PPO_AVAILABLE = False
 
-from action_space import action_direction, action_label
-from environment import TradingEnv
-from get_data import get_data, process_technical_indicators
-from train import evaluate_agent, plot_results, train_walk_forward_model
+from action_space import ACTION_COUNT, FLAT_ACTION, LONG_ACTIONS, SHORT_ACTIONS, action_direction, action_label
+from environment import TradingEnv, get_market_feature_columns, get_representation_mode
+from get_data import ensure_numeric, get_data, process_technical_indicators, select_session_dominant_contract
+from train import evaluate_agent, get_configured_algorithm, plot_results, train_walk_forward_model
 from trade import trade_with_risk_management, save_trade_history  # Import trade_with_risk_management and save_trade_history
 from config import config
 import money
@@ -144,6 +145,11 @@ def save_json(data, filepath):
         json.dump(data, f, indent=4, cls=TimestampJSONEncoder)
 
 
+def _session_timestamp() -> str:
+    """Return a high-resolution timestamp for unique walk-forward session folders."""
+    return datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+
+
 def _narrow_hp_config(base_hp_config: Dict, best_params: Dict, shrink: float) -> Dict:
     """Create a narrower stage-2 search space around a stage-1 winner."""
     narrowed = copy.deepcopy(base_hp_config)
@@ -171,24 +177,168 @@ def _narrow_hp_config(base_hp_config: Dict, best_params: Dict, shrink: float) ->
 
 
 def _sample_stage_params(trial, hp_config: Dict) -> Dict[str, float]:
-    """Sample only the retained PPO/reward tuning parameters."""
+    """Sample the configured PPO/reward/augmentation tuning parameters."""
     params: Dict[str, float] = {}
+    integer_params = {"n_steps", "reward_flat_time_grace_steps"}
     for name in (
         "learning_rate",
         "n_steps",
         "ent_coef",
+        "gamma",
+        "gae_lambda",
         "reward_turnover_penalty",
-        "reward_calm_holding_bonus",
+        "reward_loss_multiplier",
+        "reward_drawdown_penalty",
+        "reward_drawdown_penalty_threshold",
+        "reward_flat_time_penalty",
+        "reward_flat_time_grace_steps",
+        "synthetic_oversample_ratio",
     ):
         cfg = hp_config.get(name, {})
         if not isinstance(cfg, dict):
             continue
-        if name == "n_steps":
+        if "choices" in cfg:
+            params[name] = trial.suggest_categorical(name, list(cfg["choices"]))
+        elif name in integer_params:
             params[name] = trial.suggest_int(
                 name,
-                int(cfg.get("min", 128)),
-                int(cfg.get("max", 2048)),
-                log=cfg.get("log", True),
+                int(cfg.get("min", 1)),
+                int(cfg.get("max", 64)),
+                log=cfg.get("log", False),
+            )
+        else:
+            params[name] = trial.suggest_float(
+                name,
+                float(cfg.get("min", 1e-5)),
+                float(cfg.get("max", 1e-2)),
+                log=cfg.get("log", False),
+            )
+    return params
+
+
+def _resolve_qrdqn_hp_config(tuning_config: Dict) -> Dict:
+    """Resolve a minimal QR-DQN search space from config with safe defaults."""
+    shared = tuning_config.get("parameters", {})
+    qrdqn_cfg = copy.deepcopy(tuning_config.get("qrdqn_parameters", {}))
+    config_map = {
+        "learning_rate": copy.deepcopy(
+            qrdqn_cfg.get(
+                "learning_rate",
+                shared.get("learning_rate", {"min": 1e-5, "max": 5e-4, "log": True}),
+            )
+        ),
+        "batch_size": copy.deepcopy(
+            qrdqn_cfg.get(
+                "batch_size",
+                {"choices": [32, 64, 128, 256]},
+            )
+        ),
+        "gamma": copy.deepcopy(
+            qrdqn_cfg.get(
+                "gamma",
+                shared.get("gamma", {"min": 0.985, "max": 0.999, "log": False}),
+            )
+        ),
+        "buffer_size": copy.deepcopy(
+            qrdqn_cfg.get(
+                "buffer_size",
+                {"choices": [50000, 100000, 200000, 500000]},
+            )
+        ),
+        "learning_starts": copy.deepcopy(
+            qrdqn_cfg.get(
+                "learning_starts",
+                {"choices": [2000, 5000, 10000]},
+            )
+        ),
+        "train_freq": copy.deepcopy(
+            qrdqn_cfg.get(
+                "train_freq",
+                {"choices": [4, 8, 16, 32]},
+            )
+        ),
+        "gradient_steps": copy.deepcopy(
+            qrdqn_cfg.get(
+                "gradient_steps",
+                {"choices": [1, 2, 4, 8]},
+            )
+        ),
+        "target_update_interval": copy.deepcopy(
+            qrdqn_cfg.get(
+                "target_update_interval",
+                {"choices": [1000, 2000, 5000, 10000]},
+            )
+        ),
+        "exploration_fraction": copy.deepcopy(
+            qrdqn_cfg.get(
+                "exploration_fraction",
+                {"min": 0.05, "max": 0.20, "log": False},
+            )
+        ),
+        "exploration_final_eps": copy.deepcopy(
+            qrdqn_cfg.get(
+                "exploration_final_eps",
+                {"min": 0.02, "max": 0.10, "log": False},
+            )
+        ),
+    }
+    for name in (
+        "reward_turnover_penalty",
+        "reward_loss_multiplier",
+        "reward_drawdown_penalty",
+        "reward_drawdown_penalty_threshold",
+        "reward_flat_time_penalty",
+        "reward_flat_time_grace_steps",
+        "synthetic_oversample_ratio",
+    ):
+        shared_cfg = shared.get(name)
+        if isinstance(shared_cfg, dict):
+            config_map[name] = copy.deepcopy(shared_cfg)
+    return config_map
+
+
+def _sample_qrdqn_params(trial, hp_config: Dict) -> Dict[str, float]:
+    """Sample QR-DQN-specific hyperparameters."""
+    params: Dict[str, float] = {}
+    integer_params = {
+        "batch_size",
+        "buffer_size",
+        "learning_starts",
+        "train_freq",
+        "gradient_steps",
+        "target_update_interval",
+        "reward_flat_time_grace_steps",
+    }
+    for name in (
+        "learning_rate",
+        "batch_size",
+        "gamma",
+        "buffer_size",
+        "learning_starts",
+        "train_freq",
+        "gradient_steps",
+        "target_update_interval",
+        "exploration_fraction",
+        "exploration_final_eps",
+        "reward_turnover_penalty",
+        "reward_loss_multiplier",
+        "reward_drawdown_penalty",
+        "reward_drawdown_penalty_threshold",
+        "reward_flat_time_penalty",
+        "reward_flat_time_grace_steps",
+        "synthetic_oversample_ratio",
+    ):
+        cfg = hp_config.get(name, {})
+        if not isinstance(cfg, dict):
+            continue
+        if "choices" in cfg:
+            params[name] = trial.suggest_categorical(name, list(cfg["choices"]))
+        elif name in integer_params:
+            params[name] = trial.suggest_int(
+                name,
+                int(cfg.get("min", 32)),
+                int(cfg.get("max", 256 if name == "batch_size" else 10000)),
+                log=cfg.get("log", False),
             )
         else:
             params[name] = trial.suggest_float(
@@ -252,16 +402,23 @@ def _run_tuning_stage(
         learning_rate = float(sampled["learning_rate"])
         n_steps = int(sampled["n_steps"])
         ent_coef = float(sampled["ent_coef"])
-        gamma = float(config.get("model", {}).get("gamma", 0.99))
-        gae_lambda = float(config.get("model", {}).get("gae_lambda", 0.95))
+        gamma = float(sampled.get("gamma", config.get("model", {}).get("gamma", 0.99)))
+        gae_lambda = float(sampled.get("gae_lambda", config.get("model", {}).get("gae_lambda", 0.95)))
         lstm_hidden_size = int(seq_config.get("lstm_hidden_size", 256))
         n_lstm_layers = int(seq_config.get("n_lstm_layers", 1))
 
         trial_overrides = {}
-        if "reward_turnover_penalty" in sampled:
-            trial_overrides["reward_turnover_penalty"] = float(sampled["reward_turnover_penalty"])
-        if "reward_calm_holding_bonus" in sampled:
-            trial_overrides["reward_calm_holding_bonus"] = float(sampled["reward_calm_holding_bonus"])
+        for key in (
+            "reward_turnover_penalty",
+            "reward_loss_multiplier",
+            "reward_drawdown_penalty",
+            "reward_drawdown_penalty_threshold",
+            "reward_flat_time_penalty",
+            "reward_flat_time_grace_steps",
+            "synthetic_oversample_ratio",
+        ):
+            if key in sampled:
+                trial_overrides[key] = sampled[key]
 
         original_overrides = _apply_trial_config_overrides(trial_overrides)
         min_episode_steps = max(2, n_steps) if use_recurrent else 2
@@ -330,11 +487,28 @@ def _run_tuning_stage(
                 primary_score, _ = _score_tuning_trial(primary_results, len(validation_data))
                 trial.report(primary_score, prune_step)
 
-                should_prune, prune_reasons = _should_hard_prune_trial(primary_results, tuning_config)
+                should_prune, prune_reasons = _should_hard_prune_trial(
+                    primary_results,
+                    tuning_config,
+                    prune_step=prune_step,
+                )
+                action_dist = format_action_distribution(
+                    _normalize_action_counts(primary_results.get("action_counts"))
+                )
                 if should_prune:
                     trial.set_user_attr("hard_prune_reasons", prune_reasons)
+                    logger.info(
+                        f"{stage_name} Trial {trial.number} pruned at step {prune_step} "
+                        f"({timesteps_completed}/{tuning_timesteps} steps): "
+                        f"score={primary_score:.2f}, reasons={prune_reasons}, actions=[{action_dist}]"
+                    )
                     raise optuna.TrialPruned()
                 if timesteps_completed < tuning_timesteps and trial.should_prune():
+                    logger.info(
+                        f"{stage_name} Trial {trial.number} pruned by Optuna median pruner at step {prune_step} "
+                        f"({timesteps_completed}/{tuning_timesteps} steps): "
+                        f"score={primary_score:.2f}, actions=[{action_dist}]"
+                    )
                     raise optuna.TrialPruned()
 
             evaluation_scores = []
@@ -411,8 +585,12 @@ def _run_tuning_stage(
                 f"baseline_penalty={aggregate_diag['baseline_penalty']:.2f}"
             )
         log_msg += (
-            f", turnover={float(trial_overrides.get('reward_turnover_penalty', config['reward']['turnover_penalty'])):.4f}, "
-            f"calm={float(trial_overrides.get('reward_calm_holding_bonus', config['reward']['calm_holding_bonus'])):.4f}"
+            f", gamma={gamma:.4f}, gae={gae_lambda:.4f}, "
+            f"turnover={float(trial_overrides.get('reward_turnover_penalty', config['reward']['turnover_penalty'])):.4f}, "
+            f"loss_mult={float(trial_overrides.get('reward_loss_multiplier', config['reward']['loss_multiplier'])):.3f}, "
+            f"dd_pen={float(trial_overrides.get('reward_drawdown_penalty', config['reward']['drawdown_penalty'])):.3f}, "
+            f"flat_pen={float(trial_overrides.get('reward_flat_time_penalty', config['reward']['flat_time_penalty'])):.4f}, "
+            f"flat_grace={int(trial_overrides.get('reward_flat_time_grace_steps', config['reward']['flat_time_grace_steps']))}"
         )
         logger.info(log_msg)
         return composite_score
@@ -425,9 +603,255 @@ def _run_tuning_stage(
     else:
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
+    try:
+        best_params = study.best_params
+        best_value = study.best_value
+    except ValueError:
+        completed_trials = [
+            trial for trial in study.trials
+            if trial.state == optuna.trial.TrialState.COMPLETE
+        ]
+        pruned_trials = [
+            trial for trial in study.trials
+            if trial.state == optuna.trial.TrialState.PRUNED
+        ]
+        failed_trials = [
+            trial for trial in study.trials
+            if trial.state == optuna.trial.TrialState.FAIL
+        ]
+        logger.warning(
+            "%s tuning produced no completed trials (pruned=%d, failed=%d). Returning empty result.",
+            stage_name,
+            len(pruned_trials),
+            len(failed_trials),
+        )
+        best_params = {}
+        best_value = float("-inf")
+
     return {
-        "best_params": study.best_params,
-        "best_value": study.best_value,
+        "best_params": best_params,
+        "best_value": best_value,
+        "study": study,
+    }
+
+
+def _run_qrdqn_tuning(
+    *,
+    train_data: pd.DataFrame,
+    validation_data: pd.DataFrame,
+    n_trials: int,
+    window_folder: str | None,
+    holdout_validation_sets: List[pd.DataFrame],
+) -> Dict:
+    """Run a minimal QR-DQN hyperparameter tuning study."""
+    tuning_config = config.get("hyperparameter_tuning", {})
+    parallel_config = tuning_config.get("parallel_processing", {})
+    use_parallel = parallel_config.get("enabled", True)
+    n_jobs = _resolve_tuning_n_jobs()
+    if not use_parallel:
+        n_jobs = 1
+
+    reference_columns = list(train_data.columns)
+    evaluation_sets = [validation_data] + list(holdout_validation_sets or [])
+    baseline_margin = float(tuning_config.get("baseline_margin", 0.25))
+    baseline_scores = _score_constant_action_baselines(evaluation_sets, reference_columns)
+    logger.info(
+        "QR-DQN trivial baseline scores: %s",
+        [round(max(scores.values()), 2) for scores in baseline_scores],
+    )
+
+    hp_config = _resolve_qrdqn_hp_config(tuning_config)
+    tuning_timesteps = int(
+        tuning_config.get(
+            "qrdqn_tuning_timesteps",
+            tuning_config.get("tuning_timesteps", tuning_config.get("stage1_timesteps", 20000)),
+        )
+    )
+
+    study_name = f"qrdqn_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+    sampler = optuna.samplers.TPESampler(
+        seed=config.get("seed", 42),
+        multivariate=True,
+        n_startup_trials=min(10, max(5, n_trials // 3)),
+        n_ei_candidates=24,
+    )
+
+    storage = None
+    if use_parallel:
+        if window_folder:
+            storage = f"sqlite:///{window_folder}/qrdqn_optuna.db"
+        else:
+            storage = "sqlite:///qrdqn_optuna.db"
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=True,
+    )
+
+    def objective(trial):
+        sampled = _sample_qrdqn_params(trial, hp_config)
+        learning_rate = float(sampled["learning_rate"])
+        batch_size = int(sampled["batch_size"])
+        gamma = float(sampled["gamma"])
+        buffer_size = int(sampled["buffer_size"])
+        learning_starts = int(sampled["learning_starts"])
+        train_freq = int(sampled["train_freq"])
+        gradient_steps = int(sampled["gradient_steps"])
+        target_update_interval = int(sampled["target_update_interval"])
+        exploration_fraction = float(sampled["exploration_fraction"])
+        exploration_final_eps = float(sampled["exploration_final_eps"])
+        trial_overrides = {}
+        for key in (
+            "reward_turnover_penalty",
+            "reward_loss_multiplier",
+            "reward_drawdown_penalty",
+            "reward_drawdown_penalty_threshold",
+            "reward_flat_time_penalty",
+            "reward_flat_time_grace_steps",
+            "synthetic_oversample_ratio",
+        ):
+            if key in sampled:
+                trial_overrides[key] = sampled[key]
+        original_overrides = _apply_trial_config_overrides(trial_overrides)
+        device = get_device(config.get("sequence_model", {}).get("device", "auto"), for_recurrent=False)
+        train_env, _ = _build_tuning_env(train_data, random_start_pct=float(config.get("training", {}).get("random_start_pct", 0.2)), min_episode_steps=2, n_envs_override=1)
+
+        model = train_module.QRDQN(
+            "MlpPolicy",
+            train_env,
+            verbose=0,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            gamma=gamma,
+            buffer_size=buffer_size,
+            learning_starts=learning_starts,
+            train_freq=train_freq,
+            gradient_steps=gradient_steps,
+            target_update_interval=target_update_interval,
+            exploration_fraction=exploration_fraction,
+            exploration_initial_eps=float(config.get("model", {}).get("exploration_initial_eps", 1.0)),
+            exploration_final_eps=exploration_final_eps,
+            seed=config.get("seed"),
+            device=device,
+            policy_kwargs={"net_arch": [256, 256]},
+        )
+
+        try:
+            model.learn(total_timesteps=tuning_timesteps, progress_bar=False)
+            evaluation_scores = []
+            evaluation_results = []
+            for dataset in evaluation_sets:
+                aligned_dataset = _align_feature_columns(reference_columns, dataset)
+                results = evaluate_agent(model, aligned_dataset, verbose=0, deterministic=True)
+                score, diagnostics = _score_tuning_trial(results, len(aligned_dataset))
+                evaluation_results.append((results, diagnostics))
+                evaluation_scores.append(score)
+            composite_score, aggregate_diag = _summarize_trial_scores(
+                evaluation_scores,
+                baseline_scores,
+                baseline_margin=baseline_margin,
+            )
+        except (ValueError, RuntimeError) as e:
+            logger.warning("qrdqn trial %d failed during training: %s", trial.number, e)
+            return -100.0
+        finally:
+            train_env.close()
+            _restore_trial_config_overrides(original_overrides)
+
+        results, tuning_diag = evaluation_results[0]
+        trial.set_user_attr(
+            "tuning_diagnostics",
+            {
+                "stage": "qrdqn",
+                "base_score": round(tuning_diag["base_score"], 6),
+                "total_penalty": round(tuning_diag["total_penalty"], 6),
+                "trade_count": tuning_diag["trade_count"],
+                "min_trades_required": tuning_diag["min_trades_required"],
+                "dominant_action_pct": round(tuning_diag["dominant_action_pct"], 4),
+                "flat_action_pct": round(tuning_diag["flat_action_pct"], 4),
+                "collapse_flags": tuning_diag["collapse_flags"],
+                "primary_score": round(aggregate_diag["primary_score"], 6),
+                "holdout_mean": round(aggregate_diag["holdout_mean"], 6),
+                "holdout_std": round(aggregate_diag["holdout_std"], 6),
+                "best_baseline_score": round(aggregate_diag["best_baseline_score"], 6),
+                "baseline_gap": round(aggregate_diag["baseline_gap"], 6),
+                "baseline_penalty": round(aggregate_diag["baseline_penalty"], 6),
+            },
+        )
+
+        action_dist = format_action_distribution(tuning_diag["action_counts"])
+        sortino_text = bold(f"{float(results.get('sortino_ratio', 0.0)):.2f}")
+        log_msg = (
+            f"qrdqn Trial {trial.number}: composite={composite_score:.2f}, "
+            f"return={color_pct(float(results.get('total_return_pct', 0.0)))}, "
+            f"sortino={sortino_text}, "
+            f"calmar={float(results.get('calmar_ratio', 0.0)):.2f}, "
+            f"maxDD={abs(float(results.get('max_drawdown', 0.0))):.2f}%, "
+            f"actions=[{action_dist}], lr={learning_rate:.6f}, batch={batch_size}, gamma={gamma:.4f}, "
+            f"buffer={buffer_size}, starts={learning_starts}, train_freq={train_freq}, "
+            f"grad_steps={gradient_steps}, target_update={target_update_interval}, "
+            f"eps_frac={exploration_fraction:.3f}, eps_final={exploration_final_eps:.3f}"
+        )
+        if aggregate_diag["holdout_std"] > 0 or len(evaluation_sets) > 1:
+            log_msg += (
+                f", holdout_mean={aggregate_diag['holdout_mean']:.2f}, "
+                f"holdout_std={aggregate_diag['holdout_std']:.2f}"
+            )
+        if aggregate_diag["baseline_penalty"] > 0:
+            log_msg += (
+                f", baseline={aggregate_diag['best_baseline_score']:.2f}, "
+                f"baseline_penalty={aggregate_diag['baseline_penalty']:.2f}"
+            )
+        log_msg += (
+            f", turnover={float(trial_overrides.get('reward_turnover_penalty', config['reward']['turnover_penalty'])):.4f}, "
+            f"loss_mult={float(trial_overrides.get('reward_loss_multiplier', config['reward']['loss_multiplier'])):.3f}, "
+            f"dd_pen={float(trial_overrides.get('reward_drawdown_penalty', config['reward']['drawdown_penalty'])):.3f}, "
+            f"flat_pen={float(trial_overrides.get('reward_flat_time_penalty', config['reward']['flat_time_penalty'])):.4f}, "
+            f"flat_grace={int(trial_overrides.get('reward_flat_time_grace_steps', config['reward']['flat_time_grace_steps']))}"
+        )
+        if "synthetic_oversample_ratio" in trial_overrides:
+            log_msg += f", synth={float(trial_overrides['synthetic_oversample_ratio']):.3f}"
+        logger.info(log_msg)
+        return float(composite_score)
+
+    if n_trials <= 0:
+        return {
+            "best_params": {},
+            "best_value": float("-inf"),
+            "selected_stage": "qrdqn",
+            "stage1_best_params": {},
+            "stage1_best_value": float("-inf"),
+            "stage2_best_params": {},
+            "stage2_best_value": float("-inf"),
+            "stage2_search_space": {},
+            "study": None,
+        }
+
+    if use_parallel:
+        study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
+    else:
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    try:
+        best_params = study.best_params
+        best_value = study.best_value
+    except ValueError:
+        logger.warning("QR-DQN tuning produced no completed trials. Returning empty result.")
+        best_params = {}
+        best_value = float("-inf")
+
+    return {
+        "best_params": best_params,
+        "best_value": float(best_value),
+        "selected_stage": "qrdqn",
+        "stage1_best_params": dict(best_params),
+        "stage1_best_value": float(best_value),
+        "stage2_best_params": {},
+        "stage2_best_value": float("-inf"),
+        "stage2_search_space": {},
         "study": study,
     }
 
@@ -439,12 +863,17 @@ def _score_tuning_trial(results: Dict, validation_bars: int) -> Tuple[float, Dic
     sortino = float(results.get("sortino_ratio", 0.0))
     max_dd = abs(float(results.get("max_drawdown", 0.0)))
     max_allowed_drawdown_pct = float(config.get("training", {}).get("max_allowed_drawdown_pct", 40.0))
-    trade_count = int(results.get("trade_count", results.get("num_trades", 0)))
+    trade_count = int(
+        results.get(
+            "economic_trade_count",
+            results.get("completed_trades", results.get("trade_count", results.get("num_trades", 0))),
+        )
+    )
     action_counts = _normalize_action_counts(results.get("action_counts"))
     total_actions = max(1, sum(action_counts.values()))
-    long_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (0, 1, 2)) / total_actions
-    short_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (3, 4, 5)) / total_actions
-    flat_action_pct = 100.0 * action_counts.get(6, 0) / total_actions
+    long_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in LONG_ACTIONS) / total_actions
+    short_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in SHORT_ACTIONS) / total_actions
+    flat_action_pct = 100.0 * action_counts.get(FLAT_ACTION, 0) / total_actions
     dominant_action_pct = max(long_action_pct, short_action_pct, flat_action_pct)
     active_actions = sum(1 for count in action_counts.values() if count > 0)
     min_trades = max(5, validation_bars // 250)
@@ -509,9 +938,18 @@ def _apply_trial_config_overrides(trial_overrides: Dict[str, float]) -> Dict[str
     if "reward_turnover_penalty" in trial_overrides:
         originals["reward_turnover_penalty"] = reward_cfg.get("turnover_penalty")
         reward_cfg["turnover_penalty"] = float(trial_overrides["reward_turnover_penalty"])
-    if "reward_calm_holding_bonus" in trial_overrides:
-        originals["reward_calm_holding_bonus"] = reward_cfg.get("calm_holding_bonus")
-        reward_cfg["calm_holding_bonus"] = float(trial_overrides["reward_calm_holding_bonus"])
+    if "reward_drawdown_penalty" in trial_overrides:
+        originals["reward_drawdown_penalty"] = reward_cfg.get("drawdown_penalty")
+        reward_cfg["drawdown_penalty"] = float(trial_overrides["reward_drawdown_penalty"])
+    if "reward_drawdown_penalty_threshold" in trial_overrides:
+        originals["reward_drawdown_penalty_threshold"] = reward_cfg.get("drawdown_penalty_threshold")
+        reward_cfg["drawdown_penalty_threshold"] = float(trial_overrides["reward_drawdown_penalty_threshold"])
+    if "reward_flat_time_penalty" in trial_overrides:
+        originals["reward_flat_time_penalty"] = reward_cfg.get("flat_time_penalty")
+        reward_cfg["flat_time_penalty"] = float(trial_overrides["reward_flat_time_penalty"])
+    if "reward_flat_time_grace_steps" in trial_overrides:
+        originals["reward_flat_time_grace_steps"] = reward_cfg.get("flat_time_grace_steps")
+        reward_cfg["flat_time_grace_steps"] = int(trial_overrides["reward_flat_time_grace_steps"])
 
     aug_cfg = config.setdefault("augmentation", {}).setdefault("synthetic_bears", {})
     if "synthetic_oversample_ratio" in trial_overrides:
@@ -528,12 +966,150 @@ def _restore_trial_config_overrides(originals: Dict[str, object]) -> None:
         reward_cfg["loss_multiplier"] = originals["reward_loss_multiplier"]
     if "reward_turnover_penalty" in originals:
         reward_cfg["turnover_penalty"] = originals["reward_turnover_penalty"]
-    if "reward_calm_holding_bonus" in originals:
-        reward_cfg["calm_holding_bonus"] = originals["reward_calm_holding_bonus"]
+    if "reward_drawdown_penalty" in originals:
+        reward_cfg["drawdown_penalty"] = originals["reward_drawdown_penalty"]
+    if "reward_drawdown_penalty_threshold" in originals:
+        reward_cfg["drawdown_penalty_threshold"] = originals["reward_drawdown_penalty_threshold"]
+    if "reward_flat_time_penalty" in originals:
+        reward_cfg["flat_time_penalty"] = originals["reward_flat_time_penalty"]
+    if "reward_flat_time_grace_steps" in originals:
+        reward_cfg["flat_time_grace_steps"] = originals["reward_flat_time_grace_steps"]
 
     aug_cfg = config.setdefault("augmentation", {}).setdefault("synthetic_bears", {})
     if "synthetic_oversample_ratio" in originals:
         aug_cfg["oversample_ratio"] = originals["synthetic_oversample_ratio"]
+
+
+def _apply_best_hyperparameters_to_config(best_hyperparameters: Dict) -> None:
+    """Apply tuned reward/augmentation/model params to the in-memory config."""
+    reward_cfg = config.setdefault("reward", {})
+    model_cfg = config.setdefault("model", {})
+    aug_cfg = config.setdefault("augmentation", {}).setdefault("synthetic_bears", {})
+    if "learning_rate" in best_hyperparameters:
+        model_cfg["learning_rate"] = float(best_hyperparameters["learning_rate"])
+    if "batch_size" in best_hyperparameters:
+        model_cfg["batch_size"] = int(best_hyperparameters["batch_size"])
+    if "buffer_size" in best_hyperparameters:
+        model_cfg["buffer_size"] = int(best_hyperparameters["buffer_size"])
+    if "learning_starts" in best_hyperparameters:
+        model_cfg["learning_starts"] = int(best_hyperparameters["learning_starts"])
+    if "train_freq" in best_hyperparameters:
+        model_cfg["train_freq"] = int(best_hyperparameters["train_freq"])
+    if "gradient_steps" in best_hyperparameters:
+        model_cfg["gradient_steps"] = int(best_hyperparameters["gradient_steps"])
+    if "target_update_interval" in best_hyperparameters:
+        model_cfg["target_update_interval"] = int(best_hyperparameters["target_update_interval"])
+    if "exploration_fraction" in best_hyperparameters:
+        model_cfg["exploration_fraction"] = float(best_hyperparameters["exploration_fraction"])
+    if "exploration_final_eps" in best_hyperparameters:
+        model_cfg["exploration_final_eps"] = float(best_hyperparameters["exploration_final_eps"])
+    if "n_steps" in best_hyperparameters:
+        model_cfg["n_steps"] = int(best_hyperparameters["n_steps"])
+    if "ent_coef" in best_hyperparameters:
+        model_cfg["ent_coef"] = float(best_hyperparameters["ent_coef"])
+    if "reward_loss_multiplier" in best_hyperparameters:
+        reward_cfg["loss_multiplier"] = float(best_hyperparameters["reward_loss_multiplier"])
+    if "reward_turnover_penalty" in best_hyperparameters:
+        reward_cfg["turnover_penalty"] = float(best_hyperparameters["reward_turnover_penalty"])
+    if "reward_drawdown_penalty" in best_hyperparameters:
+        reward_cfg["drawdown_penalty"] = float(best_hyperparameters["reward_drawdown_penalty"])
+    if "reward_drawdown_penalty_threshold" in best_hyperparameters:
+        reward_cfg["drawdown_penalty_threshold"] = float(best_hyperparameters["reward_drawdown_penalty_threshold"])
+    if "reward_flat_time_penalty" in best_hyperparameters:
+        reward_cfg["flat_time_penalty"] = float(best_hyperparameters["reward_flat_time_penalty"])
+    if "reward_flat_time_grace_steps" in best_hyperparameters:
+        reward_cfg["flat_time_grace_steps"] = int(best_hyperparameters["reward_flat_time_grace_steps"])
+    if "synthetic_oversample_ratio" in best_hyperparameters:
+        aug_cfg["oversample_ratio"] = float(best_hyperparameters["synthetic_oversample_ratio"])
+    if "gamma" in best_hyperparameters:
+        model_cfg["gamma"] = float(best_hyperparameters["gamma"])
+    if "gae_lambda" in best_hyperparameters:
+        model_cfg["gae_lambda"] = float(best_hyperparameters["gae_lambda"])
+
+
+def _candidate_trials_from_study(study, top_k: int) -> List[optuna.trial.FrozenTrial]:
+    """Return the strongest completed Optuna trials in descending score order."""
+    if study is None or top_k <= 0:
+        return []
+    completed = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+    completed.sort(key=lambda trial: float(trial.value), reverse=True)
+    return completed[:top_k]
+
+
+def _evaluate_finalist_candidates(
+    *,
+    candidates: List[Dict],
+    train_data: pd.DataFrame,
+    validation_data: pd.DataFrame,
+    holdout_validation_sets: List[pd.DataFrame],
+    baseline_scores: List[Dict[int, float]],
+    baseline_margin: float,
+    finalist_timesteps: int,
+    finalist_num_seeds: int,
+) -> Dict | None:
+    """Re-score finalist parameter sets across multiple seeds and a larger budget."""
+    if not candidates or finalist_num_seeds <= 0 or finalist_timesteps <= 0:
+        return None
+
+    training_cfg = config.get("training", {})
+    original_seed = config.get("seed", 42)
+    evaluation_sets = [validation_data] + holdout_validation_sets
+    finalists = []
+
+    for candidate in candidates:
+        params = dict(candidate.get("params", {}))
+        seed_scores = []
+        worst_seed_drawdown = float("-inf")
+        for seed_offset in range(finalist_num_seeds):
+            seed_value = int(original_seed) + seed_offset
+            config["seed"] = seed_value
+            overrides = _apply_trial_config_overrides(params)
+            try:
+                model, _ = train_walk_forward_model(
+                    train_data=train_data,
+                    validation_data=validation_data,
+                    initial_timesteps=finalist_timesteps,
+                    additional_timesteps=0,
+                    max_iterations=1,
+                    n_stagnant_loops=1,
+                    improvement_threshold=0.0,
+                    window_folder=None,
+                    run_hyperparameter_tuning=False,
+                    model_params=params,
+                )
+                evaluation_scores = []
+                seed_drawdowns = []
+                for dataset in evaluation_sets:
+                    results = evaluate_agent(model, dataset, verbose=0, deterministic=True)
+                    score, _ = _score_tuning_trial(results, len(dataset))
+                    evaluation_scores.append(score)
+                    seed_drawdowns.append(abs(float(results.get("max_drawdown", 0.0))))
+                composite_score, aggregate_diag = _summarize_trial_scores(
+                    evaluation_scores,
+                    baseline_scores,
+                    baseline_margin=baseline_margin,
+                )
+                seed_scores.append(composite_score)
+                worst_seed_drawdown = max(worst_seed_drawdown, max(seed_drawdowns) if seed_drawdowns else 0.0)
+            finally:
+                _restore_trial_config_overrides(overrides)
+        if seed_scores:
+            finalists.append(
+                {
+                    "params": params,
+                    "median_score": float(np.median(seed_scores)),
+                    "mean_score": float(np.mean(seed_scores)),
+                    "seed_scores": [float(score) for score in seed_scores],
+                    "worst_drawdown": float(worst_seed_drawdown if worst_seed_drawdown != float("-inf") else 0.0),
+                }
+            )
+
+    config["seed"] = original_seed
+    if not finalists:
+        return None
+
+    finalists.sort(key=lambda item: (item["median_score"], item["mean_score"], -item["worst_drawdown"]), reverse=True)
+    return finalists[0]
 
 
 def _align_feature_columns(reference_columns: List[str], df: pd.DataFrame) -> pd.DataFrame:
@@ -550,7 +1126,7 @@ def _score_constant_action_baselines(
     for dataset in evaluation_sets:
         aligned = _align_feature_columns(reference_columns, dataset)
         action_scores = {}
-        for action in range(7):
+        for action in range(ACTION_COUNT):
             try:
                 results = evaluate_agent(_ConstantActionModel(action), aligned, verbose=0, deterministic=True)
             except Exception as exc:
@@ -682,7 +1258,11 @@ def _sanitize_ohlc_outliers(df: pd.DataFrame) -> pd.DataFrame:
 
 def _recompute_clean_slice(df: pd.DataFrame) -> pd.DataFrame:
     """Rebuild indicators from cleaned raw OHLCV for a window slice."""
-    raw = extract_ohlcv_frame(df)
+    try:
+        raw = extract_ohlcv_frame(df)
+    except KeyError:
+        logger.warning("Window slice missing raw OHLCV columns; using provided frame without indicator recompute")
+        return df.copy()
     raw = _sanitize_ohlc_outliers(raw)
     return process_technical_indicators(raw)
 
@@ -761,6 +1341,13 @@ def build_window_report_payload(
             "return_pct": float(test_results.get("total_return_pct", 0.0)),
             "final_portfolio_value": float(test_results.get("final_portfolio_value", 0.0)),
             "trade_count": int(test_results.get("trade_count", 0)),
+            "rebalance_count": int(test_results.get("rebalance_count", test_results.get("trade_count", 0))),
+            "completed_trades": int(
+                test_results.get("completed_trades", test_results.get("economic_trade_count", 0))
+            ),
+            "economic_trade_count": int(
+                test_results.get("economic_trade_count", test_results.get("completed_trades", 0))
+            ),
             "hit_rate": float(test_results.get("hit_rate", 0.0)),
             "profitable_trades": int(test_results.get("profitable_trades", 0)),
             "prediction_accuracy": float(test_results.get("prediction_accuracy", 0.0)),
@@ -794,7 +1381,11 @@ def build_window_report_payload(
 def _augment_training_slice(train_data: pd.DataFrame, window_folder: str | None = None) -> Tuple[pd.DataFrame, Dict | None]:
     """Augment raw OHLCV and recompute indicators for the train slice."""
     aug_config = config.get("augmentation", {}).get("synthetic_bears", {})
-    raw_train = extract_ohlcv_frame(train_data)
+    try:
+        raw_train = extract_ohlcv_frame(train_data)
+    except KeyError:
+        logger.warning("Training slice missing raw OHLCV columns; skipping augmentation/recompute fallback")
+        return train_data.copy(), None
     raw_train = _sanitize_ohlc_outliers(raw_train)
     if not aug_config.get("enabled", False):
         return process_technical_indicators(raw_train), None
@@ -822,7 +1413,13 @@ def _augment_training_slice(train_data: pd.DataFrame, window_folder: str | None 
 def _drop_unused_model_columns(datasets: List[pd.DataFrame]) -> None:
     """Drop redundant raw columns after feature generation/scaling."""
     risk_cfg = config.get("risk_management", {})
-    needs_ohlc = risk_cfg.get("enabled", False) or risk_cfg.get("dynamic_sl_tp", {}).get("enabled", False)
+    needs_ohlc = (
+        risk_cfg.get("enabled", False)
+        or risk_cfg.get("dynamic_sl_tp", {}).get("enabled", False)
+        or risk_cfg.get("stop_loss", {}).get("enabled", False)
+        or risk_cfg.get("take_profit", {}).get("enabled", False)
+        or risk_cfg.get("trailing_stop", {}).get("enabled", False)
+    )
     cols_to_drop = ['volume', 'Volume', 'SMA', 'EMA', 'VWAP', 'PSAR', 'OBV', 'VOLUME_NORM', 'DOW', 'position']
     if not needs_ohlc:
         cols_to_drop.extend(['open', 'Open', 'OPEN', 'high', 'low', 'High', 'Low', 'HIGH', 'LOW'])
@@ -830,6 +1427,112 @@ def _drop_unused_model_columns(datasets: List[pd.DataFrame]) -> None:
         cols_present = [c for c in cols_to_drop if c in df.columns]
         if cols_present:
             df.drop(columns=cols_present, inplace=True)
+
+
+def _current_lstm_tuning_scope() -> str:
+    """Return whether LSTM tuning happens once per session or per window."""
+    lstm_tuning_cfg = config.get("indicators", {}).get("lstm_features", {}).get("tuning", {})
+    scope = str(lstm_tuning_cfg.get("scope", "session")).lower()
+    if scope not in {"session", "per_window"}:
+        return "session"
+    return scope
+
+
+def _prepare_scaled_window_inputs(
+    train_data: pd.DataFrame,
+    validation_data: pd.DataFrame,
+    test_data: pd.DataFrame | None = None,
+    *,
+    window_folder: str | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, Dict | None]:
+    """Apply augmentation/recompute/scaling before any VAE or PPO fitting."""
+    prepared_train, synth_metadata = _augment_training_slice(train_data.copy(), window_folder)
+    prepared_val = _recompute_clean_slice(validation_data.copy())
+    prepared_test = _recompute_clean_slice(test_data.copy()) if test_data is not None else None
+
+    scaling_test_frame = prepared_test.copy() if prepared_test is not None else prepared_val.copy()
+    scaling_cols = get_standardized_column_names(prepared_train)
+    scaler_type = config.get("normalization", {}).get("scaler_type", "robust")
+    _, prepared_train, prepared_val, scaled_test = scale_window(
+        train_data=prepared_train,
+        val_data=prepared_val,
+        test_data=scaling_test_frame,
+        cols_to_scale=scaling_cols,
+        feature_range=(-1, 1),
+        window_folder=window_folder,
+        scaler_type=scaler_type,
+    )
+    if prepared_test is not None:
+        prepared_test = scaled_test
+    return prepared_train, prepared_val, prepared_test, synth_metadata
+
+
+def _attach_latent_features(
+    train_df: pd.DataFrame,
+    validation_df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    *,
+    lstm_params: Dict,
+    feature_columns: List[str],
+    checkpoint_path: str | None = None,
+    save_path: str | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, List[str]]:
+    """Fit a VAE on the canonical market features and attach LATENT_F* columns."""
+    lstm_generator = LSTMFeatureGenerator(
+        lookback=lstm_params["lookback"],
+        hidden_size=lstm_params["hidden_size"],
+        num_layers=lstm_params["num_layers"],
+        output_size=lstm_params["output_size"],
+        feature_columns=feature_columns,
+        beta=lstm_params.get("beta", 0.001),
+        kl_warmup_epochs=lstm_params.get("kl_warmup_epochs", 10),
+        pretrain_epochs=lstm_params.get("pretrain_epochs", 50),
+        pretrain_lr=lstm_params.get("pretrain_lr", 0.001),
+        pretrain_batch_size=lstm_params.get("pretrain_batch_size", 64),
+        pretrain_patience=lstm_params.get("pretrain_patience", 10),
+        pretrain_min_delta=lstm_params.get("pretrain_min_delta", 0.0001),
+    )
+    lstm_generator.fit(
+        train_df=train_df[feature_columns],
+        validation_df=validation_df[feature_columns],
+        checkpoint_path=checkpoint_path,
+    )
+
+    datasets = [train_df, validation_df] + ([test_df] if test_df is not None else [])
+    latent_columns = [f"LATENT_F{i}" for i in range(lstm_generator.output_size)]
+    for dataset in datasets:
+        latent_frame = lstm_generator.transform(dataset[feature_columns].copy())
+        for col in latent_columns:
+            dataset[col] = latent_frame[col]
+
+    if save_path:
+        lstm_generator.save(save_path)
+
+    return train_df, validation_df, test_df, latent_columns
+
+
+def _apply_representation_mode(
+    datasets: List[pd.DataFrame],
+    *,
+    market_feature_columns: List[str],
+    latent_columns: List[str],
+) -> None:
+    """Drop columns according to the configured representation mode."""
+    mode = get_representation_mode()
+    if mode == "engineered_only":
+        drop_columns = latent_columns
+    elif mode == "latent_only":
+        drop_columns = market_feature_columns
+    else:
+        drop_columns = []
+
+    if not drop_columns:
+        return
+
+    for dataset in datasets:
+        cols_present = [col for col in drop_columns if col in dataset.columns]
+        if cols_present:
+            dataset.drop(columns=cols_present, inplace=True)
 
 
 def _prepare_tuning_inputs(
@@ -840,43 +1543,30 @@ def _prepare_tuning_inputs(
     lstm_params: Dict | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict | None]:
     """Prepare train/validation inputs for PPO tuning using the window pipeline."""
-    prepared_train, synth_metadata = _augment_training_slice(train_data.copy(), window_folder)
-    prepared_val = _recompute_clean_slice(validation_data.copy())
+    prepared_train, prepared_val, _, synth_metadata = _prepare_scaled_window_inputs(
+        train_data,
+        validation_data,
+        window_folder=window_folder,
+    )
+    market_feature_columns = get_market_feature_columns(prepared_train, representation_mode="hybrid")
+    latent_columns: List[str] = []
 
-    if lstm_params is not None:
-        tuning_lstm_generator = LSTMFeatureGenerator(
-            lookback=lstm_params["lookback"],
-            hidden_size=lstm_params["hidden_size"],
-            num_layers=lstm_params["num_layers"],
-            output_size=lstm_params["output_size"],
-            beta=lstm_params.get("beta", 0.001),
-            kl_warmup_epochs=lstm_params.get("kl_warmup_epochs", 10),
-            pretrain_epochs=lstm_params.get("pretrain_epochs", 50),
-            pretrain_lr=lstm_params.get("pretrain_lr", 0.001),
-            pretrain_batch_size=lstm_params.get("pretrain_batch_size", 64),
-            pretrain_patience=lstm_params.get("pretrain_patience", 10),
-            pretrain_min_delta=lstm_params.get("pretrain_min_delta", 0.0001),
+    if lstm_params is not None and get_representation_mode() != "engineered_only" and market_feature_columns:
+        checkpoint_path = f"{window_folder}/lstm_autoencoder_tuning_checkpoint.pt" if window_folder else None
+        prepared_train, prepared_val, _, latent_columns = _attach_latent_features(
+            prepared_train,
+            prepared_val,
+            None,
+            lstm_params=lstm_params,
+            feature_columns=market_feature_columns,
+            checkpoint_path=checkpoint_path,
+            save_path=None,
         )
-        checkpoint_path = None
-        if window_folder:
-            checkpoint_path = f"{window_folder}/lstm_autoencoder_tuning_checkpoint.pt"
-        tuning_lstm_generator.fit(
-            train_df=prepared_train,
-            validation_df=prepared_val,
-            checkpoint_path=checkpoint_path
-        )
-        prepared_train = tuning_lstm_generator.transform(prepared_train)
-        prepared_val = tuning_lstm_generator.transform(prepared_val)
 
-    tuning_cols = get_standardized_column_names(prepared_train)
-    tuning_scaler_type = config.get("normalization", {}).get("scaler_type", "robust")
-    _, prepared_train, prepared_val, _ = scale_window(
-        train_data=prepared_train,
-        val_data=prepared_val,
-        test_data=prepared_val.copy(),
-        cols_to_scale=tuning_cols,
-        feature_range=(-1, 1),
-        scaler_type=tuning_scaler_type
+    _apply_representation_mode(
+        [prepared_train, prepared_val],
+        market_feature_columns=market_feature_columns,
+        latent_columns=latent_columns,
     )
     _drop_unused_model_columns([prepared_train, prepared_val])
     return prepared_train, prepared_val, synth_metadata
@@ -891,6 +1581,8 @@ def _current_lstm_params_from_config() -> Dict | None:
         "hidden_size": lstm_config.get("hidden_size", 64),
         "num_layers": lstm_config.get("num_layers", 1),
         "output_size": lstm_config.get("output_size", 8),
+        "beta": lstm_config.get("beta", 0.001),
+        "kl_warmup_epochs": lstm_config.get("kl_warmup_epochs", 10),
         "pretrain_epochs": lstm_config.get("pretrain_epochs", 50),
         "pretrain_lr": lstm_config.get("pretrain_lr", 0.001),
         "pretrain_batch_size": lstm_config.get("pretrain_batch_size", 64),
@@ -1039,6 +1731,7 @@ def _build_tuning_env(
     *,
     random_start_pct: float | None = None,
     min_episode_steps: int = 2,
+    n_envs_override: int | None = None,
 ) -> Tuple[object, int]:
     """Mirror train.py rollout collection during policy tuning."""
     base_seed = int(config.get("seed", 42))
@@ -1052,7 +1745,7 @@ def _build_tuning_env(
         min_episode_steps=min_episode_steps,
     )
     tuning_config = config.get("hyperparameter_tuning", {})
-    n_envs = int(tuning_config.get("n_envs", config.get("training", {}).get("n_envs", 4)))
+    n_envs = int(n_envs_override if n_envs_override is not None else tuning_config.get("n_envs", config.get("training", {}).get("n_envs", 4)))
     n_envs = max(1, n_envs)
 
     def make_env(df, **kwargs):
@@ -1108,6 +1801,33 @@ def _valid_batch_size_choices(total_rollout_steps: int) -> List[int]:
         return valid
     fallback = [size for size in candidates if size <= total_rollout_steps]
     return fallback if fallback else [total_rollout_steps]
+
+
+def _resolve_staged_trial_counts(n_trials: int, stage1_trials: int, stage2_trials: int) -> Tuple[int, int]:
+    """Fit staged tuning trial counts inside the requested total budget."""
+    n_trials = max(0, int(n_trials))
+    stage1_trials = max(0, int(stage1_trials))
+    stage2_trials = max(0, int(stage2_trials))
+
+    if n_trials <= 0:
+        return 0, 0
+
+    total_requested = stage1_trials + stage2_trials
+    if total_requested <= 0:
+        return n_trials, 0
+    if total_requested <= n_trials:
+        return stage1_trials, stage2_trials
+
+    if stage1_trials == 0:
+        return 0, n_trials
+    if stage2_trials == 0:
+        return n_trials, 0
+
+    stage1_share = stage1_trials / total_requested
+    resolved_stage1 = max(1, int(round(n_trials * stage1_share)))
+    resolved_stage1 = min(resolved_stage1, n_trials - 1) if n_trials > 1 else n_trials
+    resolved_stage2 = max(0, n_trials - resolved_stage1)
+    return resolved_stage1, resolved_stage2
 
 def load_tradingview_data(csv_filepath: str | None = None) -> pd.DataFrame:
     """
@@ -1182,10 +1902,8 @@ def load_tradingview_data(csv_filepath: str | None = None) -> pd.DataFrame:
             # Set time as index
             df = df.set_index('time')
             df = df.sort_index()
-            if df.index.has_duplicates:
-                dup_count = int(df.index.duplicated(keep='last').sum())
-                logger.warning(f"Dropping {dup_count} duplicate timestamp rows from TradingView data")
-                df = df[~df.index.duplicated(keep='last')]
+            df = select_session_dominant_contract(df, keep='last')
+            df = ensure_numeric(df, ['open', 'high', 'low', 'close', 'volume'], drop_invalid=True)
             logger.info("Successfully converted time column to datetime index")
         except Exception as e:
             logger.error(f"Error converting time column: {e}")
@@ -1226,8 +1944,8 @@ def load_tradingview_data(csv_filepath: str | None = None) -> pd.DataFrame:
         logger.error(traceback.format_exc())
         return None
 
-# Import filter_market_hours from shared utilities
-from utils.data_utils import filter_market_hours
+# Import shared data-session helpers
+from utils.data_utils import filter_market_hours, market_hours_only_enabled
 
 def get_trading_days(data: pd.DataFrame) -> List[str]:
     """
@@ -1557,6 +2275,98 @@ def export_consolidated_trade_history(all_window_results: List[Dict], session_fo
     logger.info(f"Exported consolidated trade history from {len(windows_with_history)} windows "
                f"with {len(all_trades)} trades to {export_path}")
 
+
+def _run_window_hyperparameter_tuning(
+    *,
+    window_data_list: List[Dict],
+    anchor_idx: int,
+    tuning_trials: int,
+    eval_metric: str,
+    session_lstm_params: Dict | None,
+    lstm_tuning_scope: str,
+    session_folder: str,
+) -> Tuple[Dict, Dict]:
+    """Tune PPO/RecurrentPPO on a specific walk-forward anchor window."""
+    lstm_config = config.get("indicators", {}).get("lstm_features", {})
+    lstm_tuning_config = lstm_config.get("tuning", {})
+    anchor_window = window_data_list[anchor_idx]
+    anchor_window_num = anchor_window["window_idx"]
+
+    logger.info("Starting hyperparameter tuning on window %d data", anchor_window_num)
+    tuning_train_raw = anchor_window["train_data"].copy()
+    tuning_val_raw = anchor_window["validation_data"].copy()
+
+    tuning_lstm_params = session_lstm_params
+    if (
+        lstm_config.get("enabled", False)
+        and get_representation_mode() != "engineered_only"
+        and lstm_tuning_config.get("enabled", False)
+        and lstm_tuning_scope == "per_window"
+    ):
+        logger.info("Tuning LSTM hyperparameters on prepared window %d before PPO tuning", anchor_window_num)
+        prep_train, prep_val, _, prep_synth = _prepare_scaled_window_inputs(
+            tuning_train_raw,
+            tuning_val_raw,
+            window_folder=anchor_window["window_folder"],
+        )
+        if prep_synth:
+            logger.info(
+                f"Window {anchor_window_num} PPO-tuning prep augmentation added {prep_synth.get('synthetic_bars', 0)} synthetic bars "
+                f"across {prep_synth.get('num_segments', 0)} segments"
+            )
+        prep_feature_columns = get_market_feature_columns(prep_train, representation_mode="hybrid")
+        if prep_feature_columns:
+            tuning_lstm_params = tune_lstm_hyperparameters(
+                train_data=prep_train[prep_feature_columns],
+                validation_data=prep_val[prep_feature_columns],
+                tuning_config=lstm_tuning_config,
+                base_config=lstm_config,
+                feature_columns=prep_feature_columns,
+                window_folder=anchor_window["window_folder"],
+            )
+
+    tuning_train, tuning_val, tuning_synth_metadata = _prepare_tuning_inputs(
+        tuning_train_raw,
+        tuning_val_raw,
+        window_folder=anchor_window["window_folder"],
+        lstm_params=tuning_lstm_params,
+    )
+    if tuning_synth_metadata:
+        logger.info(
+            f"Window {anchor_window_num} tuning augmentation added {tuning_synth_metadata.get('synthetic_bars', 0)} synthetic bars "
+            f"across {tuning_synth_metadata.get('num_segments', 0)} segments"
+        )
+
+    tuning_holdout_sets: List[pd.DataFrame] = []
+    holdout_window_limit = int(config.get("hyperparameter_tuning", {}).get("holdout_windows", 2))
+    for holdout_window in window_data_list[anchor_idx + 1:anchor_idx + 1 + holdout_window_limit]:
+        _, holdout_val, _ = _prepare_tuning_inputs(
+            holdout_window["train_data"],
+            holdout_window["validation_data"],
+            window_folder=holdout_window["window_folder"],
+            lstm_params=tuning_lstm_params,
+        )
+        tuning_holdout_sets.append(_align_feature_columns(list(tuning_train.columns), holdout_val))
+
+    tuning_result = hyperparameter_tuning(
+        train_data=tuning_train,
+        validation_data=tuning_val,
+        n_trials=tuning_trials,
+        window_folder=anchor_window["window_folder"],
+        eval_metric=eval_metric,
+        holdout_validation_sets=tuning_holdout_sets,
+    )
+    best_hyperparameters = tuning_result.get("best_params", {})
+    _apply_best_hyperparameters_to_config(best_hyperparameters)
+
+    tuning_summary = {k: v for k, v in tuning_result.items() if k != "study"}
+    save_json(best_hyperparameters, f"{session_folder}/reports/best_hyperparameters_window_{anchor_window_num}.json")
+    save_json(tuning_summary, f"{session_folder}/reports/hyperparameter_tuning_window_{anchor_window_num}.json")
+    save_json(best_hyperparameters, f"{session_folder}/reports/best_hyperparameters.json")
+    save_json(tuning_summary, f"{session_folder}/reports/hyperparameter_tuning_summary.json")
+    logger.info("Best hyperparameters for window %d anchor: %s", anchor_window_num, best_hyperparameters)
+    return best_hyperparameters, tuning_summary
+
 def process_single_window(
     window_idx: int,
     num_windows: int,
@@ -1572,7 +2382,9 @@ def process_single_window(
     improvement_threshold: float,
     run_hyperparameter_tuning: bool,
     tuning_trials: int,
-    best_hyperparameters: Dict = None
+    best_hyperparameters: Dict = None,
+    resolved_lstm_params: Dict | None = None,
+    lstm_tuning_scope: str = "session",
 ) -> Dict:
     """
     Process a single window in the walk-forward analysis.
@@ -1591,114 +2403,63 @@ def process_single_window(
     }
     save_json(window_periods, f"{window_folder}/window_periods.json")
 
-    # Augment the raw train slice first, then recompute indicators so synthetic
-    # episodes have internally consistent features.
-    train_data, synthetic_bears_metadata = _augment_training_slice(train_data, window_folder)
-    validation_data = _recompute_clean_slice(validation_data)
-    test_data = _recompute_clean_slice(test_data)
+    train_data, validation_data, test_data, synthetic_bears_metadata = _prepare_scaled_window_inputs(
+        train_data,
+        validation_data,
+        test_data,
+        window_folder=window_folder,
+    )
 
-    # Generate LSTM features if enabled (train per window on that window's training data)
+    representation_mode = get_representation_mode()
     lstm_config = config.get("indicators", {}).get("lstm_features", {})
-    if lstm_config.get("enabled", False):
-        # Check if LSTM hyperparameter tuning is enabled
+    market_feature_columns = get_market_feature_columns(train_data, representation_mode="hybrid")
+    latent_columns: List[str] = []
+
+    if lstm_config.get("enabled", False) and representation_mode != "engineered_only" and market_feature_columns:
         lstm_tuning_config = lstm_config.get("tuning", {})
-        if lstm_tuning_config.get("enabled", False):
-            window_logger.info("Tuning LSTM hyperparameters for this window")
+        lstm_params = resolved_lstm_params
+
+        if lstm_tuning_config.get("enabled", False) and lstm_tuning_scope == "per_window":
+            window_logger.info("Tuning LSTM hyperparameters for this window on canonical market features")
             lstm_params = tune_lstm_hyperparameters(
-                train_data=train_data,
-                validation_data=validation_data,
+                train_data=train_data[market_feature_columns],
+                validation_data=validation_data[market_feature_columns],
                 tuning_config=lstm_tuning_config,
                 base_config=lstm_config,
+                feature_columns=market_feature_columns,
                 window_folder=window_folder
             )
             window_logger.info(f"Best LSTM params: hidden={lstm_params['hidden_size']}, "
                              f"layers={lstm_params['num_layers']}, output={lstm_params['output_size']}, "
                              f"lookback={lstm_params['lookback']}, lr={lstm_params['pretrain_lr']:.6f}")
-        else:
-            # Use config values directly
-            lstm_params = {
-                "lookback": lstm_config.get("lookback", 20),
-                "hidden_size": lstm_config.get("hidden_size", 32),
-                "num_layers": lstm_config.get("num_layers", 1),
-                "output_size": lstm_config.get("output_size", 8),
-                "beta": lstm_config.get("beta", 0.001),
-                "kl_warmup_epochs": lstm_config.get("kl_warmup_epochs", 10),
-                "pretrain_epochs": lstm_config.get("pretrain_epochs", 50),
-                "pretrain_lr": lstm_config.get("pretrain_lr", 0.001),
-                "pretrain_batch_size": lstm_config.get("pretrain_batch_size", 64),
-                "pretrain_patience": lstm_config.get("pretrain_patience", 10),
-                "pretrain_min_delta": lstm_config.get("pretrain_min_delta", 0.0001)
-            }
+        elif lstm_params is None:
+            lstm_params = _current_lstm_params_from_config()
 
-        window_logger.info("Training LSTM autoencoder for this window")
-        lstm_generator = LSTMFeatureGenerator(
-            lookback=lstm_params["lookback"],
-            hidden_size=lstm_params["hidden_size"],
-            num_layers=lstm_params["num_layers"],
-            output_size=lstm_params["output_size"],
-            beta=lstm_params.get("beta", 0.001),
-            kl_warmup_epochs=lstm_params.get("kl_warmup_epochs", 10),
-            pretrain_epochs=lstm_params.get("pretrain_epochs", 50),
-            pretrain_lr=lstm_params.get("pretrain_lr", 0.001),
-            pretrain_batch_size=lstm_params.get("pretrain_batch_size", 64),
-            pretrain_patience=lstm_params.get("pretrain_patience", 10),
-            pretrain_min_delta=lstm_params.get("pretrain_min_delta", 0.0001)
-        )
-        # Pre-train on this window's training data
-        checkpoint_path = f"{window_folder}/lstm_autoencoder_checkpoint.pt"
-        lstm_generator.fit(
-            train_df=train_data,
-            validation_df=validation_data,
-            checkpoint_path=checkpoint_path
-        )
-        # Transform all datasets using the trained encoder
-        train_data = lstm_generator.transform(train_data)
-        validation_data = lstm_generator.transform(validation_data)
-        test_data = lstm_generator.transform(test_data)
-        # Save the generator for this window
-        lstm_generator.save(f"{window_folder}/lstm_generator.pkl")
-        window_logger.info(f"Added {lstm_generator.output_size} LSTM features")
+        if lstm_params is not None:
+            window_logger.info(
+                "Training LSTM autoencoder for this window on %d market features (%s mode)",
+                len(market_feature_columns),
+                representation_mode,
+            )
+            checkpoint_path = f"{window_folder}/lstm_autoencoder_checkpoint.pt"
+            generator_path = f"{window_folder}/lstm_generator.pkl"
+            train_data, validation_data, test_data, latent_columns = _attach_latent_features(
+                train_data,
+                validation_data,
+                test_data,
+                lstm_params=lstm_params,
+                feature_columns=market_feature_columns,
+                checkpoint_path=checkpoint_path,
+                save_path=generator_path,
+            )
+            window_logger.info(f"Added {len(latent_columns)} latent features")
 
-    # Scale technical indicator columns within this window to prevent data leakage
-
-    # Get columns to scale using the helper function from normalization module
-    cols_to_scale = get_standardized_column_names(train_data)
-
-    # Get scaler type from config
-    scaler_type = config.get("normalization", {}).get("scaler_type", "robust")
-
-    # Scale the data
-    scaler, train_data, validation_data, test_data = scale_window(
-        train_data=train_data,
-        val_data=validation_data,
-        test_data=test_data,
-        cols_to_scale=cols_to_scale,
-        feature_range=(-1, 1),
-        window_folder=window_folder,
-        scaler_type=scaler_type
+    _apply_representation_mode(
+        [train_data, validation_data, test_data],
+        market_feature_columns=market_feature_columns,
+        latent_columns=latent_columns,
     )
-
-    # Drop redundant columns (raw versions that have normalized equivalents, unused OHLC)
-    # Keep high/low if ANY ATR-based SL/TP is used (needed for accurate SL/TP checking)
-    risk_config = config.get("risk_management", {})
-    risk_enabled = risk_config.get("enabled", False)
-    dynamic_sl_tp_enabled = risk_config.get("dynamic_sl_tp", {}).get("enabled", False)
-    sl_mode_atr = risk_config.get("stop_loss", {}).get("mode") == "atr"
-    tp_mode_atr = risk_config.get("take_profit", {}).get("mode") == "atr"
-    needs_ohlc = risk_enabled or dynamic_sl_tp_enabled or sl_mode_atr or tp_mode_atr
-
-    cols_to_drop = ['volume', 'Volume', 'SMA', 'EMA',
-                    'VWAP', 'PSAR', 'OBV', 'VOLUME_NORM', 'DOW', 'position']
-    if not needs_ohlc:
-        # Only drop OHLC columns if risk management is not used
-        cols_to_drop.extend(['open', 'Open', 'OPEN'])
-        cols_to_drop.extend(['high', 'low', 'High', 'Low', 'HIGH', 'LOW'])
-        cols_to_drop.extend(['close', 'Close', 'CLOSE'])
-
-    for df in [train_data, validation_data, test_data]:
-        cols_present = [c for c in cols_to_drop if c in df.columns]
-        if cols_present:
-            df.drop(columns=cols_present, inplace=True)
+    _drop_unused_model_columns([train_data, validation_data, test_data])
 
     logger.info(f"Model input columns ({len(train_data.columns)}): {train_data.columns.tolist()}")
 
@@ -1715,7 +2476,7 @@ def process_single_window(
         run_hyperparameter_tuning=run_hyperparameter_tuning,
         tuning_trials=tuning_trials,
         model_params=best_hyperparameters,  # Pass the best hyperparameters to use
-        window_label=f"[W{window_idx+1}/{num_windows}] "
+        window_label=f"[W{window_idx}/{num_windows}] "
     )
 
     # Save loss history if available
@@ -1726,18 +2487,6 @@ def process_single_window(
     # Plot training progress (pass iterations list)
     plot_training_progress(training_stats.get("iterations", training_stats), window_folder)
 
-    # Load the best model for testing (try RecurrentPPO first if enabled)
-    seq_config = config.get("sequence_model", {})
-    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
-
-    if use_recurrent:
-        try:
-            model = RecurrentPPO.load(f"{window_folder}/model")
-        except Exception:
-            model = PPO.load(f"{window_folder}/model")
-    else:
-        model = PPO.load(f"{window_folder}/model")
-    
     # Get risk management parameters from config
     risk_config = config.get("risk_management", {})
     risk_enabled = risk_config.get("enabled", False)
@@ -1859,6 +2608,13 @@ def process_single_window(
         "return": test_results["total_return_pct"],
         "portfolio_value": test_results["final_portfolio_value"],
         "trade_count": test_results["trade_count"],
+        "rebalance_count": test_results.get("rebalance_count", test_results["trade_count"]),
+        "economic_trade_count": test_results.get(
+            "economic_trade_count",
+            test_results.get("completed_trades", 0),
+        ),
+        "action_history": test_results.get("action_history", []),
+        "trade_history": test_results.get("trade_history", []),
         "final_position": test_results["final_position"],
         "train_start": train_data.index[0],
         "train_end": train_data.index[-1],
@@ -1932,7 +2688,7 @@ def walk_forward_testing(
         set_global_seed(int(config.get("seed", 42)))
 
     # Create session folder within models directory
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = _session_timestamp()
     session_folder = f'models/session_{timestamp}'
     os.makedirs(f'{session_folder}/models', exist_ok=True)
     os.makedirs(f'{session_folder}/plots', exist_ok=True)
@@ -1971,12 +2727,12 @@ def walk_forward_testing(
         return error_report
     
     # Filter data to include only market hours if configured
-    market_hours_only = config.get("data", {}).get("market_hours_only", True)
+    market_hours_only = market_hours_only_enabled(config)
     if market_hours_only:
-        logger.info("Filtering data to configured market hours only")
+        logger.info("Filtering data to NYSE RTH only")
         data = filter_market_hours(data)
     else:
-        logger.info("Using full-session data without NYSE market-hours filtering")
+        logger.info("Using full-session data without NYSE RTH filtering")
     
     # Get list of unique trading days in the dataset
     trading_days = get_trading_days(data)
@@ -2019,6 +2775,14 @@ def walk_forward_testing(
     # If max_workers is 0, use n_processes
     if max_workers <= 0:
         max_workers = n_processes
+
+    tuning_config = config.get("hyperparameter_tuning", {})
+    retune_every_windows = int(tuning_config.get("retune_every_windows", 0))
+    if run_hyperparameter_tuning and use_parallel and retune_every_windows > 0:
+        logger.warning(
+            "Per-window retuning requires sequential walk-forward processing. Disabling parallel window execution."
+        )
+        use_parallel = False
     
     # Log parallelization settings
     if use_parallel:
@@ -2060,6 +2824,8 @@ def walk_forward_testing(
     
     # Add enabled indicators to session parameters
     session_params["enabled_indicators"] = enabled_indicators
+    session_params["representation_mode"] = get_representation_mode()
+    session_params["lstm_tuning_scope"] = _current_lstm_tuning_scope()
     
     save_json(session_params, f'{session_folder}/reports/session_parameters.json')
     
@@ -2128,6 +2894,60 @@ def walk_forward_testing(
             "test_data": test_data,
             "window_folder": window_folder
         })
+
+    lstm_config = config.get("indicators", {}).get("lstm_features", {})
+    lstm_tuning_config = lstm_config.get("tuning", {})
+    lstm_tuning_scope = _current_lstm_tuning_scope()
+    session_lstm_params = None
+    session_encoder_feature_columns = None
+    if lstm_config.get("enabled", False) and get_representation_mode() != "engineered_only":
+        session_lstm_params = _current_lstm_params_from_config()
+        if lstm_tuning_config.get("enabled", False) and lstm_tuning_scope == "session" and window_data_list:
+            first_window = window_data_list[0]
+            logger.info("Running session-level LSTM tuning on the first prepared window")
+            session_tune_train, session_tune_val, _, session_tune_synth = _prepare_scaled_window_inputs(
+                first_window["train_data"],
+                first_window["validation_data"],
+                window_folder=first_window["window_folder"],
+            )
+            if session_tune_synth:
+                logger.info(
+                    f"First-window LSTM tuning augmentation added {session_tune_synth.get('synthetic_bars', 0)} synthetic bars "
+                    f"across {session_tune_synth.get('num_segments', 0)} segments"
+                )
+            session_feature_columns = get_market_feature_columns(session_tune_train, representation_mode="hybrid")
+            if session_feature_columns:
+                session_encoder_feature_columns = list(session_feature_columns)
+                session_lstm_params = tune_lstm_hyperparameters(
+                    train_data=session_tune_train[session_feature_columns],
+                    validation_data=session_tune_val[session_feature_columns],
+                    tuning_config=lstm_tuning_config,
+                    base_config=lstm_config,
+                    feature_columns=session_feature_columns,
+                    window_folder=first_window["window_folder"],
+                )
+                logger.info(
+                    "Resolved session LSTM params: hidden=%s layers=%s output=%s lookback=%s lr=%.6f",
+                    session_lstm_params["hidden_size"],
+                    session_lstm_params["num_layers"],
+                    session_lstm_params["output_size"],
+                    session_lstm_params["lookback"],
+                    session_lstm_params["pretrain_lr"],
+                )
+        elif window_data_list:
+            session_preview_train, session_preview_val, _, _ = _prepare_scaled_window_inputs(
+                window_data_list[0]["train_data"],
+                window_data_list[0]["validation_data"],
+                window_folder=None,
+            )
+            session_encoder_feature_columns = get_market_feature_columns(
+                session_preview_train,
+                representation_mode="hybrid",
+            )
+    session_params["resolved_lstm_params"] = session_lstm_params
+    session_params["encoder_feature_columns"] = session_encoder_feature_columns
+    session_params["latent_width"] = int(session_lstm_params["output_size"]) if session_lstm_params else 0
+    save_json(session_params, f'{session_folder}/reports/session_parameters.json')
     
     if tune_augmentation_only:
         summary = run_augmentation_sweep(
@@ -2138,91 +2958,17 @@ def walk_forward_testing(
         summary["timestamp"] = timestamp
         return summary
 
-    # Do hyperparameter tuning only once on the first window if enabled
-    if run_hyperparameter_tuning:
-        logger.info("Starting hyperparameter tuning on first window data")
-        first_window = window_data_list[0]
-        tuning_train_raw = first_window["train_data"].copy()
-        tuning_val_raw = first_window["validation_data"].copy()
-
-        lstm_config = config.get("indicators", {}).get("lstm_features", {})
-        tuning_lstm_params = None
-        if lstm_config.get("enabled", False):
-            lstm_tuning_config = lstm_config.get("tuning", {})
-            if lstm_tuning_config.get("enabled", False):
-                logger.info("Tuning LSTM hyperparameters on first window before PPO tuning")
-                tuning_lstm_params = tune_lstm_hyperparameters(
-                    train_data=tuning_train_raw,
-                    validation_data=tuning_val_raw,
-                    tuning_config=lstm_tuning_config,
-                    base_config=lstm_config,
-                    window_folder=first_window["window_folder"]
-                )
-            else:
-                tuning_lstm_params = {
-                    "lookback": lstm_config.get("lookback", 20),
-                    "hidden_size": lstm_config.get("hidden_size", 32),
-                    "num_layers": lstm_config.get("num_layers", 1),
-                    "output_size": lstm_config.get("output_size", 8),
-                    "beta": lstm_config.get("beta", 0.001),
-                    "kl_warmup_epochs": lstm_config.get("kl_warmup_epochs", 10),
-                    "pretrain_epochs": lstm_config.get("pretrain_epochs", 50),
-                    "pretrain_lr": lstm_config.get("pretrain_lr", 0.001),
-                    "pretrain_batch_size": lstm_config.get("pretrain_batch_size", 64),
-                    "pretrain_patience": lstm_config.get("pretrain_patience", 10),
-                    "pretrain_min_delta": lstm_config.get("pretrain_min_delta", 0.0001),
-                }
-
-        tuning_train, tuning_val, tuning_synth_metadata = _prepare_tuning_inputs(
-            tuning_train_raw,
-            tuning_val_raw,
-            window_folder=first_window["window_folder"],
-            lstm_params=tuning_lstm_params,
-        )
-        if tuning_synth_metadata:
-            logger.info(
-                f"First-window tuning augmentation added {tuning_synth_metadata.get('synthetic_bars', 0)} synthetic bars "
-                f"across {tuning_synth_metadata.get('num_segments', 0)} segments"
-            )
-
-        tuning_holdout_sets: List[pd.DataFrame] = []
-        holdout_window_limit = int(config.get("hyperparameter_tuning", {}).get("holdout_windows", 2))
-        for holdout_window in window_data_list[1:1 + holdout_window_limit]:
-            holdout_train, holdout_val, _ = _prepare_tuning_inputs(
-                holdout_window["train_data"],
-                holdout_window["validation_data"],
-                window_folder=holdout_window["window_folder"],
-                lstm_params=tuning_lstm_params,
-            )
-            tuning_holdout_sets.append(_align_feature_columns(list(tuning_train.columns), holdout_val))
-
-        tuning_result = hyperparameter_tuning(
-            train_data=tuning_train,
-            validation_data=tuning_val,
-            n_trials=tuning_trials,
-            window_folder=first_window["window_folder"],
+    retune_during_loop = run_hyperparameter_tuning and not use_parallel and retune_every_windows > 0
+    if run_hyperparameter_tuning and not retune_during_loop:
+        best_hyperparameters, _ = _run_window_hyperparameter_tuning(
+            window_data_list=window_data_list,
+            anchor_idx=0,
+            tuning_trials=tuning_trials,
             eval_metric=eval_metric,
-            holdout_validation_sets=tuning_holdout_sets,
+            session_lstm_params=session_lstm_params,
+            lstm_tuning_scope=lstm_tuning_scope,
+            session_folder=session_folder,
         )
-        best_hyperparameters = tuning_result["best_params"]
-
-        # Save the best hyperparameters to JSON report
-        save_json(best_hyperparameters, f'{session_folder}/reports/best_hyperparameters.json')
-        tuning_report = {k: v for k, v in tuning_result.items() if k != "study"}
-        save_json(tuning_report, f'{session_folder}/reports/hyperparameter_tuning_summary.json')
-        logger.info(f"Best hyperparameters found: {best_hyperparameters}")
-
-        # Apply best reward/augmentation params to in-memory config for window processing
-        # (NOT written to config.yaml — only used for this run)
-        if "reward_loss_multiplier" in best_hyperparameters:
-            config.setdefault("reward", {})["loss_multiplier"] = best_hyperparameters["reward_loss_multiplier"]
-        if "reward_turnover_penalty" in best_hyperparameters:
-            config.setdefault("reward", {})["turnover_penalty"] = best_hyperparameters["reward_turnover_penalty"]
-        if "reward_calm_holding_bonus" in best_hyperparameters:
-            config.setdefault("reward", {})["calm_holding_bonus"] = best_hyperparameters["reward_calm_holding_bonus"]
-        if "synthetic_oversample_ratio" in best_hyperparameters:
-            config.setdefault("augmentation", {}).setdefault("synthetic_bears", {})["oversample_ratio"] = best_hyperparameters["synthetic_oversample_ratio"]
-        logger.info(f"Applied reward/augmentation params to in-memory config for window processing")
     
     # Process windows - either in parallel or sequentially
     # Note: With LSTM features, each window trains its own autoencoder
@@ -2259,7 +3005,9 @@ def walk_forward_testing(
                         improvement_threshold,
                         False,  # Don't run hyperparameter tuning for each window
                         tuning_trials,
-                        best_hyperparameters  # Pass the best hyperparameters found
+                        best_hyperparameters,  # Pass the best hyperparameters found
+                        session_lstm_params,
+                        lstm_tuning_scope,
                     )
                 )
 
@@ -2279,8 +3027,19 @@ def walk_forward_testing(
     else:
         # Process windows sequentially
         logger.info(f"Processing {num_windows} windows sequentially")
-        for window_data_dict in window_data_list:
+        for list_idx, window_data_dict in enumerate(window_data_list):
             try:
+                if run_hyperparameter_tuning and retune_during_loop:
+                    if best_hyperparameters is None or (list_idx % retune_every_windows) == 0:
+                        best_hyperparameters, _ = _run_window_hyperparameter_tuning(
+                            window_data_list=window_data_list,
+                            anchor_idx=list_idx,
+                            tuning_trials=tuning_trials,
+                            eval_metric=eval_metric,
+                            session_lstm_params=session_lstm_params,
+                            lstm_tuning_scope=lstm_tuning_scope,
+                            session_folder=session_folder,
+                        )
                 window_result = process_single_window(
                     window_data_dict["window_idx"],
                     num_windows,
@@ -2296,7 +3055,9 @@ def walk_forward_testing(
                     improvement_threshold,
                     False,  # Don't run hyperparameter tuning for each window
                     tuning_trials,
-                    best_hyperparameters  # Pass the best hyperparameters found
+                    best_hyperparameters,  # Pass the best hyperparameters found
+                    session_lstm_params,
+                    lstm_tuning_scope,
                 )
                 all_window_results.append(window_result)
             except Exception as e:
@@ -2308,6 +3069,8 @@ def walk_forward_testing(
     returns = [res["return"] for res in all_window_results]
     portfolio_values = [res["portfolio_value"] for res in all_window_results]
     trade_counts = [res["trade_count"] for res in all_window_results]
+    rebalance_counts = [res.get("rebalance_count", res["trade_count"]) for res in all_window_results]
+    economic_trade_counts = [res.get("economic_trade_count", 0) for res in all_window_results]
     sortinos = [res.get("sortino_ratio", 0.0) for res in all_window_results]
     
     # Also aggregate hit rates if that metric is used
@@ -2323,6 +3086,8 @@ def walk_forward_testing(
     avg_return = np.mean(returns)
     avg_portfolio = np.mean(portfolio_values)
     avg_trades = np.mean(trade_counts)
+    avg_rebalances = np.mean(rebalance_counts)
+    avg_completed_trades = np.mean(economic_trade_counts) if economic_trade_counts else 0
     avg_sortino = float(np.mean(sortinos)) if sortinos else 0.0
     avg_hit_rate = np.mean(hit_rates) if hit_rates else 0
     avg_profitable_trades = np.mean(profitable_trades) if profitable_trades else 0
@@ -2344,6 +3109,8 @@ def walk_forward_testing(
     
     logger.info(f"Average final portfolio: ${avg_portfolio:.2f}")
     logger.info(f"Average trade count: {avg_trades:.2f}")
+    logger.info(f"Average completed trades: {avg_completed_trades:.2f}")
+    logger.info(f"Average rebalances: {avg_rebalances:.2f}")
     
     # Save summary results
     summary_results = {
@@ -2353,6 +3120,8 @@ def walk_forward_testing(
         "avg_prediction_accuracy": avg_prediction_accuracy,
         "avg_portfolio": avg_portfolio,
         "avg_trades": avg_trades,
+        "avg_completed_trades": avg_completed_trades,
+        "avg_rebalances": avg_rebalances,
         "avg_profitable_trades": avg_profitable_trades,
         "avg_correct_predictions": avg_correct_predictions,
         "avg_total_predictions": avg_total_predictions,
@@ -2362,8 +3131,9 @@ def walk_forward_testing(
     }
     
     # Don't include all window results in the summary JSON (they may contain non-serializable objects)
-    save_json(summary_results, f'{session_folder}/reports/summary_results.json')
-    
+    json_safe_summary = dict(summary_results)
+    save_json(json_safe_summary, f'{session_folder}/reports/summary_results.json')
+
     # Add window results back for the return value (not for JSON serialization)
     summary_results["all_window_results"] = all_window_results
     
@@ -2382,6 +3152,9 @@ def walk_forward_testing(
         logger.error(f"Failed to generate walk-forward HTML report: {e}")
         import traceback
         logger.error(traceback.format_exc())
+
+    json_safe_summary = {k: v for k, v in summary_results.items() if k != "all_window_results"}
+    save_json(json_safe_summary, f'{session_folder}/reports/summary_results.json')
     
     return summary_results
 
@@ -2412,6 +3185,15 @@ def hyperparameter_tuning(
     logger.info(f"Starting hyperparameter tuning with {n_trials} trials")
     logger.info(f"Evaluation metric: {eval_metric}")
     holdout_validation_sets = holdout_validation_sets or []
+    if get_configured_algorithm() == "qrdqn":
+        logger.info("Using QR-DQN benchmark hyperparameter tuning")
+        return _run_qrdqn_tuning(
+            train_data=train_data,
+            validation_data=validation_data,
+            n_trials=n_trials,
+            window_folder=window_folder,
+            holdout_validation_sets=holdout_validation_sets,
+        )
 
     tuning_config = config.get("hyperparameter_tuning", {})
     parallel_config = tuning_config.get("parallel_processing", {})
@@ -2430,8 +3212,13 @@ def hyperparameter_tuning(
     reference_columns = list(train_data.columns)
     baseline_margin = float(tuning_config.get("baseline_margin", 0.25))
 
-    stage1_trials = int(tuning_config.get("stage1_trials", n_trials))
-    stage2_trials = int(tuning_config.get("stage2_trials", max(0, n_trials - stage1_trials)))
+    requested_stage1_trials = int(tuning_config.get("stage1_trials", n_trials))
+    requested_stage2_trials = int(tuning_config.get("stage2_trials", max(0, n_trials - requested_stage1_trials)))
+    stage1_trials, stage2_trials = _resolve_staged_trial_counts(
+        n_trials,
+        requested_stage1_trials,
+        requested_stage2_trials,
+    )
     if stage1_trials + stage2_trials <= 0:
         stage1_trials = max(1, n_trials)
         stage2_trials = 0
@@ -2440,6 +3227,13 @@ def hyperparameter_tuning(
     stage2_timesteps = int(tuning_config.get("stage2_timesteps", tuning_config.get("tuning_timesteps", 20000)))
     stage2_window_shrink = float(tuning_config.get("stage2_window_shrink", 0.35))
 
+    if (requested_stage1_trials, requested_stage2_trials) != (stage1_trials, stage2_trials):
+        logger.info(
+            "Adjusted staged tuning trials to fit requested budget: stage1=%d, stage2=%d, total=%d",
+            stage1_trials,
+            stage2_trials,
+            n_trials,
+        )
     logger.info(
         "Staged PPO tuning: stage1=%d trials @ %d steps, stage2=%d trials @ %d steps",
         stage1_trials,
@@ -2455,6 +3249,8 @@ def hyperparameter_tuning(
 
     stage1_sets = [validation_data]
     stage1_baselines = _score_constant_action_baselines(stage1_sets, reference_columns)
+    selection_sets = stage1_sets
+    selection_baselines = stage1_baselines
     logger.info(
         "Stage 1 trivial baseline scores: %s",
         [round(max(scores.values()), 2) for scores in stage1_baselines],
@@ -2505,10 +3301,49 @@ def hyperparameter_tuning(
         )
         if stage2_result.get("best_params"):
             final_result = stage2_result
+            selection_sets = stage2_sets
+            selection_baselines = stage2_baselines
+        else:
+            selection_sets = stage2_sets
+            selection_baselines = stage2_baselines
 
-    best_params = final_result.get("best_params", {})
-    best_value = float(final_result.get("best_value", float("-inf")))
     selected_stage = "stage2" if stage2_result.get("best_params") else "stage1"
+    finalist_result = None
+    finalist_top_k = int(tuning_config.get("finalist_top_k", 0))
+    finalist_num_seeds = int(tuning_config.get("finalist_num_seeds", 0))
+    finalist_timesteps = int(tuning_config.get("finalist_timesteps", 0))
+    final_study = final_result.get("study")
+    finalist_trials = _candidate_trials_from_study(final_study, finalist_top_k)
+    finalist_candidates = [{"params": dict(trial.params), "score": float(trial.value)} for trial in finalist_trials]
+    if finalist_candidates:
+        logger.info(
+            "Re-ranking %d finalist candidate(s) across %d seed(s) at %d timesteps",
+            len(finalist_candidates),
+            finalist_num_seeds,
+            finalist_timesteps,
+        )
+        finalist_result = _evaluate_finalist_candidates(
+            candidates=finalist_candidates,
+            train_data=train_data,
+            validation_data=validation_data,
+            holdout_validation_sets=selection_sets[1:],
+            baseline_scores=selection_baselines,
+            baseline_margin=baseline_margin,
+            finalist_timesteps=finalist_timesteps,
+            finalist_num_seeds=finalist_num_seeds,
+        )
+        if finalist_result is not None:
+            best_params = finalist_result["params"]
+            best_value = float(finalist_result["median_score"])
+            selected_stage = f"{selected_stage}_finalists"
+        else:
+            finalist_candidates = []
+    else:
+        finalist_candidates = []
+
+    if finalist_result is None:
+        best_params = final_result.get("best_params", {})
+        best_value = float(final_result.get("best_value", float("-inf")))
 
     logger.info("\n" + "=" * 80)
     logger.info("Hyperparameter Tuning Results:")
@@ -2518,7 +3353,6 @@ def hyperparameter_tuning(
     for param, value in best_params.items():
         logger.info(f"  {param}: {value}")
 
-    final_study = final_result.get("study")
     if window_folder and final_study is not None:
         try:
             os.makedirs('models/plots/tuning', exist_ok=True)
@@ -2547,6 +3381,8 @@ def hyperparameter_tuning(
         "stage2_best_params": stage2_result.get("best_params", {}),
         "stage2_best_value": float(stage2_result.get("best_value", float("-inf"))),
         "stage2_search_space": stage2_search_space,
+        "finalist_result": finalist_result,
+        "finalist_candidates": finalist_candidates,
         "study": final_study,
     }
 
@@ -3107,15 +3943,9 @@ def main():
             print("  Trailing Stop: Disabled")
     
     
-    if config.get("data", {}).get("market_hours_only", True):
-        session_cfg = config.get("data", {}).get("session", {})
-        print("Note: All references to 'days' now indicate trading days from the configured trading session, not calendar days")
-        print(
-            "Note: Training was performed only on configured market hours data "
-            f"({session_cfg.get('timezone', 'America/Chicago')} "
-            f"{session_cfg.get('open_hour', 17):02d}:{session_cfg.get('open_minute', 0):02d} "
-            f"to {session_cfg.get('close_hour', 16):02d}:{session_cfg.get('close_minute', 0):02d})"
-        )
+    if market_hours_only_enabled(config):
+        print("Note: All references to 'days' now indicate NYSE RTH trading days, not calendar days")
+        print("Note: Training and evaluation were performed only on NYSE RTH data (09:30-16:00 America/New_York, Monday-Friday)")
     else:
         print("Note: All references to 'days' now indicate trading days derived from the loaded dataset, not calendar days")
 

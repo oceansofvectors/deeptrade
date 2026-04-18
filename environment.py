@@ -14,21 +14,79 @@ from stable_baselines3.common.env_util import make_vec_env
 # Local application imports
 import constants
 import money
-from action_space import target_allocation_for_action
+from action_space import ACTION_COUNT, atr_dollar_risk_per_contract, target_contracts_for_action
 from config import config
+
+VALID_REPRESENTATION_MODES = {"hybrid", "engineered_only", "latent_only"}
+
+
+def get_representation_mode() -> str:
+    """Return the configured market-representation mode."""
+    mode = str(config.get("representation", {}).get("mode", "hybrid")).lower()
+    if mode not in VALID_REPRESENTATION_MODES:
+        return "hybrid"
+    return mode
+
+
+def infer_market_indicator_columns(
+    data: pd.DataFrame,
+    enabled_indicators: list | None = None,
+    representation_mode: str | None = None,
+) -> list[str]:
+    """Infer numeric market-feature columns used as the non-state observation block."""
+    if enabled_indicators is not None:
+        return list(enabled_indicators)
+
+    mode = representation_mode or get_representation_mode()
+    if mode == "latent_only":
+        latent_columns = []
+        for col in data.columns:
+            if not pd.api.types.is_numeric_dtype(data[col]):
+                continue
+            if str(col).startswith(("LATENT_F", "LSTM_F")):
+                latent_columns.append(col)
+        return latent_columns
+
+    excluded_cols = {
+        'time', 'timestamp', 'date', 'symbol', 'rtype', 'publisher_id', 'instrument_id',
+        'position', 'close_norm',
+        'open', 'high', 'low', 'close', 'volume',
+        'Open', 'High', 'Low', 'Close', 'Volume',
+        'OPEN', 'HIGH', 'LOW', 'CLOSE',
+    }
+    indicator_cols = []
+    for col in data.columns:
+        if col in excluded_cols:
+            continue
+        if str(col).endswith('_RAW'):
+            continue
+        if pd.api.types.is_numeric_dtype(data[col]):
+            indicator_cols.append(col)
+    return indicator_cols
+
+
+def get_market_feature_columns(data: pd.DataFrame, representation_mode: str | None = None) -> list[str]:
+    """Return the canonical market feature block used for engineered / latent inputs."""
+    feature_cols: list[str] = []
+    close_norm_col = next((c for c in ['close_norm', 'Close_norm', 'CLOSE_NORM'] if c in data.columns), None)
+    if close_norm_col is not None:
+        feature_cols.append(close_norm_col)
+    feature_cols.extend(infer_market_indicator_columns(data, representation_mode=representation_mode))
+    return feature_cols
+
 
 class TradingEnv(gym.Env):
     """
     Custom Gymnasium environment for trading with multiple technical indicators.
 
-    Observation Space: [close_norm, technical_indicators..., position, unrealized_pnl_norm, time_in_position_norm]
+    Observation Space: [market features..., signed_exposure, unrealized_pnl_norm, time_in_position_norm, drawdown_pct]
     Action Space:
-        0-2: Long target allocations of 1%, 2%, 5%
-        3-5: Short target allocations of 1%, 2%, 5%
+        0-2: Long target risk buckets
+        3-5: Short target risk buckets
         6: Flat
 
-    Agent chooses a target portfolio allocation. The environment rebalances to the
-    closest whole-contract MBT position that fits current net worth.
+    Agent chooses a target signed action bucket. The environment converts that
+    into executable MBT contracts and rebalances directly to that position.
     """
 
     metadata = {"render.modes": ["human"]}
@@ -40,7 +98,7 @@ class TradingEnv(gym.Env):
         Args:
             data (pd.DataFrame): DataFrame containing price and indicator data with columns:
                 - close: Actual closing prices
-                - close_norm: Normalized closing prices (between 0 and 1)
+                - close_norm: Normalized closing prices (between 0 and 1) when used by the active representation mode
                 - supertrend: Supertrend indicator direction
                 - Various technical indicators (RSI, CCI, ADX, etc.)
             initial_balance (float): Starting portfolio balance.
@@ -76,10 +134,10 @@ class TradingEnv(gym.Env):
             self.tp_multipliers = np.linspace(self.tp_range[0], self.tp_range[1], self.num_choices)
 
             # Action space: [position_action, sl_multiplier_idx, tp_multiplier_idx]
-            self.action_space = spaces.MultiDiscrete([7, self.num_choices, self.num_choices])
+            self.action_space = spaces.MultiDiscrete([ACTION_COUNT, self.num_choices, self.num_choices])
         else:
-            # Action space: 7 target-allocation actions
-            self.action_space = spaces.Discrete(7)
+            # Action space: executable target-contract actions
+            self.action_space = spaces.Discrete(ACTION_COUNT)
 
         # Fixed ATR-based stop loss / take profit from risk_management config
         risk_config = config.get("risk_management", {})
@@ -100,37 +158,29 @@ class TradingEnv(gym.Env):
         self.sl_price = Decimal('0.0')
         self.tp_price = Decimal('0.0')
 
-        # Define the technical indicators to include in the observation space
-        self.technical_indicators = []
-        
-        # If enabled_indicators is provided, use those
-        if enabled_indicators is not None:
-            self.technical_indicators = enabled_indicators
-        else:
-            excluded_cols = {
-                'time', 'timestamp', 'date', 'symbol', 'rtype', 'publisher_id', 'instrument_id',
-                'position', 'close_norm',
-                'open', 'high', 'low', 'close', 'volume',
-                'Open', 'High', 'Low', 'Close', 'Volume',
-                'OPEN', 'HIGH', 'LOW', 'CLOSE',
-            }
-            for col in self.data.columns:
-                if col in excluded_cols:
-                    continue
-                if pd.api.types.is_numeric_dtype(self.data[col]):
-                    self.technical_indicators.append(col)
-            
-        # Calculate observation space size: close_norm + all technical indicators +
+        self.representation_mode = get_representation_mode()
+        self._close_norm_col = next((c for c in ['CLOSE_NORM', 'Close_norm', 'close_norm'] if c in self.data.columns), None)
+        self.include_close_norm = self.representation_mode != "latent_only" and self._close_norm_col is not None
+
+        # Define the technical indicators to include in the observation space.
+        self.technical_indicators = infer_market_indicator_columns(
+            self.data,
+            enabled_indicators=enabled_indicators,
+            representation_mode=self.representation_mode,
+        )
+
+        # Calculate observation space size: optional close_norm + all technical indicators +
         # signed_exposure + unrealized_pnl + time_in_position + drawdown_pct
-        obs_size = 1 + len(self.technical_indicators) + 4
+        obs_size = (1 if self.include_close_norm else 0) + len(self.technical_indicators) + 4
 
         # Create observation space with appropriate bounds
         # Most indicators are normalized between -1 and 1 or 0 and 1
         low_obs = np.array([-1.0] * obs_size, dtype=np.float32)
         high_obs = np.array([1.0] * obs_size, dtype=np.float32)
 
-        # Ensure close_norm is between 0 and 1
-        low_obs[0] = 0.0
+        # Ensure close_norm is between 0 and 1 when present.
+        if self.include_close_norm:
+            low_obs[0] = 0.0
 
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
 
@@ -138,9 +188,10 @@ class TradingEnv(gym.Env):
         self.current_step = 0
         self.position = 0  # 0 = flat, 1 = long, -1 = short
         self.current_contracts = 0
-        self.target_allocation_pct = Decimal('0.0')
+        self.target_contracts = 0
         self.signed_exposure_pct = Decimal('0.0')
         self.entry_price = Decimal('0.0')  # Weighted average entry price
+        self.entry_risk_per_contract = Decimal('0.0')
         self.initial_index = 0
         # Random start: on reset(), pick a random start within first random_start_pct of data
         # This gives vectorized envs trajectory diversity across episodes
@@ -170,8 +221,6 @@ class TradingEnv(gym.Env):
         self._point_value_decimal = money.to_decimal(constants.CONTRACT_POINT_VALUE)
         self._position_size_decimal = money.to_decimal(self.position_size)
         self._min_balance_pct_decimal = Decimal(str(constants.MIN_BALANCE_PERCENTAGE))
-        self._allocation_choices = [Decimal('0.01'), Decimal('0.02'), Decimal('0.05')]
-
         # Realistic execution cost model: fee + spread + time-of-day slippage.
         # MBT outright tick = 5.0 quoted BTC price points = $0.50/contract.
         exec_config = config.get("execution_costs", {})
@@ -188,17 +237,22 @@ class TradingEnv(gym.Env):
             self._slippage_points = np.full(len(self.data), base_slippage, dtype=np.float64)
 
         # Pre-compute column name lookups (avoid per-step capitalization checks)
-        self._close_norm_col = next((c for c in ['CLOSE_NORM', 'Close_norm', 'close_norm'] if c in self.data.columns), 'close_norm')
         self._close_col = next((c for c in ['CLOSE', 'Close', 'close'] if c in self.data.columns), 'close')
         self._high_col = next((c for c in ['HIGH', 'High', 'high'] if c in self.data.columns), None)
         self._low_col = next((c for c in ['LOW', 'Low', 'low'] if c in self.data.columns), None)
         self._atr_col = next((c for c in ['ATR', 'atr'] if c in self.data.columns), None)
+        self._atr_raw_col = next((c for c in ['ATR_RAW', 'atr_raw'] if c in self.data.columns), self._atr_col)
+        self._rolling_dd_raw_col = next((c for c in ['ROLLING_DD_RAW', 'rolling_dd_raw'] if c in self.data.columns), None)
+        self._vol_pct_raw_col = next((c for c in ['VOL_PERCENTILE_RAW', 'vol_percentile_raw'] if c in self.data.columns), None)
 
         # Pre-compute numpy arrays for fast per-step access (avoid DataFrame .loc[])
-        self._close_norm_array = self._sanitize_feature_array(
-            self.data[self._close_norm_col].values.astype(np.float32),
-            name=self._close_norm_col,
-        )
+        if self._close_norm_col is not None:
+            self._close_norm_array = self._sanitize_feature_array(
+                self.data[self._close_norm_col].values.astype(np.float32),
+                name=self._close_norm_col,
+            )
+        else:
+            self._close_norm_array = np.full(len(self.data), 0.5, dtype=np.float32)
         self._close_array = self._sanitize_price_array(
             self.data[self._close_col].values.astype(np.float64),
             name=self._close_col,
@@ -214,9 +268,17 @@ class TradingEnv(gym.Env):
             name=self._low_col,
         ) if self._low_col else None
         self._atr_array = self._sanitize_feature_array(
-            self.data[self._atr_col].values.astype(np.float64),
-            name=self._atr_col,
-        ) if self._atr_col else None
+            self.data[self._atr_raw_col].values.astype(np.float64),
+            name=self._atr_raw_col,
+        ) if self._atr_raw_col else None
+        self._rolling_dd_raw_array = self._sanitize_feature_array(
+            self.data[self._rolling_dd_raw_col].values.astype(np.float64),
+            name=self._rolling_dd_raw_col,
+        ) if self._rolling_dd_raw_col else None
+        self._vol_pct_raw_array = self._sanitize_feature_array(
+            self.data[self._vol_pct_raw_col].values.astype(np.float64),
+            name=self._vol_pct_raw_col,
+        ) if self._vol_pct_raw_col else None
 
         # Resolve indicator column names once and build pre-computed indicator matrix
         resolved_indicator_cols = []
@@ -231,7 +293,8 @@ class TradingEnv(gym.Env):
 
         # Build indicator matrix: shape (total_steps+1, num_indicators)
         if any(self._indicator_found):
-            cols = [c if c is not None else self._close_norm_col for c in resolved_indicator_cols]
+            fallback_indicator_col = self._close_norm_col or self._close_col
+            cols = [c if c is not None else fallback_indicator_col for c in resolved_indicator_cols]
             self._indicator_matrix = self.data[cols].values.astype(np.float32)
             # Zero out columns where indicator was not found
             for i, found in enumerate(self._indicator_found):
@@ -245,15 +308,6 @@ class TradingEnv(gym.Env):
         self._obs_size = obs_size
         self._n_indicators = len(self.technical_indicators)
 
-        # Cache regime feature indices for reward shaping (calm holding bonus)
-        self._rolling_dd_idx = None
-        self._vol_pct_idx = None
-        for i, ind in enumerate(self.technical_indicators):
-            if ind == 'ROLLING_DD':
-                self._rolling_dd_idx = i
-            elif ind == 'VOL_PERCENTILE':
-                self._vol_pct_idx = i
-
         # Cache reward config lookups (avoid repeated config.get() in per-step reward loop)
         reward_config = config.get("reward", {})
         self._reward_base_scale = reward_config.get("base_scale", 500.0)
@@ -261,9 +315,10 @@ class TradingEnv(gym.Env):
         self._reward_dd_threshold = reward_config.get("drawdown_penalty_threshold", 0.03)
         self._reward_dd_penalty = reward_config.get("drawdown_penalty", 3.0)
         self._reward_turnover_pen = reward_config.get("turnover_penalty", 0.05)
-        self._reward_calm_bonus = reward_config.get("calm_holding_bonus", 0.0005)
         self._reward_flat_penalty = reward_config.get("flat_time_penalty", 0.0015)
         self._reward_flat_grace = reward_config.get("flat_time_grace_steps", 6)
+        self._reward_realized_quality = reward_config.get("realized_trade_quality_bonus", 0.0)
+        self._reward_opportunity_vol_pct = reward_config.get("flat_penalty_opportunity_vol_percentile", 70.0)
 
     def _sanitize_feature_array(self, values: np.ndarray, *, name: str) -> np.ndarray:
         """Replace NaN/Inf feature values with neutral zeroes."""
@@ -334,9 +389,10 @@ class TradingEnv(gym.Env):
             self.current_step = self.initial_index
         self.position = 0  # Start flat (no position)
         self.current_contracts = 0
-        self.target_allocation_pct = Decimal('0.0')
+        self.target_contracts = 0
         self.signed_exposure_pct = Decimal('0.0')
         self.entry_price = Decimal('0.0')
+        self.entry_risk_per_contract = Decimal('0.0')
         self.net_worth = self.initial_balance
         self.previous_net_worth = self.initial_balance  # Reset previous net worth for reward calculation
         self.time_in_position = 0  # Reset time in position
@@ -361,19 +417,23 @@ class TradingEnv(gym.Env):
         Uses pre-computed numpy arrays for fast access (no DataFrame lookups).
 
         Returns:
-            np.ndarray: Array with [close_norm, technical_indicators..., position, unrealized_pnl_norm, time_in_position_norm].
+            np.ndarray: Array with [market features..., signed_exposure, unrealized_pnl_norm, time_in_position_norm, drawdown_pct].
         """
         obs = np.empty(self._obs_size, dtype=np.float32)
 
-        # Close norm from pre-computed array
-        obs[0] = self._close_norm_array[self.current_step]
+        idx = 0
+
+        # Optional close_norm from pre-computed array
+        if self.include_close_norm:
+            obs[idx] = self._close_norm_array[self.current_step]
+            idx += 1
 
         # Indicators from pre-computed matrix (single array slice)
         if self._n_indicators > 0:
-            obs[1:1 + self._n_indicators] = self._indicator_matrix[self.current_step]
+            obs[idx:idx + self._n_indicators] = self._indicator_matrix[self.current_step]
+            idx += self._n_indicators
 
         # State features
-        idx = 1 + self._n_indicators
         obs[idx] = float(self.signed_exposure_pct)
         obs[idx + 1] = self._calculate_unrealized_pnl_normalized()
         obs[idx + 2] = float(np.tanh(self.time_in_position / 50.0))
@@ -405,15 +465,20 @@ class TradingEnv(gym.Env):
 
     def _get_high_low_prices(self) -> Tuple[Decimal, Decimal]:
         """Get high and low prices from pre-computed arrays. Falls back to close price."""
+        return self._get_high_low_prices_at(self.current_step)
+
+    def _get_high_low_prices_at(self, step_idx: int) -> Tuple[Decimal, Decimal]:
+        """Get high/low prices for an arbitrary bar index."""
+        step_idx = max(0, min(int(step_idx), len(self.data) - 1))
         if self._high_array is not None:
-            high = money.to_decimal(self._high_array[self.current_step])
+            high = money.to_decimal(self._high_array[step_idx])
         else:
-            high = self._get_current_price()
+            high = money.to_decimal(self._close_array[step_idx])
 
         if self._low_array is not None:
-            low = money.to_decimal(self._low_array[self.current_step])
+            low = money.to_decimal(self._low_array[step_idx])
         else:
-            low = self._get_current_price()
+            low = money.to_decimal(self._close_array[step_idx])
 
         return high, low
 
@@ -473,21 +538,6 @@ class TradingEnv(gym.Env):
         exposure = notional / self.net_worth
         return exposure if contracts > 0 else -exposure
 
-    def _calculate_target_contracts(self, target_allocation_pct: Decimal, price: Decimal) -> int:
-        """Convert a target allocation into a whole-contract MBT quantity."""
-        if price <= Decimal('0.0') or self.net_worth <= Decimal('0.0') or target_allocation_pct == Decimal('0.0'):
-            return 0
-
-        contract_notional = price * self._point_value_decimal
-        if contract_notional <= Decimal('0.0'):
-            return 0
-
-        target_notional = self.net_worth * abs(target_allocation_pct)
-        contracts = int(target_notional / contract_notional)
-        if contracts < 1:
-            return 0
-        return contracts if target_allocation_pct > 0 else -contracts
-
     def _sync_position_state(self, price: Decimal) -> None:
         """Synchronize derived position state after a rebalance/exit."""
         if self.current_contracts > 0:
@@ -497,40 +547,65 @@ class TradingEnv(gym.Env):
         else:
             self.position = 0
             self.entry_price = Decimal('0.0')
-            self.target_allocation_pct = Decimal('0.0')
+            self.entry_risk_per_contract = Decimal('0.0')
+            self.target_contracts = 0
 
         self.signed_exposure_pct = self._calculate_signed_exposure(self.current_contracts, price)
 
-    def _rebalance_position(self, target_contracts: int, current_price: Decimal) -> Tuple[bool, bool, int]:
+    def _execution_cost_for_contracts(self, contracts: int, *, step_idx: int) -> Decimal:
+        """Return commission, spread, and slippage costs for a fill count."""
+        contracts = int(abs(contracts))
+        if contracts <= 0:
+            return Decimal('0.0')
+
+        total_cost = Decimal('0.0')
+        if self.transaction_cost > Decimal('0.0'):
+            total_cost += self.transaction_cost * Decimal(str(contracts))
+
+        total_cost += self._spread_points * self._point_value_decimal * Decimal(str(contracts))
+
+        step_idx = max(0, min(int(step_idx), len(self._slippage_points) - 1))
+        slippage_pts = Decimal(str(self._slippage_points[step_idx]))
+        total_cost += slippage_pts * self._point_value_decimal * Decimal(str(contracts))
+        return total_cost
+
+    def _rebalance_position(self, target_contracts: int, current_price: Decimal, current_atr: Decimal) -> Tuple[bool, bool, int, int]:
         """Rebalance to a target contract count.
 
         Returns:
-            (position_changed, is_redundant_action, contracts_traded)
+            (position_changed, is_redundant_action, contracts_traded, realized_contracts)
         """
         old_contracts = self.current_contracts
+        self.target_contracts = int(target_contracts)
         if target_contracts == old_contracts:
-            self.target_allocation_pct = self._calculate_signed_exposure(target_contracts, current_price)
-            self.signed_exposure_pct = self.target_allocation_pct
-            return False, True, 0
+            self.signed_exposure_pct = self._calculate_signed_exposure(target_contracts, current_price)
+            return False, True, 0, 0
 
         contracts_traded = 0
+        realized_contracts = 0
         old_direction = 1 if old_contracts > 0 else (-1 if old_contracts < 0 else 0)
         new_direction = 1 if target_contracts > 0 else (-1 if target_contracts < 0 else 0)
+        current_risk_per_contract = atr_dollar_risk_per_contract(current_atr)
 
         if old_direction == 0:
             self.current_contracts = target_contracts
             self.entry_price = current_price if target_contracts != 0 else Decimal('0.0')
+            self.entry_risk_per_contract = current_risk_per_contract if target_contracts != 0 else Decimal('0.0')
             self.time_in_position = 0 if target_contracts != 0 else 0
             contracts_traded = abs(target_contracts)
         elif new_direction == 0:
             self.current_contracts = 0
             self.entry_price = Decimal('0.0')
+            self.entry_risk_per_contract = Decimal('0.0')
             self.time_in_position = 0
             contracts_traded = abs(old_contracts)
+            realized_contracts = abs(old_contracts)
         elif old_direction != new_direction:
             contracts_traded = abs(old_contracts) + abs(target_contracts)
+            realized_contracts = abs(old_contracts)
             self.current_contracts = target_contracts
             self.entry_price = current_price
+            self.entry_risk_per_contract = current_risk_per_contract
             self.time_in_position = 0
         else:
             old_abs = abs(old_contracts)
@@ -543,11 +618,18 @@ class TradingEnv(gym.Env):
                     (current_price * Decimal(str(delta)))
                 ) / Decimal(str(new_abs))
                 self.entry_price = weighted_entry
+                if current_risk_per_contract > 0:
+                    existing_risk = self.entry_risk_per_contract if self.entry_risk_per_contract > 0 else current_risk_per_contract
+                    self.entry_risk_per_contract = (
+                        (existing_risk * Decimal(str(old_abs))) +
+                        (current_risk_per_contract * Decimal(str(delta)))
+                    ) / Decimal(str(new_abs))
+            elif delta < 0:
+                realized_contracts = abs(delta)
             self.current_contracts = target_contracts
 
-        self.target_allocation_pct = self._calculate_signed_exposure(target_contracts, current_price)
         self._sync_position_state(current_price)
-        return True, False, contracts_traded
+        return True, False, contracts_traded, realized_contracts
 
     def _calculate_unrealized_pnl_normalized(self) -> float:
         """
@@ -581,7 +663,7 @@ class TradingEnv(gym.Env):
 
         Args:
             action: Action to execute. Either int (Discrete) or array (MultiDiscrete).
-                   Discrete: 7 target-allocation actions
+                   Discrete: 7 target-risk actions
                    MultiDiscrete: [position_action, sl_idx, tp_idx]
 
         Returns:
@@ -608,12 +690,19 @@ class TradingEnv(gym.Env):
         # Track old position state to detect changes for transaction cost and profit calculation
         old_position = self.position
         old_entry_price = self.entry_price
+        old_entry_risk_per_contract = self.entry_risk_per_contract
         old_contracts = self.current_contracts
         position_changed = False
         is_redundant_action = False
         sl_tp_exit_reason = ""
         sl_tp_exit_price = Decimal('0.0')
         contracts_traded = 0
+        realized_contracts = 0
+        realized_position = 0
+        realized_entry_price = Decimal('0.0')
+        realized_risk_per_contract = Decimal('0.0')
+        previous_max_net_worth = self.max_net_worth
+        reward_exit_price = current_price
 
         # Check for SL/TP exit BEFORE processing the action
         if self.position != 0 and self.dynamic_sl_tp_enabled:
@@ -639,13 +728,18 @@ class TradingEnv(gym.Env):
                 old_contracts = self.current_contracts
                 self.current_contracts = 0
                 self.position = 0
-                self.target_allocation_pct = Decimal('0.0')
+                self.target_contracts = 0
                 self.signed_exposure_pct = Decimal('0.0')
                 self.entry_price = Decimal('0.0')
+                self.entry_risk_per_contract = Decimal('0.0')
                 self.time_in_position = 0
                 self.trade_count += 1
                 position_changed = True
                 contracts_traded = abs(old_contracts)
+                realized_contracts = abs(old_contracts)
+                realized_position = old_position
+                realized_entry_price = old_entry_price
+                realized_risk_per_contract = old_entry_risk_per_contract
 
                 # Reset SL/TP state
                 self.current_sl_multiplier = None
@@ -655,15 +749,29 @@ class TradingEnv(gym.Env):
 
                 info["sl_tp_exit"] = exit_reason
                 info["sl_tp_exit_price"] = float(exit_price)
+                reward_exit_price = exit_price
 
         # Only process action if we didn't get stopped out
         if not sl_tp_exit_reason:
-            target_allocation = Decimal(str(target_allocation_for_action(position_action)))
-            target_contracts = self._calculate_target_contracts(target_allocation, current_price)
-            position_changed, is_redundant_action, contracts_traded = self._rebalance_position(
+            current_atr = self._get_current_atr()
+            target_contracts = int(
+                target_contracts_for_action(
+                    position_action,
+                    net_worth=self.net_worth,
+                    atr=current_atr,
+                    price=current_price,
+                )
+            )
+            position_changed, is_redundant_action, contracts_traded, rebalance_realized_contracts = self._rebalance_position(
                 target_contracts=target_contracts,
                 current_price=current_price,
+                current_atr=current_atr,
             )
+            if rebalance_realized_contracts > 0:
+                realized_contracts = rebalance_realized_contracts
+                realized_position = old_position
+                realized_entry_price = old_entry_price
+                realized_risk_per_contract = old_entry_risk_per_contract
             if position_changed:
                 self.trade_count += 1
 
@@ -710,20 +818,10 @@ class TradingEnv(gym.Env):
         # Apply execution costs if position changed: commission + spread + slippage
         transaction_cost_applied = Decimal('0.0')
         if position_changed:
-            # Commission (per fill)
-            if self.transaction_cost > Decimal('0.0'):
-                transaction_cost_applied += self.transaction_cost * Decimal(str(contracts_traded))
-
-            # Spread cost: half-spread per fill (crossing the bid-ask)
-            spread_cost = self._spread_points * self._point_value_decimal * Decimal(str(contracts_traded))
-            transaction_cost_applied += spread_cost
-
-            # Slippage: time-of-day dependent, per fill
-            step_idx = min(self.current_step, len(self._slippage_points) - 1)
-            slippage_pts = Decimal(str(self._slippage_points[step_idx]))
-            slippage_cost = slippage_pts * self._point_value_decimal * Decimal(str(contracts_traded))
-            transaction_cost_applied += slippage_cost
-
+            transaction_cost_applied += self._execution_cost_for_contracts(
+                contracts_traded,
+                step_idx=self.current_step,
+            )
             self.net_worth -= transaction_cost_applied
 
         # Increment time in position if holding, or time flat if no position
@@ -742,24 +840,28 @@ class TradingEnv(gym.Env):
         # If a fixed SL/TP is triggered on the next bar, only mark to the exit price once.
         if self.current_step < self.total_steps and not sl_tp_exit_reason:
             next_price = self._get_current_price()
+            next_high, next_low = self._get_high_low_prices_at(self.current_step)
             fixed_exit = False
             exit_price = Decimal('0.0')
+            fixed_exit_reason = ""
 
             if self.position != 0:
-                # Check fixed SL/TP against the next bar close proxy. Use the exit price
-                # directly for MTM so we do not double-count entry-to-exit P&L.
+                # Check fixed SL/TP against the realized next-bar range so stop/target
+                # handling is consistent with the dynamic SL/TP path.
                 if self.fixed_sl_enabled and self.fixed_sl_price > 0:
-                    if (self.position == 1 and next_price <= self.fixed_sl_price) or \
-                       (self.position == -1 and next_price >= self.fixed_sl_price):
+                    if (self.position == 1 and next_low <= self.fixed_sl_price) or \
+                       (self.position == -1 and next_high >= self.fixed_sl_price):
                         fixed_exit = True
                         exit_price = self.fixed_sl_price
+                        fixed_exit_reason = "stop_loss"
                         info["fixed_sl_triggered"] = True
 
                 if not fixed_exit and self.fixed_tp_enabled and self.fixed_tp_price > 0:
-                    if (self.position == 1 and next_price >= self.fixed_tp_price) or \
-                       (self.position == -1 and next_price <= self.fixed_tp_price):
+                    if (self.position == 1 and next_high >= self.fixed_tp_price) or \
+                       (self.position == -1 and next_low <= self.fixed_tp_price):
                         fixed_exit = True
                         exit_price = self.fixed_tp_price
+                        fixed_exit_reason = "take_profit"
                         info["fixed_tp_triggered"] = True
 
             if self.position != 0 and self.current_contracts != 0:
@@ -773,15 +875,32 @@ class TradingEnv(gym.Env):
                 self.net_worth += dollar_change
 
             if fixed_exit:
+                exited_contracts = abs(self.current_contracts)
+                realized_contracts = exited_contracts
+                realized_position = self.position
+                realized_entry_price = self.entry_price
+                realized_risk_per_contract = self.entry_risk_per_contract
+                position_changed = True
+                contracts_traded += exited_contracts
+                fixed_exit_cost = self._execution_cost_for_contracts(
+                    exited_contracts,
+                    step_idx=self.current_step,
+                )
+                transaction_cost_applied += fixed_exit_cost
+                self.net_worth -= fixed_exit_cost
                 self.current_contracts = 0
                 self.position = 0
                 self.entry_price = Decimal('0.0')
+                self.entry_risk_per_contract = Decimal('0.0')
                 self.time_in_position = 0
                 self.trade_count += 1
                 self.fixed_sl_price = Decimal('0.0')
                 self.fixed_tp_price = Decimal('0.0')
-                self.target_allocation_pct = Decimal('0.0')
+                self.target_contracts = 0
                 self.signed_exposure_pct = Decimal('0.0')
+                info["fixed_exit_price"] = float(exit_price)
+                info["fixed_exit_reason"] = fixed_exit_reason
+                reward_exit_price = exit_price
 
         # Update max net worth for drawdown tracking
         if self.net_worth > self.max_net_worth:
@@ -808,14 +927,20 @@ class TradingEnv(gym.Env):
         self._sync_position_state(self._get_current_price() if self.current_step <= self.total_steps else current_price)
 
         # Calculate RISK-ADJUSTED REWARD with scalping incentives
-        exit_price_for_reward = sl_tp_exit_price if sl_tp_exit_price > Decimal('0.0') else current_price
+        exit_price_for_reward = reward_exit_price
         reward = self._calculate_risk_adjusted_reward(
             position_changed=position_changed,
             transaction_cost_applied=float(transaction_cost_applied),
             is_redundant_action=is_redundant_action,
             old_position=old_position,
             old_entry_price=old_entry_price,
-            exit_price=exit_price_for_reward
+            exit_price=exit_price_for_reward,
+            realized_contracts=realized_contracts,
+            realized_position=realized_position,
+            realized_entry_price=realized_entry_price,
+            realized_risk_per_contract=realized_risk_per_contract,
+            previous_max_net_worth=previous_max_net_worth,
+            opportunity_step_idx=max(0, self.current_step - 1),
         )
 
         obs = self._get_obs()
@@ -830,9 +955,9 @@ class TradingEnv(gym.Env):
         info["current_contracts"] = self.current_contracts
         info["old_contracts"] = old_contracts
         info["contracts_traded"] = contracts_traded
+        info["target_contracts"] = self.target_contracts
         info["signed_exposure"] = float(self.signed_exposure_pct)
         info["avg_entry_price"] = float(self.entry_price) if self.entry_price > Decimal('0.0') else 0.0
-        info["target_allocation_pct"] = float(self.target_allocation_pct)
         info["time_in_position"] = self.time_in_position
         info["trade_count"] = self.trade_count
         info["transaction_cost"] = float(transaction_cost_applied)
@@ -843,14 +968,19 @@ class TradingEnv(gym.Env):
     def _calculate_risk_adjusted_reward(self, position_changed: bool, transaction_cost_applied: float,
                                          is_redundant_action: bool, old_position: int = 0,
                                          old_entry_price: Decimal = Decimal('0.0'),
-                                         exit_price: Decimal = Decimal('0.0')) -> float:
+                                         exit_price: Decimal = Decimal('0.0'),
+                                         realized_contracts: int = 0,
+                                         realized_position: int = 0,
+                                         realized_entry_price: Decimal = Decimal('0.0'),
+                                         realized_risk_per_contract: Decimal = Decimal('0.0'),
+                                         previous_max_net_worth: Decimal = Decimal('0.0'),
+                                         opportunity_step_idx: int | None = None) -> float:
         """
         Portfolio-return-based reward aligned with Sortino/Calmar optimization.
 
         Primary signal: log change in net worth (captures P&L, costs, and compounding).
         Asymmetric penalty: losses penalized at 1.7x gains.
-        Calm holding bonus: small reward for staying in position during low-vol regimes.
-        Penalties: drawdown increase, excessive turnover.
+        Penalties: drawdown increase, excessive turnover, and excessive flat time.
 
         Returns:
             float: Reward signal
@@ -860,7 +990,6 @@ class TradingEnv(gym.Env):
         dd_threshold = self._reward_dd_threshold
         dd_penalty = self._reward_dd_penalty
         turnover_pen = self._reward_turnover_pen
-        calm_bonus = self._reward_calm_bonus
 
         # Primary signal: log change in equity
         if self.previous_net_worth > 0 and self.net_worth > 0:
@@ -878,33 +1007,47 @@ class TradingEnv(gym.Env):
         if log_return < 0:
             reward += log_return * base_scale * loss_multiplier
 
-        # Drawdown penalty: penalize increases in drawdown from peak
-        if self.max_net_worth > self.initial_balance:
-            current_dd = float((self.max_net_worth - self.net_worth) / self.max_net_worth)
-            if current_dd > dd_threshold:
-                reward -= current_dd * dd_penalty
-
-        # Calm holding bonus: reward holding LONG in calm, low-drawdown regimes
-        # This directly counters the "trade too little" problem in bull windows
-        if self.position == 1 and calm_bonus > 0:
-            rolling_dd_val = 0.0
-            vol_pct_val = 50.0
-            if self._rolling_dd_idx is not None:
-                rolling_dd_val = float(self._indicator_matrix[self.current_step, self._rolling_dd_idx])
-            if self._vol_pct_idx is not None:
-                vol_pct_val = float(self._indicator_matrix[self.current_step, self._vol_pct_idx])
-
-            # Stronger bonus when near highs and volatility is low
-            if rolling_dd_val > -2.5 and vol_pct_val < 68.0:
-                reward += calm_bonus * 2.0  # Double the bonus for holding long in good conditions
+        # Drawdown penalty: penalize worsening drawdown, not the absolute drawdown every step.
+        prev_peak = previous_max_net_worth if previous_max_net_worth > 0 else self.initial_balance
+        previous_dd = 0.0
+        if prev_peak > 0 and self.previous_net_worth > 0:
+            previous_dd = max(0.0, float((prev_peak - self.previous_net_worth) / prev_peak))
+        current_dd = 0.0
+        if self.max_net_worth > 0 and self.net_worth > 0:
+            current_dd = max(0.0, float((self.max_net_worth - self.net_worth) / self.max_net_worth))
+        dd_worsening = max(0.0, current_dd - previous_dd)
+        if current_dd > dd_threshold and dd_worsening > 0:
+            reward -= dd_worsening * dd_penalty * base_scale
 
         # Turnover penalty: discourage excessive trading (cost already in net_worth, this is extra signal)
         if position_changed:
             reward -= turnover_pen
 
-        # Inactivity penalty: gently discourage staying flat for long stretches.
-        if self.position == 0 and self.time_flat > self._reward_flat_grace and self._reward_flat_penalty > 0:
+        # Optional flat-time penalty: only apply in stronger opportunity regimes.
+        if (
+            self.position == 0
+            and self.time_flat > self._reward_flat_grace
+            and self._reward_flat_penalty > 0
+            and self._is_opportunity_regime(step_idx=opportunity_step_idx)
+        ):
             reward -= self._reward_flat_penalty * float(self.time_flat - self._reward_flat_grace)
+
+        # Reward realized trade quality as an ATR-normalized R multiple on exits/reductions.
+        if (
+            self._reward_realized_quality > 0
+            and realized_contracts > 0
+            and realized_position != 0
+            and realized_entry_price > 0
+            and exit_price > 0
+            and realized_risk_per_contract > 0
+        ):
+            if realized_position > 0:
+                realized_points = exit_price - realized_entry_price
+            else:
+                realized_points = realized_entry_price - exit_price
+            realized_pnl_per_contract = realized_points * self._point_value_decimal
+            realized_r_multiple = float(realized_pnl_per_contract / realized_risk_per_contract)
+            reward += float(np.clip(realized_r_multiple, -3.0, 3.0)) * float(self._reward_realized_quality)
 
         if not np.isfinite(reward):
             logging.warning("TradingEnv: encountered non-finite reward; replacing with 0.0")
@@ -912,3 +1055,13 @@ class TradingEnv(gym.Env):
 
         # Clamp reward to prevent gradient explosion from extreme values
         return max(min(reward, 10.0), -10.0)
+
+    def _is_opportunity_regime(self, step_idx: int | None = None) -> bool:
+        """Return whether a realized bar looks actionable enough to penalize inactivity."""
+        if self._vol_pct_raw_array is None:
+            return False
+        if step_idx is None:
+            step_idx = self.current_step
+        step_idx = max(0, min(int(step_idx), len(self._vol_pct_raw_array) - 1))
+        threshold = float(self._reward_opportunity_vol_pct)
+        return float(self._vol_pct_raw_array[step_idx]) >= threshold

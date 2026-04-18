@@ -69,7 +69,7 @@ if sys.platform == "darwin":
         return _OriginalSubproc(env_fns, start_method="fork")
 
     _train_module.SubprocVecEnv = _fork_subproc
-from utils.data_utils import filter_market_hours
+from utils.data_utils import filter_market_hours, market_hours_only_enabled
 from utils.seeding import set_global_seed
 from utils.synthetic_bears import augment_with_synthetic_bears, extract_ohlcv_frame
 from walk_forward import get_trading_days, load_tradingview_data
@@ -210,12 +210,13 @@ def drop_redundant_columns(*dfs):
     risk_config = config.get("risk_management", {})
     risk_enabled = risk_config.get("enabled", False)
     dynamic_sl_tp = risk_config.get("dynamic_sl_tp", {}).get("enabled", False)
-    sl_atr = risk_config.get("stop_loss", {}).get("mode") == "atr"
-    tp_atr = risk_config.get("take_profit", {}).get("mode") == "atr"
-    needs_ohlc = risk_enabled or dynamic_sl_tp or sl_atr or tp_atr
+    fixed_sl_enabled = risk_config.get("stop_loss", {}).get("enabled", False)
+    fixed_tp_enabled = risk_config.get("take_profit", {}).get("enabled", False)
+    trailing_stop_enabled = risk_config.get("trailing_stop", {}).get("enabled", False)
+    needs_ohlc = risk_enabled or dynamic_sl_tp or fixed_sl_enabled or fixed_tp_enabled or trailing_stop_enabled
     if not needs_ohlc:
         cols_to_drop.extend(
-            ["open", "Open", "OPEN", "high", "low", "High", "Low", "HIGH", "LOW", "close", "Close", "CLOSE"]
+            ["open", "Open", "OPEN", "high", "low", "High", "Low", "HIGH", "LOW"]
         )
     for df in dfs:
         present = [c for c in cols_to_drop if c in df.columns]
@@ -303,9 +304,11 @@ def main():
         logger.info(f"Dropping non-indicator source-CSV columns: {junk_cols}")
         full_data = full_data.drop(columns=junk_cols)
 
-    if config.get("data", {}).get("market_hours_only", True):
+    if market_hours_only_enabled(config):
         full_data = filter_market_hours(full_data)
-        logger.info(f"After market-hours filter: {len(full_data)} bars")
+        logger.info(f"After NYSE RTH filter: {len(full_data)} bars")
+    else:
+        logger.info("Using full-session data without NYSE RTH filtering")
 
     window_size = args.window_size or config.get("walk_forward", {}).get("window_size", 120)
     window_data = slice_last_window(full_data, window_size)

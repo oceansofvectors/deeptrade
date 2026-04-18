@@ -4,12 +4,16 @@
 import os
 import sys
 import unittest
+import copy
+import importlib
 from unittest import mock
 
 import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import action_space as action_space_module  # noqa: E402
+from config import config  # noqa: E402
 from trade import trade_with_risk_management  # noqa: E402
 
 
@@ -25,6 +29,15 @@ class _SequenceModel:
 
 
 class TestTradeWithRiskManagement(unittest.TestCase):
+    def setUp(self):
+        self._action_cfg = copy.deepcopy(config.get("action_space", {}))
+        config.setdefault("action_space", {})["mode"] = "fixed_contracts"
+        importlib.reload(action_space_module)
+
+    def tearDown(self):
+        config["action_space"] = self._action_cfg
+        importlib.reload(action_space_module)
+
     def _make_data(self):
         idx = pd.date_range("2026-01-02 09:30:00", periods=5, freq="1min", tz="UTC")
         closes = [100.0, 101.0, 102.0, 103.0, 104.0]
@@ -185,7 +198,7 @@ class TestTradeWithRiskManagement(unittest.TestCase):
                 transaction_cost=0.0,
                 close_at_end_of_day=False,
                 deterministic=True,
-                daily_risk_limit=100.0,
+                daily_risk_limit=0.5,
             )
 
         self.assertEqual(results["exit_reasons"]["daily_risk_limit"], 1)

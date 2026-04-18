@@ -11,7 +11,7 @@ At a high level, the system does this:
 1. Load OHLCV data from CSV or yfinance.
 2. Compute configured indicators and session-derived features.
 3. Optionally augment the training slice with synthetic bearish episodes.
-4. Optionally fit an LSTM-VAE on train data only and append latent features `LSTM_F*`.
+4. Optionally fit an LSTM-VAE on train data only and append latent features `LATENT_F*`.
 5. Fit normalization on the train split only and transform validation/test with the same parameters.
 6. Train a PPO or RecurrentPPO policy in `TradingEnv`.
 7. Select checkpoints on validation metrics with guardrails against degenerate policies.
@@ -45,7 +45,7 @@ Data processing in `get_data()`:
 - converts the timestamp column to a sorted `DatetimeIndex`
 - drops duplicate timestamps
 - computes enabled indicators
-- optionally filters to regular market hours when `data.market_hours_only` is enabled
+- optionally filters to NYSE regular trading hours (`09:30-16:00 America/New_York`, Monday-Friday) when `data.market_hours_only` is enabled
 - trims the warmup region at the front of the dataset
 - splits into train/validation/test using `data.train_ratio`, `data.validation_ratio`, and `data.test_ratio`
 
@@ -65,7 +65,7 @@ Available feature families include:
 - volume and price-location: `OBV`, `CMF`, `VWAP`, volume MA features
 - session features: opening range, day of week, minutes since open
 - anomaly features: `RRCF` anomaly score
-- learned latent features: `LSTM_F0...LSTM_Fn`
+- learned latent features: `LATENT_F0...LATENT_Fn`
 
 The environment observation is:
 
@@ -105,7 +105,7 @@ What it does:
 - creates sliding windows of length `lookback`
 - trains an `LSTMVAE` on train sequences only
 - uses the encoder mean as the latent representation
-- appends latent columns `LSTM_F0`, `LSTM_F1`, ... to each split
+- appends latent columns `LATENT_F0`, `LATENT_F1`, ... to each split
 
 The VAE is a beta-VAE:
 

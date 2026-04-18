@@ -15,7 +15,7 @@ python train_current_model.py --data data/NQ_live.csv
 ```
 
 What this does, in order:
-1. Loads the CSV and filters to NYSE market hours (`utils/data_utils.py`).
+1. Loads the CSV and, when `data.market_hours_only` is enabled, filters to NYSE regular trading hours (`09:30-16:00 America/New_York`, Monday-Friday) via `utils/data_utils.py`.
 2. Slices the **last `config.walk_forward.window_size`** trading days (120 by
    default).
 3. Splits train/validation/test = `config.data.{train,validation,test}_ratio`

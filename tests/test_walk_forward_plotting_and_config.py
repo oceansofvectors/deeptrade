@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from config import config  # noqa: E402
 from walk_forward import (  # noqa: E402
     _current_lstm_params_from_config,
+    _current_lstm_tuning_scope,
     plot_training_progress,
     plot_walk_forward_results,
     plot_window_performance,
@@ -45,6 +46,14 @@ class TestWalkForwardPlottingAndConfig(unittest.TestCase):
     def test_current_lstm_params_returns_none_when_disabled(self):
         config["indicators"]["lstm_features"]["enabled"] = False
         self.assertIsNone(_current_lstm_params_from_config())
+
+    def test_current_lstm_tuning_scope_defaults_to_session_on_invalid_value(self):
+        config["indicators"]["lstm_features"]["tuning"]["scope"] = "not_a_scope"
+        self.assertEqual(_current_lstm_tuning_scope(), "session")
+
+    def test_current_lstm_tuning_scope_accepts_per_window(self):
+        config["indicators"]["lstm_features"]["tuning"]["scope"] = "per_window"
+        self.assertEqual(_current_lstm_tuning_scope(), "per_window")
 
     def test_save_best_hyperparameters_to_config_updates_yaml(self):
         payload = {

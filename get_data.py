@@ -44,6 +44,7 @@ from indicators.z_score import calculate_zscore
 from indicators.rolling_drawdown import calculate_rolling_drawdown
 from indicators.vol_percentile import calculate_vol_percentile
 # Note: LSTM features are imported and used in walk_forward.py, not here
+from utils.session_context import build_session_context, session_config_from_mapping
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -52,28 +53,105 @@ logger = logging.getLogger(__name__)
 def _session_feature_config() -> dict:
     return config.get("data", {}).get("session", {})
 
-# Helper function to ensure numeric values
-def ensure_numeric(df, columns):
+
+def select_session_dominant_contract(
+    df: pd.DataFrame,
+    *,
+    symbol_col: str = "symbol",
+    instrument_col: str = "instrument_id",
+    volume_col: str = "volume",
+    keep: str = "last",
+) -> pd.DataFrame:
+    """Filter multi-contract source data to one dominant contract per session.
+
+    Some source CSVs contain overlapping expiries at the same timestamp. Simply
+    dropping duplicate timestamps creates a fake stitched price path that can
+    jump between contracts minute-to-minute. Select the session-dominant
+    contract (by total session volume, then row count) before deduplication.
     """
-    Ensure columns contain only numeric values.
-    
-    Args:
-        df: DataFrame to process
-        columns: List of column names to check/convert
-        
-    Returns:
-        DataFrame with numeric columns
-    """
-    for col in columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Drop rows with NaN in essential columns
-    df = df.dropna(subset=[col for col in columns if col in df.columns])
-    return df
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    has_symbol = symbol_col in df.columns
+    has_instrument = instrument_col in df.columns
+    if not has_symbol and not has_instrument:
+        if df.index.has_duplicates:
+            dup_count = int(df.index.duplicated(keep=keep).sum())
+            logger.warning(f"Dropping {dup_count} duplicate timestamp rows from source CSV")
+            return df[~df.index.duplicated(keep=keep)]
+        return df
+
+    working = df.copy()
+    symbol_series = (
+        working[symbol_col].astype(str).where(working[symbol_col].notna(), "")
+        if has_symbol else pd.Series("", index=working.index, dtype=object)
+    )
+    instrument_series = (
+        working[instrument_col].astype(str).where(working[instrument_col].notna(), "")
+        if has_instrument else pd.Series("", index=working.index, dtype=object)
+    )
+    contract_key = symbol_series.where(symbol_series != "", instrument_series)
+
+    if (contract_key == "").all():
+        if working.index.has_duplicates:
+            dup_count = int(working.index.duplicated(keep=keep).sum())
+            logger.warning(f"Dropping {dup_count} duplicate timestamp rows from source CSV")
+            return working[~working.index.duplicated(keep=keep)]
+        return working
+
+    duplicate_contract_counts = pd.Series(contract_key, index=working.index).groupby(level=0).nunique()
+    multi_contract_timestamps = int((duplicate_contract_counts > 1).sum())
+    if multi_contract_timestamps == 0:
+        if working.index.has_duplicates:
+            dup_count = int(working.index.duplicated(keep=keep).sum())
+            logger.warning(f"Dropping {dup_count} duplicate timestamp rows from source CSV")
+            return working[~working.index.duplicated(keep=keep)]
+        return working
+
+    session_ctx = build_session_context(working.index, session_config_from_mapping(_session_feature_config()))
+    working["_session_anchor"] = session_ctx["session_anchor"]
+    working["_contract_key"] = contract_key.to_numpy()
+
+    if volume_col in working.columns:
+        volume_series = pd.to_numeric(working[volume_col], errors="coerce").fillna(0.0)
+    else:
+        volume_series = pd.Series(0.0, index=working.index)
+    working["_contract_volume"] = volume_series.to_numpy()
+
+    ranked = (
+        working.groupby(["_session_anchor", "_contract_key"], dropna=False)
+        .agg(_session_volume=("_contract_volume", "sum"), _rows=("_contract_key", "size"))
+        .reset_index()
+        .sort_values(
+            ["_session_anchor", "_session_volume", "_rows", "_contract_key"],
+            ascending=[True, False, False, True],
+        )
+    )
+    dominant = ranked.drop_duplicates(subset=["_session_anchor"], keep="first")
+    dominant_lookup = dominant.set_index("_session_anchor")["_contract_key"]
+    selected_contract = pd.Index(working["_session_anchor"]).map(dominant_lookup)
+    filtered = working.loc[working["_contract_key"].to_numpy() == selected_contract.to_numpy()].copy()
+    filtered.drop(columns=["_session_anchor", "_contract_key", "_contract_volume"], inplace=True)
+    filtered.sort_index(inplace=True)
+
+    contract_switches = int((dominant["_contract_key"] != dominant["_contract_key"].shift()).sum() - 1)
+    logger.warning(
+        "Filtered source data to one dominant contract per session: kept %d/%d rows across %d multi-contract timestamps (%d session rolls)",
+        len(filtered),
+        len(df),
+        multi_contract_timestamps,
+        max(contract_switches, 0),
+    )
+
+    if filtered.index.has_duplicates:
+        dup_count = int(filtered.index.duplicated(keep=keep).sum())
+        logger.warning(f"Dropping {dup_count} duplicate timestamp rows after contract filtering")
+        filtered = filtered[~filtered.index.duplicated(keep=keep)]
+
+    return filtered
 
 # Import shared utilities to avoid circular dependencies
-from utils.data_utils import filter_market_hours
+from utils.data_utils import filter_market_hours, market_hours_only_enabled
 
 def download_data(symbol: str = "NQ=F", period: str = "60d", interval: str = "5m") -> pd.DataFrame:
     """
@@ -149,26 +227,37 @@ def download_data(symbol: str = "NQ=F", period: str = "60d", interval: str = "5m
         logger.error(traceback.format_exc())
         return None
 
-def ensure_numeric(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+def ensure_numeric(df: pd.DataFrame, columns: List[str], *, drop_invalid: bool = False) -> pd.DataFrame:
     """
-    Ensure columns in DataFrame are numeric types and handle any conversion issues.
+    Ensure columns in DataFrame are numeric types and handle conversion issues.
     
     Args:
         df: DataFrame to process
         columns: List of column names to ensure are numeric
+        drop_invalid: Whether to drop rows with NaN in the requested columns
         
     Returns:
         DataFrame with numeric columns
     """
+    numeric_df = df.copy()
     for col in columns:
-        if col in df.columns:
+        if col in numeric_df.columns:
             try:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+                numeric_df[col] = pd.to_numeric(numeric_df[col], errors='coerce')
             except Exception as e:
                 logger.warning(f"Error converting {col} to numeric: {e}. Using best effort conversion.")
                 # Try a more robust conversion
-                df[col] = df[col].astype(str).str.replace(',', '').astype(float)
-    return df
+                numeric_df[col] = numeric_df[col].astype(str).str.replace(',', '').astype(float)
+
+    if drop_invalid:
+        present_cols = [col for col in columns if col in numeric_df.columns]
+        if present_cols:
+            before_rows = len(numeric_df)
+            numeric_df = numeric_df.dropna(subset=present_cols)
+            dropped_rows = before_rows - len(numeric_df)
+            if dropped_rows:
+                logger.warning("Dropped %d rows with invalid numeric values in columns %s", dropped_rows, present_cols)
+    return numeric_df
 
 def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> pd.DataFrame:
     """
@@ -369,6 +458,15 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
             df = calculate_vol_percentile(df, window=config["indicators"]["vol_percentile"].get("window", 60),
                                          target_col='VOL_PERCENTILE')
 
+        # Preserve raw-unit risk/regime signals for reward shaping and ATR-based execution logic.
+        for raw_col, source_col in (
+            ("ATR_RAW", "ATR"),
+            ("ROLLING_DD_RAW", "ROLLING_DD"),
+            ("VOL_PERCENTILE_RAW", "VOL_PERCENTILE"),
+        ):
+            if source_col in df.columns:
+                df[raw_col] = pd.to_numeric(df[source_col], errors="coerce")
+
         # Note: LSTM features are generated in walk_forward.py, not here
         # This ensures the autoencoder is pre-trained once on training data only
 
@@ -410,7 +508,7 @@ def process_technical_indicators(df: pd.DataFrame, train_ratio: float = 0.7) -> 
                 if indicator not in ['supertrend', 'RSI', 'PSAR_DIR', 'RRCF_ANOMALY', 'VWAP_ABOVE', 'OR_BREAKOUT_DIR', 'OR_BREAKOUT_ACTIVE']:
                     indicators_to_normalize.append(indicator)
 
-        # Note: LSTM features (LSTM_F0, LSTM_F1, etc.) are added in walk_forward.py
+        # Note: latent VAE features (LATENT_F0, LATENT_F1, etc.) are added in walk_forward.py
 
         # Fill any remaining NaN values
         df = df.fillna(0)
@@ -547,10 +645,7 @@ def get_data(symbol: str = "NQ=F",
             # Set timestamp as index
             df = df.set_index('timestamp')
             df = df.sort_index()
-            if df.index.has_duplicates:
-                dup_count = int(df.index.duplicated(keep='last').sum())
-                logger.warning(f"Dropping {dup_count} duplicate timestamp rows from source CSV")
-                df = df[~df.index.duplicated(keep='last')]
+            df = select_session_dominant_contract(df, keep='last')
             logger.info("Successfully converted timestamp column to datetime index")
         except Exception as e:
             logger.error(f"Error converting timestamp column: {e}")
@@ -562,14 +657,13 @@ def get_data(symbol: str = "NQ=F",
         essential_columns = ['open', 'high', 'low', 'close', 'volume']
         
         # Use the helper function to ensure numeric data
-        df = ensure_numeric(df, essential_columns)
+        df = ensure_numeric(df, essential_columns, drop_invalid=True)
         
         # Drop any duplicate columns and NaN values
         df = df.loc[:, ~df.columns.duplicated()]
         
         logger.info(f"After preprocessing. Shape: {df.shape}")
         logger.info(f"Columns after preprocessing: {df.columns.tolist()}")
-        print(df.head())
         
         # Process technical indicators
         logger.info("Step 4: Processing technical indicators")
@@ -577,14 +671,11 @@ def get_data(symbol: str = "NQ=F",
         logger.info(f"Technical indicators processed. Available columns: {df.columns.tolist()}")
 
         # After all processing, check if we should filter to market hours only
-        if config["data"].get("market_hours_only", False):
-            logger.info("Step 5: Filtering data to include only NYSE market hours")
-            try:
-                # Try to import again in case it wasn't available earlier
-                from walk_forward import filter_market_hours
-                df = filter_market_hours(df)
-            except ImportError:
-                logger.warning("Could not import filter_market_hours from walk_forward module. Using unfiltered data.")
+        if market_hours_only_enabled(config):
+            logger.info("Step 5: Filtering data to NYSE RTH only")
+            df = filter_market_hours(df)
+        else:
+            logger.info("Step 5: Keeping full-session data without NYSE RTH filtering")
         
         # Trim the first 30 rows which may contain incomplete indicator data
         logger.info("Step 6: Trimming first 30 rows with incomplete indicator initialization")

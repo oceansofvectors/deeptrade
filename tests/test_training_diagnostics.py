@@ -114,7 +114,7 @@ class TestTrainingDiagnostics(unittest.TestCase):
         results = {
             "trade_count": 80,
             "action_counts": {0: 20, 3: 30, 6: 50},
-            "max_drawdown": -45.0,
+            "max_drawdown": -65.0,
             "total_return_pct": 5.0,
         }
         enriched = _with_training_diagnostics(
@@ -129,11 +129,23 @@ class TestTrainingDiagnostics(unittest.TestCase):
         self.assertFalse(enriched["has_acceptable_drawdown"])
         self.assertIn("excessive_drawdown", enriched["collapse_flags"])
 
-    def test_infer_periods_per_year_for_one_minute_data(self):
+    def test_infer_periods_per_year_for_short_one_minute_data(self):
         idx = pd.date_range("2026-01-01", periods=10, freq="1min", tz="UTC")
         periods = _infer_periods_per_year(idx)
         self.assertGreater(periods, 500000)
         self.assertLess(periods, 530000)
+
+    def test_infer_periods_per_year_uses_active_bars_per_day_when_available(self):
+        day1 = pd.date_range("2026-01-05 14:30:00", periods=390, freq="1min", tz="UTC")
+        day2 = pd.date_range("2026-01-06 14:30:00", periods=390, freq="1min", tz="UTC")
+        day3 = pd.date_range("2026-01-07 14:30:00", periods=390, freq="1min", tz="UTC")
+        day4 = pd.date_range("2026-01-08 14:30:00", periods=390, freq="1min", tz="UTC")
+        day5 = pd.date_range("2026-01-09 14:30:00", periods=390, freq="1min", tz="UTC")
+        idx = day1.append([day2, day3, day4, day5])
+
+        periods = _infer_periods_per_year(idx)
+
+        self.assertEqual(periods, 390 * 252)
 
     def test_sortino_is_negative_for_crash_path(self):
         idx = pd.date_range("2026-01-01", periods=5, freq="1min", tz="UTC")

@@ -44,6 +44,7 @@ def calculate_zscore(df, length=100, target_col='ZScore'):
 
         # Calculate Z-Score using pandas_ta
         zscore = ta.zscore(result_df[close_col], length=length)
+        zscore = zscore.replace([np.inf, -np.inf], np.nan)
 
         # Add to DataFrame
         result_df[target_col] = zscore

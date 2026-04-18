@@ -56,6 +56,7 @@ class _FakeStudy:
         self.trial = trial
         self.best_params = {}
         self.best_value = float("-inf")
+        self.trials = []
 
     def optimize(self, objective, n_trials, n_jobs=None, show_progress_bar=False):
         try:
@@ -66,11 +67,32 @@ class _FakeStudy:
                 "n_steps": 256,
                 "ent_coef": 0.1,
                 "reward_turnover_penalty": 0.01,
-                "reward_calm_holding_bonus": 0.001,
             }
+            self.trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE)]
         except optuna.TrialPruned:
             self.best_value = float("-inf")
             self.best_params = {}
+            self.trials = [SimpleNamespace(state=optuna.trial.TrialState.PRUNED)]
+
+
+class _FakeStudyNoCompleted:
+    def __init__(self, trial):
+        self.trial = trial
+        self.trials = []
+
+    def optimize(self, objective, n_trials, n_jobs=None, show_progress_bar=False):
+        try:
+            objective(self.trial)
+        except optuna.TrialPruned:
+            self.trials = [SimpleNamespace(state=optuna.trial.TrialState.PRUNED)]
+
+    @property
+    def best_params(self):
+        raise ValueError("No trials are completed yet.")
+
+    @property
+    def best_value(self):
+        raise ValueError("No trials are completed yet.")
 
 
 class TestRunTuningStage(unittest.TestCase):
@@ -81,7 +103,6 @@ class TestRunTuningStage(unittest.TestCase):
         config["model"]["gae_lambda"] = 0.95
         config["model"]["max_grad_norm"] = 0.5
         config["reward"]["turnover_penalty"] = 0.01
-        config["reward"]["calm_holding_bonus"] = 0.001
         config["training"]["random_start_pct"] = 0.2
         config["hyperparameter_tuning"]["pruning_eval_steps"] = 1000
         config["sequence_model"]["enabled"] = False
@@ -99,7 +120,6 @@ class TestRunTuningStage(unittest.TestCase):
                 "n_steps": {"min": 128, "max": 512, "log": True},
                 "ent_coef": {"min": 0.01, "max": 0.2},
                 "reward_turnover_penalty": {"min": 0.0, "max": 0.02},
-                "reward_calm_holding_bonus": {"min": 0.0, "max": 0.01},
             },
             train_data=df,
             validation_data=df,
@@ -133,7 +153,6 @@ class TestRunTuningStage(unittest.TestCase):
                  "n_steps": 256,
                  "ent_coef": 0.1,
                  "reward_turnover_penalty": 0.01,
-                 "reward_calm_holding_bonus": 0.001,
              }), \
              mock.patch("walk_forward._build_tuning_env", return_value=(train_env, 1)), \
              mock.patch("walk_forward.get_device", return_value="cpu"), \
@@ -191,6 +210,32 @@ class TestRunTuningStage(unittest.TestCase):
         self.assertEqual(result["best_params"], {})
         self.assertEqual(result["best_value"], float("-inf"))
         self.assertEqual(trial.user_attrs["hard_prune_reasons"], ["zero_trade"])
+        self.assertTrue(train_env.closed)
+
+    def test_run_tuning_stage_handles_real_optuna_no_completed_trials(self):
+        trial = _FakeTrial()
+        study = _FakeStudyNoCompleted(trial)
+        train_env = _FakeEnv()
+
+        with mock.patch("walk_forward.optuna.samplers.TPESampler"), \
+             mock.patch("walk_forward.optuna.pruners.MedianPruner"), \
+             mock.patch("walk_forward.optuna.create_study", return_value=study), \
+             mock.patch("walk_forward._sample_stage_params", return_value={
+                 "learning_rate": 1e-4,
+                 "n_steps": 256,
+                 "ent_coef": 0.1,
+             }), \
+             mock.patch("walk_forward._build_tuning_env", return_value=(train_env, 1)), \
+             mock.patch("walk_forward.get_device", return_value="cpu"), \
+             mock.patch("walk_forward.PPO", _FakeModel), \
+             mock.patch("walk_forward.evaluate_agent", return_value={"total_return_pct": -10.0, "trade_count": 0, "action_counts": {6: 100}}), \
+             mock.patch("walk_forward._score_tuning_trial", return_value=(-5.0, {})), \
+             mock.patch("walk_forward._should_hard_prune_trial", return_value=(True, ["zero_trade"])):
+            result = _run_tuning_stage(**{**self._base_kwargs(), "evaluation_sets": [pd.DataFrame({"close": [1.0], "close_norm": [0.1]})], "baseline_scores": [{0: 0.0}]})
+
+        self.assertEqual(result["best_params"], {})
+        self.assertEqual(result["best_value"], float("-inf"))
+        self.assertIs(result["study"], study)
         self.assertTrue(train_env.closed)
 
 

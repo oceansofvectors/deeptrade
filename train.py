@@ -23,8 +23,14 @@ try:
 except ImportError:
     RECURRENT_PPO_AVAILABLE = False
 
+try:
+    from sb3_contrib import QRDQN
+    QRDQN_AVAILABLE = True
+except ImportError:
+    QRDQN_AVAILABLE = False
+
 # Local application imports
-from action_space import action_label
+from action_space import ACTION_COUNT, FLAT_ACTION, LONG_ACTIONS, SHORT_ACTIONS, action_label
 from config import config
 from environment import TradingEnv
 from get_data import get_data
@@ -45,6 +51,52 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FEE_RATE = 0.0  # No trading fees
+
+
+def get_configured_algorithm() -> str:
+    """Return the configured RL algorithm with safe fallbacks."""
+    sequence_enabled = bool(config.get("sequence_model", {}).get("enabled", False))
+    requested = str(
+        config.get(
+            "model",
+            {},
+        ).get(
+            "algorithm",
+            "recurrent_ppo" if sequence_enabled else "ppo",
+        )
+    ).lower()
+    if requested == "recurrent_ppo":
+        if not sequence_enabled:
+            return "ppo"
+        if RECURRENT_PPO_AVAILABLE:
+            return requested
+        logger.warning("RecurrentPPO requested but sb3-contrib is unavailable. Falling back to PPO.")
+        return "ppo"
+    if requested == "qrdqn":
+        if QRDQN_AVAILABLE:
+            return requested
+        logger.warning("QR-DQN requested but sb3-contrib is unavailable. Falling back to PPO.")
+        return "ppo"
+    return "ppo"
+
+
+def _resolve_qrdqn_params(model_params: dict | None = None) -> dict:
+    """Resolve QR-DQN-specific hyperparameters from config plus optional overrides."""
+    model_cfg = config.get("model", {})
+    merged = dict(model_params or {})
+    return {
+        "learning_rate": merged.get("learning_rate", model_cfg.get("learning_rate", 0.0003)),
+        "batch_size": int(merged.get("batch_size", model_cfg.get("batch_size", 64))),
+        "gamma": float(merged.get("gamma", model_cfg.get("gamma", 0.99))),
+        "buffer_size": int(merged.get("buffer_size", model_cfg.get("buffer_size", 200000))),
+        "learning_starts": int(merged.get("learning_starts", model_cfg.get("learning_starts", 5000))),
+        "train_freq": int(merged.get("train_freq", model_cfg.get("train_freq", 16))),
+        "gradient_steps": int(merged.get("gradient_steps", model_cfg.get("gradient_steps", 4))),
+        "target_update_interval": int(merged.get("target_update_interval", model_cfg.get("target_update_interval", 2000))),
+        "exploration_fraction": float(merged.get("exploration_fraction", model_cfg.get("exploration_fraction", 0.15))),
+        "exploration_initial_eps": float(merged.get("exploration_initial_eps", model_cfg.get("exploration_initial_eps", 1.0))),
+        "exploration_final_eps": float(merged.get("exploration_final_eps", model_cfg.get("exploration_final_eps", 0.05))),
+    }
 
 
 def _checkpoint_prefix(window_folder: str | None) -> str:
@@ -70,6 +122,22 @@ def _extract_metric_value(results: dict, evaluation_metric: str) -> tuple[float,
     return results["total_return_pct"], "return"
 
 
+def _economic_trade_count(results: dict) -> int:
+    """Return the number of completed economic trades, not raw rebalances."""
+    if results is None:
+        return 0
+    if "economic_trade_count" in results:
+        return int(results.get("economic_trade_count", 0))
+    if "completed_trades" in results:
+        return int(results.get("completed_trades", 0))
+
+    trade_history = results.get("trade_history")
+    if isinstance(trade_history, list):
+        return int(sum(1 for trade in trade_history if isinstance(trade, dict) and trade.get("realized_trade", False)))
+
+    return int(results.get("trade_count", results.get("num_trades", 0)))
+
+
 def _with_training_diagnostics(
     results: dict,
     *,
@@ -82,10 +150,12 @@ def _with_training_diagnostics(
     """Attach policy-collapse diagnostics to an evaluation result."""
     enriched = dict(results)
     action_counts = {int(k): int(v) for k, v in enriched.get("action_counts", {}).items()}
+    economic_trade_count = _economic_trade_count(enriched)
+    rebalance_count = int(enriched.get("trade_count", enriched.get("num_trades", 0)))
     total_actions = max(1, sum(action_counts.values()))
-    long_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (0, 1, 2)) / total_actions
-    short_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in (3, 4, 5)) / total_actions
-    flat_action_pct = 100.0 * action_counts.get(6, 0) / total_actions
+    long_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in LONG_ACTIONS) / total_actions
+    short_action_pct = 100.0 * sum(action_counts.get(i, 0) for i in SHORT_ACTIONS) / total_actions
+    flat_action_pct = 100.0 * action_counts.get(FLAT_ACTION, 0) / total_actions
     dominant_action_pct = max(long_action_pct, short_action_pct, flat_action_pct)
     active_actions = sum(1 for count in action_counts.values() if count > 0)
     max_flat_action_pct = float(config.get("training", {}).get("max_flat_action_pct", 80.0))
@@ -102,7 +172,7 @@ def _with_training_diagnostics(
         collapse_flags.append("single_action_policy")
     if max_drawdown_abs > max_allowed_drawdown_pct:
         collapse_flags.append("excessive_drawdown")
-    if enriched.get("trade_count", 0) < min_trades:
+    if economic_trade_count < min_trades:
         collapse_flags.append("too_few_trades")
     if metric_drop_from_best is not None and metric_drop_from_best <= -2.0:
         collapse_flags.append("metric_drop")
@@ -117,7 +187,9 @@ def _with_training_diagnostics(
     enriched.update({
         "metric_used": metric_name,
         "loss_info": loss_info,
-        "has_enough_trades": enriched.get("trade_count", 0) >= min_trades,
+        "has_enough_trades": economic_trade_count >= min_trades,
+        "economic_trade_count": economic_trade_count,
+        "rebalance_count": rebalance_count,
         "has_enough_action_mix": has_enough_action_mix,
         "has_acceptable_drawdown": has_acceptable_drawdown,
         "min_trades_required": min_trades,
@@ -137,7 +209,7 @@ def _with_training_diagnostics(
         ),
         "warning_metric_drop": "metric_drop" in collapse_flags,
         "action_distribution": {
-            action_label(i): 100.0 * action_counts.get(i, 0) / total_actions for i in range(7)
+            action_label(i): 100.0 * action_counts.get(i, 0) / total_actions for i in range(ACTION_COUNT)
         },
     })
     return enriched
@@ -149,6 +221,13 @@ def _infer_periods_per_year(index) -> float:
         return 252.0
 
     dt_index = pd.DatetimeIndex(index)
+    active_days = dt_index.normalize()
+    if active_days.nunique() >= 5:
+        bars_per_day = active_days.to_series().groupby(active_days).size()
+        median_bars_per_day = float(bars_per_day.median()) if not bars_per_day.empty else 0.0
+        if median_bars_per_day > 0:
+            return median_bars_per_day * 252.0
+
     deltas = dt_index.to_series().diff().dropna().dt.total_seconds()
     deltas = deltas[deltas > 0]
     if deltas.empty:
@@ -198,7 +277,7 @@ def _fallback_candidate_score(results: dict) -> float:
     metric_value = float(
         results.get("sortino_ratio", results.get("calmar_ratio", results.get("total_return_pct", 0.0)))
     )
-    trade_count = float(results.get("trade_count", 0))
+    trade_count = float(_economic_trade_count(results))
     flat_action_pct = float(results.get("flat_action_pct", 100.0))
     active_action_count = float(results.get("active_action_count", 0))
     collapse_flags = set(results.get("collapse_flags", []))
@@ -216,6 +295,50 @@ def _fallback_candidate_score(results: dict) -> float:
         score -= 1.5
 
     return float(score)
+
+
+def _is_meaningful_metric_improvement(
+    current_metric_value: float,
+    best_metric_value: float,
+    improvement_threshold: float,
+) -> bool:
+    """Return whether a metric improvement clears the configured significance threshold.
+
+    ``improvement_threshold`` is treated as a relative hurdle against the current best
+    metric with a minimum absolute scale of 1.0 so near-zero metrics do not trigger
+    endless tiny "improvements" from noise alone.
+    """
+    current_metric_value = float(current_metric_value)
+    best_metric_value = float(best_metric_value)
+    improvement_threshold = max(0.0, float(improvement_threshold))
+
+    if not np.isfinite(current_metric_value):
+        return False
+    if not np.isfinite(best_metric_value):
+        return True
+
+    improvement = current_metric_value - best_metric_value
+    if improvement <= 0.0:
+        return False
+    if improvement_threshold <= 0.0:
+        return True
+
+    required_delta = max(1.0, abs(best_metric_value)) * improvement_threshold
+    return improvement >= required_delta
+
+
+def _ensure_close_norm_column(test_data: pd.DataFrame) -> None:
+    """Create a causal close_norm fallback when callers forgot to pass scaled data."""
+    if "close_norm" in test_data.columns:
+        return
+
+    close_col = "Close" if "Close" in test_data.columns else ("CLOSE" if "CLOSE" in test_data.columns else "close")
+    close_series = pd.to_numeric(test_data[close_col], errors="coerce").ffill().bfill()
+    running_min = close_series.cummin()
+    running_max = close_series.cummax()
+    running_range = (running_max - running_min).replace(0, np.nan)
+    close_norm = ((close_series - running_min) / running_range).clip(0, 1)
+    test_data["close_norm"] = close_norm.fillna(0.5)
 
 
 class LossTrackingCallback(BaseCallback):
@@ -316,10 +439,12 @@ def train_agent(train_data, total_timesteps: int):
     check_env(single_env, skip_render_check=True)
 
     # Create vectorized environment for faster rollout collection
-    # Get sequence model config
     seq_config = config.get("sequence_model", {})
-    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+    algorithm = get_configured_algorithm()
+    use_recurrent = algorithm == "recurrent_ppo"
     n_envs = config.get("training", {}).get("n_envs", 4)
+    if algorithm == "qrdqn":
+        n_envs = 1
     env_kwargs["random_start_pct"] = float(config.get("training", {}).get("random_start_pct", 0.2))
     if use_recurrent:
         env_kwargs["min_episode_steps"] = max(2, int(config["model"].get("n_steps", 2048)))
@@ -341,7 +466,7 @@ def train_agent(train_data, total_timesteps: int):
     logger.info(f"Using device: {device}")
 
     # Check for learning rate decay in config
-    use_lr_decay = config["model"].get("use_lr_decay", False)
+    use_lr_decay = config["model"].get("use_lr_decay", False) and algorithm != "qrdqn"
     if use_lr_decay:
         # Set up learning rate parameters
         initial_lr = config["model"].get("learning_rate", 0.0003)
@@ -357,9 +482,9 @@ def train_agent(train_data, total_timesteps: int):
         learning_rate = config["model"].get("learning_rate", 0.0003)
 
     # Check for entropy coefficient decay in config
-    use_ent_decay = config["model"].get("ent_coef_decay", False)
+    use_ent_decay = config["model"].get("ent_coef_decay", False) and algorithm != "qrdqn"
     entropy_callback = None
-    if use_ent_decay and not use_recurrent:
+    if use_ent_decay and algorithm == "ppo":
         initial_ent = config["model"].get("ent_coef", 0.01)
         final_ent = config["model"].get("final_ent_coef", 0.001)
         from stable_baselines3.common.utils import LinearSchedule
@@ -399,9 +524,29 @@ def train_agent(train_data, total_timesteps: int):
                 "net_arch": {"pi": [128, 64], "vf": [128, 64]},
             }
         )
+    elif algorithm == "qrdqn":
+        logger.info("Using QR-DQN benchmark policy")
+        qrdqn_params = _resolve_qrdqn_params()
+        model = QRDQN(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            learning_rate=qrdqn_params["learning_rate"],
+            batch_size=qrdqn_params["batch_size"],
+            gamma=qrdqn_params["gamma"],
+            buffer_size=qrdqn_params["buffer_size"],
+            learning_starts=qrdqn_params["learning_starts"],
+            train_freq=qrdqn_params["train_freq"],
+            gradient_steps=qrdqn_params["gradient_steps"],
+            target_update_interval=qrdqn_params["target_update_interval"],
+            exploration_fraction=qrdqn_params["exploration_fraction"],
+            exploration_initial_eps=qrdqn_params["exploration_initial_eps"],
+            exploration_final_eps=qrdqn_params["exploration_final_eps"],
+            seed=config.get('seed'),
+            device=device,
+            policy_kwargs={"net_arch": [256, 256]},
+        )
     else:
-        if seq_config.get("enabled", False) and not RECURRENT_PPO_AVAILABLE:
-            logger.warning("RecurrentPPO requested but sb3-contrib not installed. Falling back to standard PPO.")
         model = PPO(
             "MlpPolicy",
             env,
@@ -457,7 +602,10 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     logger.debug(f"Observation space: {single_env.observation_space.shape}, indicators: {len(single_env.technical_indicators)}")
 
     # Create vectorized environment for faster rollout collection
+    algorithm = get_configured_algorithm()
     n_envs = config.get("training", {}).get("n_envs", 4)
+    if algorithm == "qrdqn":
+        n_envs = 1
     env_kwargs["random_start_pct"] = float(config.get("training", {}).get("random_start_pct", 0.2))
 
     # Get verbosity level from config
@@ -473,6 +621,8 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
             "gamma": config["model"].get("gamma", 0.99),
             "gae_lambda": config["model"].get("gae_lambda", 0.95),
         }
+        if algorithm == "qrdqn":
+            model_params.update(_resolve_qrdqn_params())
     
     best_model_path = _checkpoint_prefix(window_folder)
     fallback_model_path = f"{best_model_path}_fallback"
@@ -480,7 +630,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     fallback_results = None
 
     # Get learning rate decay parameters from config or use defaults
-    use_lr_decay = config["model"].get("use_lr_decay", False)
+    use_lr_decay = config["model"].get("use_lr_decay", False) and algorithm != "qrdqn"
     # Total timesteps for decay is initial + additional * max iterations
     total_decay_timesteps = initial_timesteps + (additional_timesteps * max_iterations)
 
@@ -499,7 +649,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
 
     # Get sequence model config (need this before entropy coef setup)
     seq_config = config.get("sequence_model", {})
-    use_recurrent = seq_config.get("enabled", False) and RECURRENT_PPO_AVAILABLE
+    use_recurrent = algorithm == "recurrent_ppo"
     if use_recurrent:
         env_kwargs["min_episode_steps"] = max(2, int(model_params.get("n_steps", config["model"].get("n_steps", 2048))))
 
@@ -515,9 +665,9 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
     train_env.seed(base_seed)
 
     # Get entropy coefficient decay parameters from config or use defaults
-    use_ent_decay = config["model"].get("ent_coef_decay", False)
+    use_ent_decay = config["model"].get("ent_coef_decay", False) and algorithm != "qrdqn"
     entropy_callback = None
-    if use_ent_decay and not use_recurrent:
+    if use_ent_decay and algorithm == "ppo":
         initial_ent = model_params.get("ent_coef", 0.01)
         final_ent = config["model"].get("final_ent_coef", 0.001)
         from stable_baselines3.common.utils import LinearSchedule
@@ -565,9 +715,29 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
                 "net_arch": {"pi": [128, 64], "vf": [128, 64]},
             }
         )
+    elif algorithm == "qrdqn":
+        logger.debug("Using QR-DQN benchmark policy")
+        qrdqn_params = _resolve_qrdqn_params(model_params)
+        model = QRDQN(
+            "MlpPolicy",
+            train_env,
+            verbose=verbose_level,
+            learning_rate=qrdqn_params["learning_rate"],
+            batch_size=qrdqn_params["batch_size"],
+            gamma=qrdqn_params["gamma"],
+            buffer_size=qrdqn_params["buffer_size"],
+            learning_starts=qrdqn_params["learning_starts"],
+            train_freq=qrdqn_params["train_freq"],
+            gradient_steps=qrdqn_params["gradient_steps"],
+            target_update_interval=qrdqn_params["target_update_interval"],
+            exploration_fraction=qrdqn_params["exploration_fraction"],
+            exploration_initial_eps=qrdqn_params["exploration_initial_eps"],
+            exploration_final_eps=qrdqn_params["exploration_final_eps"],
+            seed=config.get('seed'),
+            device=device,
+            policy_kwargs={"net_arch": [256, 256]},
+        )
     else:
-        if seq_config.get("enabled", False) and not RECURRENT_PPO_AVAILABLE:
-            logger.warning("RecurrentPPO requested but sb3-contrib not installed. Falling back to standard PPO.")
         model = PPO(
             "MlpPolicy",
             train_env,
@@ -703,7 +873,12 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         has_enough_trades = results["has_enough_trades"]
         has_enough_action_mix = results["has_enough_action_mix"]
         has_acceptable_drawdown = results["has_acceptable_drawdown"]
-        if current_metric_value > best_metric_value and has_enough_trades and has_enough_action_mix and has_acceptable_drawdown:
+        meaningful_improvement = _is_meaningful_metric_improvement(
+            current_metric_value,
+            best_metric_value,
+            improvement_threshold,
+        )
+        if meaningful_improvement and has_enough_trades and has_enough_action_mix and has_acceptable_drawdown:
             best_metric_value = current_metric_value
             results["is_best"] = True
             best_results = dict(results)
@@ -724,7 +899,7 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
                 f"ActionPct(L/S/F)=({results['long_action_pct']:.1f}/{results['short_action_pct']:.1f}/{results['flat_action_pct']:.1f})"
                 f"{collapse_warning}"
             )
-        elif current_metric_value > best_metric_value and (not has_enough_trades or not has_enough_action_mix or not has_acceptable_drawdown):
+        elif meaningful_improvement and (not has_enough_trades or not has_enough_action_mix or not has_acceptable_drawdown):
             metric_stagnant_counter += 1
             reject_reasons = []
             if not has_enough_trades:
@@ -745,13 +920,20 @@ def train_agent_iteratively(train_data, validation_data, initial_timesteps: int,
         else:
             metric_stagnant_counter += 1
             warnings = f", Warnings={results['collapse_flags']}" if results["collapse_flags"] else ""
+            threshold_note = ""
+            if current_metric_value > best_metric_value and not meaningful_improvement:
+                required_delta = max(1.0, abs(float(best_metric_value))) * max(0.0, float(improvement_threshold))
+                threshold_note = (
+                    f", below improvement threshold "
+                    f"(delta={current_metric_value - best_metric_value:.4f} < {required_delta:.4f})"
+                )
             logger.info(
                 f"{window_label}Iter {iteration} - Val {metric_name}={color_value(current_metric_value)}, "
                 f"Train loss={current_loss:.4f} [no improvement {metric_stagnant_counter}/{n_stagnant_loops}], "
                 f"Portfolio=${results['final_portfolio_value']:.2f}, Trades={results['trade_count']}, "
                 f"Actions={{{format_action_distribution(results['action_counts'])}}}, "
                 f"ActionPct(L/S/F)=({results['long_action_pct']:.1f}/{results['short_action_pct']:.1f}/{results['flat_action_pct']:.1f})"
-                f"{warnings}"
+                f"{threshold_note}{warnings}"
             )
 
         all_results.append(dict(results))
@@ -794,22 +976,10 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     Returns:
         Dict: Results including portfolio value, return, etc.
     """
-    # Check for the presence of close_norm column
-    if 'close_norm' not in test_data.columns:
-        # Determine which price column names are used in this dataframe
-        if 'Close' in test_data.columns:
-            close_col = 'Close'
-        else:
-            close_col = 'close'
-
-        # Calculate close_norm using min/max scaling to [0, 1]
-        close_min = test_data[close_col].min()
-        close_max = test_data[close_col].max()
-        close_range = close_max - close_min
-        if close_range > 0:
-            test_data['close_norm'] = ((test_data[close_col] - close_min) / close_range).clip(0, 1)
-        else:
-            test_data['close_norm'] = 0.5
+    # Evaluate on scaled data when available. If a caller forgets to pass close_norm,
+    # fall back to a causal running min/max transform instead of using the whole test
+    # window and leaking future extrema into earlier observations.
+    _ensure_close_norm_column(test_data)
 
     # Create evaluation environment with realistic transaction costs
     env = TradingEnv(
@@ -967,6 +1137,16 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
                 pos_from = float(entry_price) if entry_price > 0 else float(current_price)
                 pos_to = current_price
 
+            exit_reason = ""
+            if info.get("sl_tp_exit"):
+                exit_reason = str(info.get("sl_tp_exit"))
+            elif info.get("fixed_exit_reason"):
+                exit_reason = str(info.get("fixed_exit_reason"))
+            elif info.get("fixed_sl_triggered"):
+                exit_reason = "stop_loss"
+            elif info.get("fixed_tp_triggered"):
+                exit_reason = "take_profit"
+
             trade_history.append({
                 "date": test_data.index[current_step],
                 "trade_type": trade_type,
@@ -979,7 +1159,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
                 "new_contracts": new_contracts,
                 "avg_entry_price": float(info.get("avg_entry_price", 0.0)),
                 "realized_trade": realized_trade,
-                "exit_reason": ""
+                "exit_reason": exit_reason
             })
 
             if new_contracts != 0:
@@ -1026,8 +1206,8 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
     # Calculate trade history
     trade_history_df = pd.DataFrame(trade_history)
     
-    # Calculate action distribution across the 7 target-allocation actions.
-    action_counts = {i: 0 for i in range(7)}
+    # Calculate action distribution across the 7 target-contract actions.
+    action_counts = {i: 0 for i in range(ACTION_COUNT)}
     for action in action_history:
         action_val = int(action)
         if action_val in action_counts:
@@ -1055,6 +1235,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         "final_portfolio_value": final_portfolio_value,
         "total_return_pct": total_return_pct,
         "trade_count": trade_count,
+        "rebalance_count": trade_count,
         "hit_rate": hit_rate,
         "final_position": env.position,
         "dates": evaluation_dates,
@@ -1062,6 +1243,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         "portfolio_history": portfolio_history,
         "position_history": position_history,
         "drawdown_history": drawdown_history,
+        "action_history": action_history,
         "trade_history": trade_history_df.to_dict(orient="records"),
         "buy_dates": [],
         "buy_prices": [],
@@ -1069,6 +1251,7 @@ def evaluate_agent(model, test_data, verbose=0, deterministic=True, render=False
         "sell_prices": [],
         "action_counts": action_counts,
         "completed_trades": completed_trades,
+        "economic_trade_count": completed_trades,
         "max_drawdown": max_drawdown,
         "calmar_ratio": calmar_ratio,
         "sortino_ratio": sortino_ratio
@@ -1223,6 +1406,45 @@ def plot_training_progress(all_results):
     
     fig.show()
 
+
+def _serialize_validation_results_for_report(validation_results: dict, evaluation_metric: str) -> dict:
+    """Persist the validation fields needed by the HTML reporting pipeline."""
+    validation_results = validation_results or {}
+    return {
+        "final_portfolio_value": validation_results.get("final_portfolio_value", 0),
+        "total_return_pct": validation_results.get("total_return_pct", 0),
+        "trade_count": validation_results.get("trade_count", 0),
+        "rebalance_count": validation_results.get("rebalance_count", validation_results.get("trade_count", 0)),
+        "completed_trades": validation_results.get(
+            "completed_trades",
+            validation_results.get("economic_trade_count", 0),
+        ),
+        "economic_trade_count": validation_results.get(
+            "economic_trade_count",
+            validation_results.get("completed_trades", 0),
+        ),
+        "profitable_trades": validation_results.get("profitable_trades", 0),
+        "hit_rate": validation_results.get("hit_rate", 0),
+        "prediction_accuracy": validation_results.get("prediction_accuracy", 0),
+        "correct_predictions": validation_results.get("correct_predictions", 0),
+        "total_predictions": validation_results.get("total_predictions", 0),
+        "sortino_ratio": validation_results.get("sortino_ratio"),
+        "calmar_ratio": validation_results.get("calmar_ratio"),
+        "max_drawdown": validation_results.get("max_drawdown"),
+        "final_position": validation_results.get("final_position", 0),
+        "evaluation_metric_used": validation_results.get("metric_used", evaluation_metric),
+        "selected_via_fallback": validation_results.get("selected_via_fallback", False),
+        "fallback_score": validation_results.get("fallback_score"),
+        "has_enough_trades": validation_results.get("has_enough_trades"),
+        "has_enough_action_mix": validation_results.get("has_enough_action_mix"),
+        "has_acceptable_drawdown": validation_results.get("has_acceptable_drawdown"),
+        "collapse_flags": validation_results.get("collapse_flags", []),
+        "warning_policy_collapse": validation_results.get("warning_policy_collapse", False),
+        "warning_metric_drop": validation_results.get("warning_metric_drop", False),
+        "action_counts": validation_results.get("action_counts", {}),
+        "loss_info": validation_results.get("loss_info", {}),
+    }
+
 def save_trade_history(trade_history, filename="trade_history.csv"):
     """
     Export the trade history to a CSV file.
@@ -1303,6 +1525,8 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
             "gamma": config["model"].get("gamma", 0.99),
             "gae_lambda": config["model"].get("gae_lambda", 0.95),
         }
+        if get_configured_algorithm() == "qrdqn":
+            model_params.update(_resolve_qrdqn_params())
         logger.debug(f"Using default parameters from config")
     
     # Train the model iteratively
@@ -1334,6 +1558,11 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
             "calmar_ratio": result.get("calmar_ratio", 0),
             "max_drawdown": result.get("max_drawdown", 0),
             "trade_count": result.get("trade_count", 0),
+            "rebalance_count": result.get("rebalance_count", result.get("trade_count", 0)),
+            "economic_trade_count": result.get(
+                "economic_trade_count",
+                result.get("completed_trades", 0),
+            ),
             "is_best": result.get("is_best", False),
             "metric_used": result.get("metric_used", evaluation_metric),
             "has_enough_trades": result.get("has_enough_trades", False),
@@ -1359,18 +1588,10 @@ def train_walk_forward_model(train_data, validation_data, initial_timesteps=2000
         os.makedirs(window_folder, exist_ok=True)
         
         # Save validation results in json format
-        validation_results_json = {
-            "final_portfolio_value": validation_results.get("final_portfolio_value", 0),
-            "total_return_pct": validation_results.get("total_return_pct", 0),
-            "trade_count": validation_results.get("trade_count", 0),
-            "profitable_trades": validation_results.get("profitable_trades", 0),
-            "hit_rate": validation_results.get("hit_rate", 0),
-            "prediction_accuracy": validation_results.get("prediction_accuracy", 0),
-            "correct_predictions": validation_results.get("correct_predictions", 0),
-            "total_predictions": validation_results.get("total_predictions", 0),
-            "final_position": validation_results.get("final_position", 0),
-            "evaluation_metric_used": evaluation_metric
-        }
+        validation_results_json = _serialize_validation_results_for_report(
+            validation_results,
+            evaluation_metric=evaluation_metric,
+        )
         
         with open(os.path.join(window_folder, "validation_results.json"), "w") as f:
             json.dump(validation_results_json, f, indent=4)

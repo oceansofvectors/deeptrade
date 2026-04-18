@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from walk_forward import (  # noqa: E402
     _narrow_hp_config,
     _normalize_action_counts,
+    _resolve_qrdqn_hp_config,
+    _sample_qrdqn_params,
     _sample_stage_params,
     _score_tuning_trial,
     _should_hard_prune_trial,
@@ -110,7 +112,7 @@ class TestWalkForwardTuningScore(unittest.TestCase):
             "total_return_pct": 25.0,
             "sortino_ratio": 3.0,
             "calmar_ratio": 0.8,
-            "max_drawdown": -55.0,
+            "max_drawdown": -65.0,
             "trade_count": 40,
             "action_counts": {0: 300, 3: 250, 6: 100},
         }
@@ -146,6 +148,10 @@ class TestWalkForwardTuningScore(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
+            def suggest_categorical(self, name, choices):
+                self.calls.append(("categorical", name))
+                return choices[0]
+
             def suggest_float(self, name, low, high, log=False):
                 self.calls.append(("float", name))
                 return low
@@ -161,10 +167,15 @@ class TestWalkForwardTuningScore(unittest.TestCase):
                 "learning_rate": {"min": 1e-5, "max": 1e-4, "log": True},
                 "n_steps": {"min": 256, "max": 512, "log": True},
                 "ent_coef": {"min": 0.05, "max": 0.25, "log": False},
-                "reward_turnover_penalty": {"min": 0.01, "max": 0.02},
-                "reward_calm_holding_bonus": {"min": 0.001, "max": 0.002},
                 "gamma": {"min": 0.99, "max": 0.999},
-                "lstm_hidden_size": {"choices": [64, 128]},
+                "gae_lambda": {"min": 0.9, "max": 0.99},
+                "reward_turnover_penalty": {"min": 0.01, "max": 0.02},
+                "reward_loss_multiplier": {"min": 0.25, "max": 1.25},
+                "reward_drawdown_penalty": {"min": 0.5, "max": 4.0},
+                "reward_drawdown_penalty_threshold": {"min": 0.01, "max": 0.05},
+                "reward_flat_time_penalty": {"min": 0.0, "max": 0.002},
+                "reward_flat_time_grace_steps": {"min": 15, "max": 60},
+                "synthetic_oversample_ratio": {"min": 0.0, "max": 0.2},
             },
         )
 
@@ -174,8 +185,15 @@ class TestWalkForwardTuningScore(unittest.TestCase):
                 "learning_rate",
                 "n_steps",
                 "ent_coef",
+                "gamma",
+                "gae_lambda",
                 "reward_turnover_penalty",
-                "reward_calm_holding_bonus",
+                "reward_loss_multiplier",
+                "reward_drawdown_penalty",
+                "reward_drawdown_penalty_threshold",
+                "reward_flat_time_penalty",
+                "reward_flat_time_grace_steps",
+                "synthetic_oversample_ratio",
             },
         )
         self.assertEqual(
@@ -184,10 +202,125 @@ class TestWalkForwardTuningScore(unittest.TestCase):
                 "learning_rate",
                 "n_steps",
                 "ent_coef",
+                "gamma",
+                "gae_lambda",
                 "reward_turnover_penalty",
-                "reward_calm_holding_bonus",
+                "reward_loss_multiplier",
+                "reward_drawdown_penalty",
+                "reward_drawdown_penalty_threshold",
+                "reward_flat_time_penalty",
+                "reward_flat_time_grace_steps",
+                "synthetic_oversample_ratio",
             ],
         )
+
+    def test_sample_qrdqn_params_uses_minimal_search_fields(self):
+        class DummyTrial:
+            def __init__(self):
+                self.calls = []
+
+            def suggest_categorical(self, name, choices):
+                self.calls.append(("categorical", name))
+                return choices[0]
+
+            def suggest_float(self, name, low, high, log=False):
+                self.calls.append(("float", name))
+                return low
+
+            def suggest_int(self, name, low, high, log=False):
+                self.calls.append(("int", name))
+                return low
+
+        trial = DummyTrial()
+        params = _sample_qrdqn_params(
+            trial,
+            {
+                "learning_rate": {"min": 1e-5, "max": 5e-4, "log": True},
+                "batch_size": {"choices": [32, 64, 128]},
+                "gamma": {"min": 0.985, "max": 0.999},
+                "buffer_size": {"choices": [50000, 100000]},
+                "learning_starts": {"choices": [2000, 5000]},
+                "train_freq": {"choices": [4, 16]},
+                "gradient_steps": {"choices": [1, 4]},
+                "target_update_interval": {"choices": [1000, 2000]},
+                "exploration_fraction": {"min": 0.05, "max": 0.2},
+                "exploration_final_eps": {"min": 0.02, "max": 0.1},
+                "reward_turnover_penalty": {"min": 0.002, "max": 0.02},
+                "reward_loss_multiplier": {"min": 0.25, "max": 1.25},
+                "reward_drawdown_penalty": {"min": 0.5, "max": 4.0},
+                "reward_drawdown_penalty_threshold": {"min": 0.01, "max": 0.05},
+                "reward_flat_time_penalty": {"min": 0.0, "max": 0.002},
+                "reward_flat_time_grace_steps": {"min": 15, "max": 60},
+                "synthetic_oversample_ratio": {"min": 0.0, "max": 0.2},
+            },
+        )
+
+        self.assertEqual(
+            params,
+            {
+                "learning_rate": 1e-5,
+                "batch_size": 32,
+                "gamma": 0.985,
+                "buffer_size": 50000,
+                "learning_starts": 2000,
+                "train_freq": 4,
+                "gradient_steps": 1,
+                "target_update_interval": 1000,
+                "exploration_fraction": 0.05,
+                "exploration_final_eps": 0.02,
+                "reward_turnover_penalty": 0.002,
+                "reward_loss_multiplier": 0.25,
+                "reward_drawdown_penalty": 0.5,
+                "reward_drawdown_penalty_threshold": 0.01,
+                "reward_flat_time_penalty": 0.0,
+                "reward_flat_time_grace_steps": 15,
+                "synthetic_oversample_ratio": 0.0,
+            },
+        )
+        self.assertEqual(
+            [name for _, name in trial.calls],
+            [
+                "learning_rate",
+                "batch_size",
+                "gamma",
+                "buffer_size",
+                "learning_starts",
+                "train_freq",
+                "gradient_steps",
+                "target_update_interval",
+                "exploration_fraction",
+                "exploration_final_eps",
+                "reward_turnover_penalty",
+                "reward_loss_multiplier",
+                "reward_drawdown_penalty",
+                "reward_drawdown_penalty_threshold",
+                "reward_flat_time_penalty",
+                "reward_flat_time_grace_steps",
+                "synthetic_oversample_ratio",
+            ],
+        )
+
+    def test_resolve_qrdqn_hp_config_inherits_shared_reward_fields(self):
+        resolved = _resolve_qrdqn_hp_config(
+            {
+                "parameters": {
+                    "learning_rate": {"min": 1e-5, "max": 5e-4, "log": True},
+                    "reward_turnover_penalty": {"min": 0.002, "max": 0.02},
+                    "reward_loss_multiplier": {"min": 0.25, "max": 1.25},
+                    "reward_flat_time_grace_steps": {"min": 15, "max": 60},
+                    "synthetic_oversample_ratio": {"min": 0.0, "max": 0.2},
+                },
+                "qrdqn_parameters": {
+                    "batch_size": {"choices": [64, 128]},
+                },
+            }
+        )
+
+        self.assertIn("reward_turnover_penalty", resolved)
+        self.assertIn("reward_loss_multiplier", resolved)
+        self.assertIn("reward_flat_time_grace_steps", resolved)
+        self.assertIn("synthetic_oversample_ratio", resolved)
+        self.assertEqual(resolved["batch_size"]["choices"], [64, 128])
 
 
 if __name__ == "__main__":
